@@ -1,5 +1,3 @@
-# core/phase3_pcs_score.py
-
 # %% 📚 Imports
 import pandas as pd
 import numpy as np
@@ -8,20 +6,40 @@ from scipy.stats import skew, kurtosis
 import yfinance as yf
 
 # %% 🔢 Sub-phase 1: PCS Scoring
+# %% 🔢 Sub-phase 1: PCS Scoring (with IVHV + Tier)
 def calculate_pcs(df: pd.DataFrame) -> pd.DataFrame:
     def calculate_row_score(row):
         gamma = np.nan_to_num(pd.to_numeric(row.get("Gamma", 0)), nan=0)
         vega = np.nan_to_num(pd.to_numeric(row.get("Vega", 0)), nan=0)
         roi = np.nan_to_num(pd.to_numeric(row.get("% Total G/L", 0)), nan=0)
-        score = min(gamma * 1000, 25) + min(vega * 80, 25)
+        ivhv_gap = np.nan_to_num(pd.to_numeric(row.get("IVHV_Gap_Entry", 0)), nan=0)
+
+        score = min(gamma * 1000, 25)
+        score += min(vega * 80, 25)
         score += 15 if roi >= 3.0 else 10 if roi >= 2.0 else 5
+        score += 5 if ivhv_gap >= 5.0 else 0
         return score
 
     today = pd.to_datetime(datetime.now().date())
     if "Expiration" in df.columns:
         df['DTE'] = (df['Expiration'] - today).dt.days
+
     df['PCS'] = df.apply(calculate_row_score, axis=1)
-    print("✅ Sub-phase 1: PCS calculated.")
+    if "GroupKey" in df.columns:
+        df["PCS_GroupAvg"] = df.groupby("GroupKey")["PCS"].transform("mean")
+    def assign_pcs_tier(pcs):
+        if pcs >= 80:
+            return "Tier 1"
+        elif pcs >= 70:
+            return "Tier 2"
+        elif pcs >= 60:
+            return "Tier 3"
+        else:
+            return "Tier 4"
+
+    df["PCS_Tier"] = df["PCS"].apply(assign_pcs_tier)
+
+    print("✅ Sub-phase 1: PCS + Tier calculated.")
     return df
 
 # %% 📉 Sub-phase 2: IVHV Gap
@@ -49,12 +67,18 @@ def calculate_ivhv_gap(df: pd.DataFrame) -> pd.DataFrame:
     print("✅ Sub-phase 2: IVHV Gap calculated.")
     return df
 
-# %% 📊 Sub-phase 3: Skew & Kurtosis
+# %% 📊 Sub-phase 3: Skew & Kurtosis (Group-Based)
 def calculate_skew_and_kurtosis(df: pd.DataFrame) -> pd.DataFrame:
-    ivs = df['IV Mid'].dropna()
-    df['Skew_Entry'] = skew(ivs)
-    df['Kurtosis_Entry'] = kurtosis(ivs)
-    print("✅ Sub-phase 3: Skew and Kurtosis calculated.")
+    if "GroupKey" in df.columns:
+        df["Skew_Entry"] = df.groupby("GroupKey")["IV Mid"].transform(lambda x: skew(x.dropna()))
+        df["Kurtosis_Entry"] = df.groupby("GroupKey")["IV Mid"].transform(lambda x: kurtosis(x.dropna()))
+        print("✅ Sub-phase 3: Group-level Skew and Kurtosis calculated.")
+    else:
+        val_skew = skew(df["IV Mid"].dropna())
+        val_kurt = kurtosis(df["IV Mid"].dropna())
+        df["Skew_Entry"] = val_skew
+        df["Kurtosis_Entry"] = val_kurt
+        print("⚠️ GroupKey missing — applied global Skew/Kurtosis.")
     return df
 
 # %% 🔁 Phase 3 Main Entry Point
