@@ -1,0 +1,28 @@
+Field,In Phase 3.5,In Master,Nulls in Master,% Null in Master
+BreakEven,True,True,0.0,0.0
+Capital Deployed,True,True,0.0,0.0
+Confidence Tier,True,True,0.0,0.0
+Confidence_Entry,True,True,0.0,0.0
+CostBasis_Entry,False,True,0.0,0.0
+Days_to_Earnings,True,True,0.0,0.0
+Delta_Entry,True,True,0.0,0.0
+Earnings_Date,True,True,0.0,0.0
+Gamma_Entry,True,True,0.0,0.0
+IVHV_Gap_Entry,True,True,0.0,0.0
+Intrinsic_Val_Entry,True,True,0.0,0.0
+Is_Event_Setup,True,True,0.0,0.0
+Kurtosis_Entry,True,True,0.0,0.0
+Margin Required,False,False,,
+PCS,True,True,0.0,0.0
+PCS_Entry,True,True,0.0,0.0
+Premium_Entry,True,True,0.0,0.0
+Skew_Entry,True,True,0.0,0.0
+Strategy,True,True,0.0,0.0
+Structure,True,True,0.0,0.0
+Tag_ExitStyle,True,True,0.0,0.0
+Tag_Intent,True,True,0.0,0.0
+Theta_Entry,True,True,0.0,0.0
+Time_Val_Entry,True,True,0.0,0.0
+TradeDate,True,True,0.0,0.0
+TradeID,True,True,0.0,0.0
+Vega_Entry,True,True,0.0,0.0

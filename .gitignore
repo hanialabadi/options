@@ -1,0 +1,39 @@
+# ---- OS ----
+.DS_Store
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ---- Virtual env ----
+venv/
+taenv/
+.env
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+Untitled*.ipynb
+
+# ---- Editors ----
+.vscode/
+
+# ---- Logs & runtime ----
+logs/
+*.log
+
+# ---- Data / outputs (DO NOT COMMIT) ----
+data/
+inputs/
+audit_logs/
+snapshots/
+exports/
+
+# ---- Databases / models ----
+*.duckdb
+*.pkl
+
+# ---- Chrome / misc ----
+.chrome_fidauto/
+
