@@ -1,6 +1,6 @@
 # drift_engine_runner.py
 
-from core.phase7_drift_engine import run_phase7_drift_engine
+from core.management_engine.monitor import run_phase7_drift_engine
 from dashboard.config import SNAPSHOT_DIR
 from datetime import datetime
 import os

@@ -96,28 +96,28 @@ def test_updated_modules():
     """Test that updated modules still work."""
     print("\n🧪 Testing updated modules...")
     
-    # Test phase7_drift_engine imports
+    # Test monitor (formerly phase7_drift_engine) imports
     try:
-        from core import phase7_drift_engine
-        print("✅ phase7_drift_engine imports successfully")
+        from core.management_engine import monitor
+        print("✅ management_engine.monitor imports successfully")
     except Exception as e:
-        print(f"❌ phase7_drift_engine import failed: {e}")
+        print(f"❌ management_engine.monitor import failed: {e}")
         return False
     
-    # Test phase10_revalidate imports
+    # Test revalidate (formerly phase10) imports
     try:
         # Import separately to isolate data_contracts changes
         from core.data_contracts import load_active_master, save_active_master
-        from core.pcs_engine_v3_unified import score_pcs_batch
-        print("  ✓ phase10 core dependencies import successfully")
-        print("✅ phase10_revalidate_pipeline data_contracts integration verified")
+        from core.management_engine.pcs_live import score_pcs_batch
+        print("  ✓ revalidate core dependencies import successfully")
+        print("✅ management_engine.revalidate data_contracts integration verified")
     except Exception as e:
-        print(f"❌ phase10_revalidate_pipeline data_contracts failed: {e}")
+        print(f"❌ management_engine.revalidate data_contracts failed: {e}")
         return False
     
-    # Test pcs_engine_v3
+    # Test pcs_live (formerly pcs_engine_v3)
     try:
-        from core import pcs_engine_v3_unified
+        from core.management_engine import pcs_live
         print("✅ pcs_engine_v3_unified imports successfully")
     except Exception as e:
         print(f"❌ pcs_engine_v3_unified import failed: {e}")

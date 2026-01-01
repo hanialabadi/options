@@ -12,16 +12,16 @@ Canonical replacements exist elsewhere in the codebase.
 ## Files and Their Replacements
 
 ### Deprecated PCS Engines
-- `pcs_engine_v2.py` → **Use:** `core/pcs_engine_v3_unified.py`
-- `sus_phase3_pcs_score.py` → **Use:** `core/pcs_engine_v3_unified.py`
+- `pcs_engine_v2.py` → **Use:** `core/management_engine/pcs_live.py` (formerly pcs_engine_v3_unified)
+- `sus_phase3_pcs_score.py` → **Use:** `core/management_engine/pcs_live.py`
 
 ### Deprecated Recommendation Engines
-- `rec_engine_v4_holistic.py` → **Use:** `core/rec_engine_v6_overlay.py`
-- `rec_engine_v5_signal_tuned.py` → **Use:** `core/rec_engine_v6_overlay.py`
-- `sus_phase7_rec_engine2222.py` → **Use:** `core/rec_engine_v6_overlay.py`
+- `rec_engine_v4_holistic.py` → **Use:** `core/management_engine/recommend.py` (formerly rec_engine_v6_overlay)
+- `rec_engine_v5_signal_tuned.py` → **Use:** `core/management_engine/recommend.py`
+- `sus_phase7_rec_engine2222.py` → **Use:** `core/management_engine/recommend.py`
 
 ### Deprecated Drift Logic
-- `sus_phase5_drift.py` → **Use:** `core/phase7_drift_engine.py`
+- `sus_phase5_drift.py` → **Use:** `core/management_engine/monitor.py` (formerly phase7_drift_engine)
 
 ### Deprecated Freeze/Greeks
 - `Sus_phase3_5_freeze_fields.py` → **Use:** `core/phase6_freeze_and_archive.py`

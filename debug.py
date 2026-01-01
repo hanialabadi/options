@@ -17,7 +17,7 @@ from core.phase3_pcs_score import calculate_pcs, calculate_ivhv_gap, calculate_s
 from core.phase3_5_freeze_fields import phase3_5_fill_freeze_fields
 from core.phase6_freeze_and_archive import phase6_freeze_and_archive
 from core.phase6_5 import phase6_5_inject_derived_fields
-from core.phase7_drift_engine import run_phase7_drift_engine
+from core.management_engine.monitor import run_phase7_drift_engine
 from utils.load_master_snapshot import load_master_snapshot
 from core.freeze_leg_status import evaluate_leg_status
 

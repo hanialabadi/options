@@ -1,6 +1,6 @@
 import pandas as pd
-from core.pcs_engine_v3_unified import score_pcs_batch
-from core.rec_engine_v6_overlay import run_v6_overlay
+from core.management_engine.pcs_live import score_pcs_batch
+from core.management_engine.recommend import run_v6_overlay
 
 def run_pcs_v6_sync_pipeline(master_path="/Users/haniabadi/Documents/Windows/Optionrec/active_master.csv", auto_fix=True):
     print("📁 Loading master data...")

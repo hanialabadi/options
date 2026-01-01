@@ -193,8 +193,8 @@ if has_trades:
         print(f"   Sample IDs: {list(active_ids)[:3]}")
         
         # Test drift engine can import and access contracts
-        from core import phase7_drift_engine
-        print(f"   phase7_drift_engine imports successfully")
+        from core.management_engine import monitor
+        print(f"   management_engine.monitor imports successfully")
         print(f"   Ready for drift tracking")
         print()
         
@@ -213,7 +213,7 @@ print("-" * 70)
 
 if has_trades:
     try:
-        from core.pcs_engine_v3_unified import pcs_engine_v3_2_strategy_aware
+        from core.management_engine.pcs_live import pcs_engine_v3_2_strategy_aware
         from core.data_contracts import load_active_master
         
         # Test PCS engine can process data
