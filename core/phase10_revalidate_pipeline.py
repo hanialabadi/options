@@ -3,8 +3,9 @@
 
 import pandas as pd
 from datetime import datetime
+from core.data_contracts import load_active_master, save_active_master
 from core.tradier_chain import update_greeks_for_active
-from core.chart_engine import run_phase8_chart_engine
+from core.chart_engine import run_phase8_chart_engine  # Import from main file, not package
 from core.pcs_engine_v3_unified import score_pcs_batch
 from core.rec_engine_v6_overlay import run_v6_overlay
 
@@ -25,7 +26,7 @@ def run_full_revalidation_pipeline():
         return
 
     print("🔁 Starting revalidation for flagged trades...")
-    df = pd.read_csv("/Users/haniabadi/Documents/Windows/Optionrec/active_master.csv")
+    df = load_active_master()
 
     if "Rec_V6" not in df.columns:
         print("⚠️ Rec_V6 column missing. Run initial overlay first.")

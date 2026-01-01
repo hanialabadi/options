@@ -3,11 +3,12 @@ import os
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from core.data_contracts import get_active_trade_ids, load_snapshot_timeseries
 
 
 def load_drift_timeseries(drift_dir: str) -> pd.DataFrame:
-    master_path = "/Users/haniabadi/Documents/Windows/Optionrec/active_master.csv"
-    active_ids = set(pd.read_csv(master_path)["TradeID"].dropna().unique())
+    # Use data contract instead of hardcoded path
+    active_ids = get_active_trade_ids()
 
     files = [f for f in os.listdir(drift_dir) if f.startswith("positions_") and f.endswith(".csv")]
     data = []

@@ -1,10 +1,11 @@
 import os
 from datetime import datetime
 import pandas as pd
+from core.data_contracts import save_snapshot
 
 def save_clean_snapshot(
     df: pd.DataFrame,
-    snapshot_dir: str = "/Users/haniabadi/Documents/Windows/Optionrec/drift",
+    snapshot_dir: str = None,  # Now optional - uses data_contracts
     db_path: str = "data/pipeline.duckdb",
     to_csv: bool = True,
     to_db: bool = True,
@@ -13,6 +14,8 @@ def save_clean_snapshot(
     Saves a snapshot of clean live trades with a timestamped filename (CSV and/or DuckDB).
     Appends every snapshot to DuckDB (never overwrites) for full historical time-series storage.
     Returns: clean_df, snapshot_path (CSV or ""), run_id
+    
+    Note: Now uses data_contracts for CSV saving. snapshot_dir parameter deprecated.
     """
     now = datetime.now()
     date_str = now.strftime("%Y-%m-%d")
@@ -41,11 +44,11 @@ def save_clean_snapshot(
 
     df_clean = df[clean_cols].copy()
 
-    # --- Save CSV ---
+    # --- Save CSV via data contract ---
     if to_csv:
         try:
-            df_clean.to_csv(snapshot_path, index=False)
-            print(f"\n✅ Snapshot saved successfully → {snapshot_path}")
+            snapshot_path = str(save_snapshot(df_clean))
+            print(f"\n✅ Snapshot saved successfully via data_contracts → {snapshot_path}")
         except Exception as e:
             print(f"\n❌ Failed to save snapshot: {e}")
             snapshot_path = ""

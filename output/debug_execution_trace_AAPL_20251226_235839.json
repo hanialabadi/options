@@ -1,0 +1,81 @@
+{
+  "ticker": "AAPL",
+  "timestamp": "2025-12-26T23:58:39.666289",
+  "min_gap": 2.0,
+  "final_result": "NO_EXECUTION",
+  "blockers": [
+    "9A: All strategies are Tier 2+ (non-executable)",
+    "11: See blockers above"
+  ],
+  "steps": [
+    {
+      "step": "1",
+      "result": "PASS",
+      "detail": "Loaded snapshot_20251226_123126.csv",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T23:58:39.137997"
+    },
+    {
+      "step": "2",
+      "result": "PASS",
+      "detail": "IV_Rank=nan, IV_Trend=Unknown, HV_Trend=Falling",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T23:58:39.144035"
+    },
+    {
+      "step": "3",
+      "result": "PASS",
+      "detail": "Gap=5.1, Regime=[HighVol, IV_Rich]",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T23:58:39.147523"
+    },
+    {
+      "step": "5",
+      "result": "PASS",
+      "detail": "Signal=Bearish, Regime=Unknown, Trend=-1.22",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T23:58:39.661982"
+    },
+    {
+      "step": "6",
+      "result": "PASS",
+      "detail": "Data complete, Crossover=Age_6_15",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T23:58:39.664162"
+    },
+    {
+      "step": "7B",
+      "result": "PASS",
+      "detail": "T1=0, T2=1, T3=0",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T23:58:39.665736"
+    },
+    {
+      "step": "9A",
+      "result": "FAIL",
+      "detail": "0 Tier-1 strategies",
+      "reason": "All strategies are Tier 2+ (non-executable)",
+      "count": null,
+      "timestamp": "2025-12-26T23:58:39.665984"
+    },
+    {
+      "step": "11",
+      "result": "FAIL",
+      "detail": "No strategies survived pipeline",
+      "reason": "See blockers above",
+      "count": null,
+      "timestamp": "2025-12-26T23:58:39.666173"
+    }
+  ],
+  "summary": {
+    "total_steps": 8,
+    "passed_steps": 6,
+    "failed_steps": 2
+  }
+}

@@ -1,0 +1,89 @@
+{
+  "ticker": "AAPL",
+  "timestamp": "2025-12-26T23:55:45.423755",
+  "min_gap": 2.0,
+  "final_result": "NO_EXECUTION",
+  "blockers": [
+    "9B: Need: ['Primary_Strategy', 'Min_DTE', 'Max_DTE', 'Trade_Bias', 'Num_Contracts', 'Dollar_Allocation']",
+    "11: See blockers above"
+  ],
+  "steps": [
+    {
+      "step": "1",
+      "result": "PASS",
+      "detail": "Loaded snapshot_20251226_123126.csv",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T23:55:44.910439"
+    },
+    {
+      "step": "2",
+      "result": "PASS",
+      "detail": "IV_Rank=nan, IV_Trend=Unknown, HV_Trend=Falling",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T23:55:44.921027"
+    },
+    {
+      "step": "3",
+      "result": "PASS",
+      "detail": "Gap=5.1, Regime=[HighVol, IV_Rich]",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T23:55:44.924639"
+    },
+    {
+      "step": "5",
+      "result": "PASS",
+      "detail": "Signal=Bearish, Regime=Unknown, Trend=-1.22",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T23:55:45.420526"
+    },
+    {
+      "step": "6",
+      "result": "PASS",
+      "detail": "Data complete, Crossover=Age_6_15",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T23:55:45.422311"
+    },
+    {
+      "step": "7B",
+      "result": "PASS",
+      "detail": "T1=1, T2=0, T3=0",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T23:55:45.423398"
+    },
+    {
+      "step": "9A",
+      "result": "PASS",
+      "detail": "1 Tier-1 strategies approved",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T23:55:45.423626"
+    },
+    {
+      "step": "9B",
+      "result": "FAIL",
+      "detail": "Missing required columns from Step 9A",
+      "reason": "Need: ['Primary_Strategy', 'Min_DTE', 'Max_DTE', 'Trade_Bias', 'Num_Contracts', 'Dollar_Allocation']",
+      "count": null,
+      "timestamp": "2025-12-26T23:55:45.423656"
+    },
+    {
+      "step": "11",
+      "result": "FAIL",
+      "detail": "No strategies survived pipeline",
+      "reason": "See blockers above",
+      "count": null,
+      "timestamp": "2025-12-26T23:55:45.423677"
+    }
+  ],
+  "summary": {
+    "total_steps": 9,
+    "passed_steps": 7,
+    "failed_steps": 2
+  }
+}

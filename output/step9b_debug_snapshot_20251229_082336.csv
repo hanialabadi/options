@@ -1,0 +1,5 @@
+Ticker,Strategy,Underlying_Price,Selected_Expiration,Actual_DTE,Is_LEAP,Horizon_Class,Selected_Strikes,Bid_Ask_Spread_Pct,Open_Interest,Liquidity_Class,Liquidity_Context,Contract_Selection_Status,Actual_Risk_Per_Contract
+TSLA,Buy-Write,467.1986,2026-02-06,38,False,Unknown,[],0.0,0,Unknown,"Strategy-aware laziness applied, awaiting PCS strike optimization",Explored_Pending_PCS,
+TSLA,Buy-Write,467.3002014160156,2026-02-06,38,False,Short,[460.0],0.7057163020465773,67,Normal,Standard,Success,3554.9999999999995
+TSLA,Buy-Write,467.3002014160156,2026-02-06,38,False,Short,[460.0],0.7077140835102618,67,Normal,Standard,Success,3545.0000000000005
+BKNG,Long Call,5414.575,2026-02-06,38,False,Unknown,[],0.0,0,Unknown,"Strategy-aware laziness applied, awaiting PCS strike optimization",Explored_Pending_PCS,

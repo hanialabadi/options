@@ -1,0 +1,73 @@
+{
+  "ticker": "AAPL",
+  "timestamp": "2025-12-26T22:24:12.200501",
+  "min_gap": 2.0,
+  "final_result": "NO_EXECUTION",
+  "blockers": [
+    "7B: name 'strategy_name' is not defined",
+    "11: See blockers above"
+  ],
+  "steps": [
+    {
+      "step": "1",
+      "result": "PASS",
+      "detail": "Loaded snapshot_20251226_123126.csv",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T22:24:11.576369"
+    },
+    {
+      "step": "2",
+      "result": "PASS",
+      "detail": "IV_Rank=nan, IV_Trend=Unknown, HV_Trend=Falling",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T22:24:11.589354"
+    },
+    {
+      "step": "3",
+      "result": "PASS",
+      "detail": "Gap=5.1, Regime=[HighVol, IV_Rich]",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T22:24:11.597158"
+    },
+    {
+      "step": "5",
+      "result": "PASS",
+      "detail": "Signal=Bearish, Regime=Unknown, Trend=-1.22",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T22:24:12.198219"
+    },
+    {
+      "step": "6",
+      "result": "PASS",
+      "detail": "Data complete, Crossover=Age_6_15",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T22:24:12.200161"
+    },
+    {
+      "step": "7B",
+      "result": "FAIL",
+      "detail": "",
+      "reason": "name 'strategy_name' is not defined",
+      "count": null,
+      "timestamp": "2025-12-26T22:24:12.200371"
+    },
+    {
+      "step": "11",
+      "result": "FAIL",
+      "detail": "No strategies survived pipeline",
+      "reason": "See blockers above",
+      "count": null,
+      "timestamp": "2025-12-26T22:24:12.200403"
+    }
+  ],
+  "summary": {
+    "total_steps": 7,
+    "passed_steps": 5,
+    "failed_steps": 2
+  }
+}

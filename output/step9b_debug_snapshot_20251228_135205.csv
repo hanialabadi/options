@@ -1,0 +1,7 @@
+Ticker,Strategy,Underlying_Price,Selected_Expiration,Actual_DTE,Is_LEAP,Horizon_Class,Selected_Strikes,Bid_Ask_Spread_Pct,Open_Interest,Liquidity_Class,Liquidity_Context,Contract_Selection_Status,Actual_Risk_Per_Contract
+BKNG,Long Straddle,5440.14013671875,,0,False,Unknown,[],0.0,0,Unknown,,Low_Liquidity,
+BKNG,Long Straddle,5440.14013671875,,0,False,Unknown,[],0.0,0,Unknown,,Low_Liquidity,
+BKNG,Long Straddle,5440.14013671875,,0,False,Unknown,[],0.0,0,Unknown,,No_Suitable_Strikes,
+TSLA,Long Straddle,475.19000244140625,2026-02-06,39,False,Short,[480.0],0.65040650406505,41,Thin,Standard,Success,3085.0
+TSLA,Long Straddle,475.19000244140625,2026-02-06,39,False,Short,[480.0],0.65040650406505,41,Thin,Standard,Success,3085.0
+TSLA,Long Straddle,475.19000244140625,2026-02-20,53,False,Short,"[475.0, 475.0]",0.42248106715873435,3485,Excellent,Standard,Success,7234.999999999999

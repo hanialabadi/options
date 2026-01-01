@@ -1,0 +1,3 @@
+Ticker,Strategy,Underlying_Price,Selected_Expiration,Actual_DTE,Is_LEAP,Horizon_Class,Selected_Strikes,Bid_Ask_Spread_Pct,Open_Interest,Liquidity_Class,Liquidity_Context,Contract_Selection_Status,Actual_Risk_Per_Contract
+TSLA,Long Straddle,475.19000244140625,2026-02-06,39,False,Short,"[480.0, 475.0]",0.7347036615329345,75,Normal,Standard,Success,6150.0
+AAPL,Long Strangle,273.3999938964844,,0,False,Unknown,[],0.0,0,Unknown,,Low_Liquidity,

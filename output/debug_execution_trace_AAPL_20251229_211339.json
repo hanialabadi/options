@@ -1,0 +1,41 @@
+{
+  "ticker": "AAPL",
+  "timestamp": "2025-12-29T21:13:39.964202",
+  "min_gap": 2.0,
+  "final_result": "NO_EXECUTION",
+  "blockers": [
+    "2: \u274c CRITICAL: Signal_Type is missing after Step 2. Hard failure enforced.",
+    "11: See blockers above"
+  ],
+  "steps": [
+    {
+      "step": "1",
+      "result": "PASS",
+      "detail": "Loaded snapshot_20251226_123126.csv",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-29T21:13:28.161320"
+    },
+    {
+      "step": "2",
+      "result": "FAIL",
+      "detail": "",
+      "reason": "\u274c CRITICAL: Signal_Type is missing after Step 2. Hard failure enforced.",
+      "count": null,
+      "timestamp": "2025-12-29T21:13:39.958780"
+    },
+    {
+      "step": "11",
+      "result": "FAIL",
+      "detail": "No strategies survived pipeline",
+      "reason": "See blockers above",
+      "count": null,
+      "timestamp": "2025-12-29T21:13:39.961529"
+    }
+  ],
+  "summary": {
+    "total_steps": 3,
+    "passed_steps": 1,
+    "failed_steps": 2
+  }
+}

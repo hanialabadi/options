@@ -1,0 +1,36 @@
+CLI Pipeline Validation Report
+================================================================================
+Mode: HV-only (IV disabled)
+Snapshot: ivhv_snapshot_live_20251231_181439.csv
+
+STEP 2 RESULTS:
+  Rows: 177
+  HV populated: 15/177
+  IV populated: 0/177
+
+STEP 3 RESULTS:
+  Rows: 0
+  ⚠️  No tickers passed filter
+  ROOT CAUSE: Step 3 requires IV but all IV values are NaN
+  IMPACT: Step 3 cannot compute IVHV gap without IV
+
+================================================================================
+DASHBOARD VALIDATION CHECKLIST
+================================================================================
+1. Dashboard loads SAME snapshot file
+   Expected: ivhv_snapshot_live_20251231_181439.csv
+
+2. Dashboard Step 2 row count matches CLI
+   Expected: 177 rows
+
+3. Dashboard handles NaN IV gracefully
+   Expected: No crashes, no synthetic IV injection
+
+4. Dashboard shows HV-only mode warning
+   Expected: Clear UI indication that IV is unavailable
+
+5. Dashboard Step 3 row count matches CLI
+   Expected: 0 rows (likely 0 due to missing IV)
+
+6. No pipeline logic changes in dashboard
+   Expected: Same filtering, same thresholds, same regime tags

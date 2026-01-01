@@ -1,8 +1,10 @@
 # config.py
+# DEPRECATED: Use core.data_contracts instead
 
-# === Paths ===
-MASTER_PATH = "/Users/haniabadi/Documents/Windows/Optionrec/active_master.csv"
-SNAPSHOT_DIR = "/Users/haniabadi/Documents/Windows/Optionrec/drift"
+from core.data_contracts.config import ACTIVE_MASTER_PATH as MASTER_PATH
+from core.data_contracts.config import SNAPSHOT_DIR
+
+# === Legacy paths (to be migrated) ===
 TAENV_PYTHON = "/Users/haniabadi/Documents/Github/options/taenv/bin/python"
 
 # === Snapshot Naming ===

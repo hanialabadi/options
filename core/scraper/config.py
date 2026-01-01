@@ -27,4 +27,4 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 # === Browser Constants ===
 WAIT_TIME = 20
 PAGE_TIMEOUT = 30
-VERSION_MAIN = 138
+VERSION_MAIN = 143  # Updated to match Chrome 143.0.7499.170

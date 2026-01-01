@@ -1,24 +1,22 @@
 import os
 import pandas as pd
+from core.data_contracts import load_active_master as _load_active_master
 
 try:
     from IPython.display import display
 except ImportError:
     display = print
 
-def load_master_snapshot(path: str = "/Users/haniabadi/Documents/Windows/Optionrec/active_master.csv") -> pd.DataFrame:
-    print("🔒 Read-only load from active_master.csv")
-
-    if not os.path.exists(path):
-        print(f"⚠️ Master file not found at: {path}")
-        return pd.DataFrame()
-
-    try:
-        df = pd.read_csv(path)
-        print(f"✅ Loaded master with {len(df)} trades.")
-    except Exception as e:
-        print(f"❌ Failed to read CSV: {e}")
-        return pd.DataFrame()
+def load_master_snapshot(path: str = None) -> pd.DataFrame:
+    """
+    DEPRECATED: Use core.data_contracts.load_active_master() instead.
+    
+    Maintained for backward compatibility only.
+    """
+    print("⚠️ load_master_snapshot() is deprecated. Use: from core.data_contracts import load_active_master")
+    
+    # Use data contract loader
+    df = _load_active_master(path)
 
     # 🔐 Inject display-only derived fields (do not persist)
     if "TradeDate" in df.columns and "Days_Held" not in df.columns:

@@ -1,0 +1,6 @@
+Ticker,Strategy,Underlying_Price,Selected_Expiration,Actual_DTE,Is_LEAP,Horizon_Class,Selected_Strikes,Bid_Ask_Spread_Pct,Open_Interest,Liquidity_Class,Liquidity_Context,Contract_Selection_Status,Actual_Risk_Per_Contract
+AAPL,Long Straddle,273.3999938964844,2026-02-20,53,False,Short,"[255.0, 255.0]",3.6693942668931108,41831,Excellent,Standard,Success,2650.0
+AAPL,Long Call,273.4,2026-02-06,39,False,Unknown,[],0.0,0,Unknown,,Requires_PCS,
+TSLA,Long Strangle,475.19000244140625,2026-02-20,53,False,Short,"[500.0, 450.0]",0.7106121936990684,16024,Excellent,Standard,Success,5050.0
+TSLA,Long Call,475.19,2026-02-06,39,False,Unknown,[],0.0,0,Unknown,,Requires_PCS,
+BKNG,Long Call,5440.14,2026-02-06,39,False,Unknown,[],0.0,0,Unknown,,Requires_PCS,

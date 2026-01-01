@@ -1,0 +1,4 @@
+Ticker,Strategy,Underlying_Price,Selected_Expiration,Actual_DTE,Is_LEAP,Horizon_Class,Selected_Strikes,Bid_Ask_Spread_Pct,Open_Interest,Liquidity_Class,Liquidity_Context,Contract_Selection_Status,Actual_Risk_Per_Contract
+TSLA,Long Straddle,462.8900146484375,2026-02-20,52,False,Short,"[465.0, 460.0]",0.38275570350704613,3815,Excellent,Standard,Success,6625.0
+TSLA,Long Straddle,462.8900146484375,2026-02-20,52,False,Short,"[490.0, 435.0]",0.571933888826622,4586,Excellent,Standard,Success,4515.000000000001
+BKNG,Long Put,5435.04,2026-02-06,38,False,Unknown,[],0.0,0,Unknown,"Strategy-aware laziness applied, awaiting PCS strike optimization",Explored_Pending_PCS,

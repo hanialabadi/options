@@ -1,4 +1,5 @@
 import pandas as pd
+from core.data_contracts import load_active_master, save_active_master
 
 
 def pcs_engine_v3_2_strategy_aware(df):
@@ -142,9 +143,18 @@ def pcs_engine_v3_2_strategy_aware(df):
     return df
 
 
-def score_pcs_batch(master_path="/Users/haniabadi/Documents/Windows/Optionrec/active_master.csv"):
+def score_pcs_batch(master_path=None):
+    """
+    Load active master, run PCS v3, save back.
+    master_path parameter deprecated - uses data_contracts.
+    """
     print("🔁 Running PCS batch scoring...")
-    df = pd.read_csv(master_path)
+    df = load_active_master()
+    if df.empty:
+        print("⚠️ No trades to score")
+        return df
+    
     df = pcs_engine_v3_2_strategy_aware(df)
-    df.to_csv(master_path, index=False)
-    print("✅ PCS scores updated and saved.")
+    save_active_master(df)
+    print("✅ PCS scores updated and saved via data_contracts.")
+    return df

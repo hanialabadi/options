@@ -1,0 +1,49 @@
+{
+  "ticker": "AAPL",
+  "timestamp": "2025-12-26T20:48:15.359642",
+  "min_gap": 2.0,
+  "final_result": "NO_EXECUTION",
+  "blockers": [
+    "3: 'ShortTerm_Qualified'",
+    "11: See blockers above"
+  ],
+  "steps": [
+    {
+      "step": "1",
+      "result": "PASS",
+      "detail": "Loaded snapshot_20251226_123126.csv",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T20:48:15.350695"
+    },
+    {
+      "step": "2",
+      "result": "PASS",
+      "detail": "IV_Rank=nan, IV_Trend=Unknown, HV_Trend=Falling",
+      "reason": "",
+      "count": 1,
+      "timestamp": "2025-12-26T20:48:15.356920"
+    },
+    {
+      "step": "3",
+      "result": "FAIL",
+      "detail": "",
+      "reason": "'ShortTerm_Qualified'",
+      "count": null,
+      "timestamp": "2025-12-26T20:48:15.359508"
+    },
+    {
+      "step": "11",
+      "result": "FAIL",
+      "detail": "No strategies survived pipeline",
+      "reason": "See blockers above",
+      "count": null,
+      "timestamp": "2025-12-26T20:48:15.359562"
+    }
+  ],
+  "summary": {
+    "total_steps": 4,
+    "passed_steps": 2,
+    "failed_steps": 2
+  }
+}

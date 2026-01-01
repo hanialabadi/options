@@ -1,0 +1,77 @@
+WARNING:root:pandas_ta not available - ADX/RSI will be unavailable
+WARNING:core.scan_engine.step2_load_snapshot:⚠️ Snapshot is 3011.4 hours old (threshold: 48h). Data may be stale.
+Full Pipeline Test: Step 2 -> Step 11 -> Step 8
+================================================================================
+
+Step 2: Loaded 175 tickers with Murphy+Sinclair data
+Created 150 strategies (50 tickers x 3 strategies)
+
+=== DEBUG: Sample data per strategy ===
+
+Long Call:
+  Trend_State: Bullish
+  Volatility_Regime: Compression
+  Delta: 0.65, Gamma: 0.04, Vega: 0.18, Theta: -0.22
+  IV_Rank_Pct: 25, IV_HV_Ratio: 0.9
+
+Long Straddle:
+  Trend_State: nan
+  Volatility_Regime: Compression
+  Delta: 0.0, Gamma: 0.08, Vega: 0.35, Theta: -0.45
+  IV_Rank_Pct: 45, IV_HV_Ratio: 1.15
+  Put_Call_Skew: 1.05
+  IV_Term_Structure: Contango
+
+Cash-Secured Put:
+  Trend_State: nan
+  Volatility_Regime: Compression
+  Delta: -0.3, Gamma: 0.02, Vega: 0.12, Theta: 0.15
+  IV_Rank_Pct: 35, IV_HV_Ratio: 1.0
+
+Step 11: Evaluated 150 strategies
+
+Validation Status:
+  Reject              :  50 ( 33.3%)
+  Incomplete_Data     :  50 ( 33.3%)
+  Valid               :  35 ( 23.3%)
+  Watch               :  15 ( 10.0%)
+
+Validation Status:
+  Reject              :  50 ( 33.3%)
+  Incomplete_Data     :  50 ( 33.3%)
+  Valid               :  35 ( 23.3%)
+  Watch               :  15 ( 10.0%)
+
+=== DEBUG: Rejection reasons by strategy ===
+
+REJECTED (50):
+
+  Long Straddle: 50 rejected
+    Reason: ❌ Fails vol strategy requirements (RAG violations) | Low Vega (0.35 < 0.40 - weak vol sensitivity) | Missing IV context (cannot validate vol edge) | Missing RV/IV ratio (vol edge unvalidated) | No cat...
+
+INCOMPLETE_DATA (50):
+
+  Cash-Secured Put: 50 incomplete
+    Missing: IV_HV_Gap
+    Reason: Missing required data: IV_HV_Gap...
+
+Valid/Watch Strategies: 50
+
+Strategy Distribution (Step 11 Output):
+  Long Call                :  50 (100.0%)
+
+Step 8: Portfolio allocation...
+Allocated capital to 35 strategies
+
+Final Portfolio Distribution:
+  Long Call                :  35 (100.0%) - $20,000 (100.0%)
+
+Total Capital Allocated: $20,000
+
+================================================================================
+SUCCESS: Pipeline test complete
+
+Expected vs Actual:
+  Directionals: Expected 40-50%, Actual will show above
+  Volatility: Expected 20-30%, Actual will show above
+  Income: Expected 20-30%, Actual will show above

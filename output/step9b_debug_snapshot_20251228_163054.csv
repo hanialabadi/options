@@ -1,0 +1,8 @@
+Ticker,Strategy,Underlying_Price,Selected_Expiration,Actual_DTE,Is_LEAP,Horizon_Class,Selected_Strikes,Bid_Ask_Spread_Pct,Open_Interest,Liquidity_Class,Liquidity_Context,Contract_Selection_Status,Actual_Risk_Per_Contract
+BKNG,Long Straddle,5440.14,2026-02-06,39,False,Unknown,[],0.0,0,Unknown,"Strategy-aware laziness applied, awaiting PCS strike optimization",Explored_Pending_PCS,
+BKNG,Long Straddle,5440.14013671875,2026-02-06,39,False,Unknown,[],0.0,0,Thin,"Explored but thin: Found 0 expirations, 516 strikes. Calls: 217 tradable (spread: 6.3%). Puts: 213 tradable (spread: 16.4%). Max OI: 10. ATM liquid: True. Chain liquid: True",Explored_Thin_Liquidity,
+BKNG,Long Straddle,5440.14013671875,2026-02-20,53,False,Unknown,[],0.0,0,Marginal,Strikes exist but none optimal for strategy,Explored_No_Ideal_Strikes,
+TSLA,Long Straddle,475.19,2026-02-06,39,False,Unknown,[],0.0,0,Unknown,"Strategy-aware laziness applied, awaiting PCS strike optimization",Explored_Pending_PCS,
+TSLA,Long Straddle,475.19000244140625,,0,True,LEAP,[],0.0,0,Unknown,,Failed: cannot access local variable 'avg_spread' where it,
+TSLA,Long Straddle,475.19000244140625,2026-02-06,39,False,Short,[480.0],0.65040650406505,41,Thin,Standard,Success,3085.0
+TSLA,Long Straddle,475.19000244140625,2026-02-20,53,False,Short,"[475.0, 475.0]",0.42248106715873435,3485,Excellent,Standard,Success,7234.999999999999
