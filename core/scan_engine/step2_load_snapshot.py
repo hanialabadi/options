@@ -465,14 +465,16 @@ def load_ivhv_snapshot(
                 logger.warning("⚠️ Regime contains Unknown values - volatility regime not yet classified")
         
         # ====================
-        # ENTRY QUALITY ENRICHMENT (NEW - Scan-Time Enhancements) - TEMPORARILY DISABLED
+        # ENTRY QUALITY ENRICHMENT - Phase 1: Intraday Metrics
         # ====================
         # Add intraday range, 52W context, and momentum metrics for entry timing
-        # try:
-        #     from core.scan_engine.entry_quality_enhancements import enrich_snapshot_with_entry_quality
-        #     df = enrich_snapshot_with_entry_quality(df)
-        # except Exception as e:
-        #     logger.warning(f"⚠️ Entry quality enrichment failed (non-critical): {e}")
+        # These are DESCRIPTIVE facts about market state, not trade decisions
+        try:
+            from core.scan_engine.entry_quality_enhancements import enrich_snapshot_with_entry_quality
+            df = enrich_snapshot_with_entry_quality(df)
+            logger.info("✅ Phase 1 enrichment: Intraday compression, gap, 52W context added")
+        except Exception as e:
+            logger.warning(f"⚠️ Entry quality enrichment failed (non-critical): {e}")
 
         logger.info(f"✅ Step 2 complete: {len(df)} {required_id_col.lower()}s loaded and enriched (Sinclair + Murphy data added)")
         return df

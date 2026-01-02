@@ -1106,15 +1106,18 @@ def fetch_contracts(df: pd.DataFrame, client: SchwabClient) -> pd.DataFrame:
                 logger.info(f"   {grade}: {count} ({count/len(ok_contracts)*100:.1f}%)")
     
     # ====================
-    # ENTRY QUALITY ENRICHMENT (NEW - Execution Quality + Dividend Risk) - TEMPORARILY DISABLED
+    # ENTRY QUALITY ENRICHMENT - Phase 2: Execution Quality + Dividend Risk
     # ====================
-    # try:
-    #     from core.scan_engine.entry_quality_enhancements import enrich_contracts_with_execution_quality
-    #     # Add dividend date/yield from underlying snapshot to contract rows
-    #     # (These fields come from Step 2 snapshot and propagate through Step 7/9A)
-    #     result_df = enrich_contracts_with_execution_quality(result_df)
-    # except Exception as e:
-    #     logger.warning(f"⚠️ Execution quality enrichment failed (non-critical): {e}")
+    # Add bid/ask depth, execution quality grades, and dividend assignment risk
+    # These are DESCRIPTIVE facts about trade execution conditions, not decisions
+    try:
+        from core.scan_engine.entry_quality_enhancements import enrich_contracts_with_execution_quality
+        # Add dividend date/yield from underlying snapshot to contract rows
+        # (These fields come from Step 2 snapshot and propagate through Step 7/9A)
+        result_df = enrich_contracts_with_execution_quality(result_df)
+        logger.info("✅ Phase 2 enrichment: Execution quality + dividend risk added")
+    except Exception as e:
+        logger.warning(f"⚠️ Execution quality enrichment failed (non-critical): {e}")
     
     return result_df
 
