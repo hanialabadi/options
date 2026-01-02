@@ -1165,6 +1165,16 @@ def fetch_and_select_contracts_schwab(evaluated_strategies_df: pd.DataFrame,
         logger.warning("⚠️ No strategies after merge - check join key alignment")
         return pd.DataFrame()
     
+    # GUARDRAIL: Verify critical columns survived the merge (prevent silent schema drift)
+    required_columns = ['last_price', 'Validation_Status', 'Ticker', 'Strategy_Name']
+    missing_columns = [col for col in required_columns if col not in merged.columns]
+    if missing_columns:
+        raise ValueError(
+            f"❌ CRITICAL: Merge dropped required columns: {missing_columns}\n"
+            f"This indicates a column collision in the merge logic.\n"
+            f"Available columns: {list(merged.columns)}"
+        )
+    
     # Initialize Schwab client
     logger.info("🔑 Initializing Schwab API client for contract fetching...")
     client = SchwabClient()
