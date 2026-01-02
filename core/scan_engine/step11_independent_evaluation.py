@@ -186,6 +186,16 @@ def evaluate_strategies_independently(
     logger.info(f"✅ Step 11 Complete: {len(df_evaluated)} strategies independently evaluated")
     _log_evaluation_summary(df_evaluated, user_goal)
     
+    # ====================
+    # ENTRY QUALITY ENRICHMENT (NEW - Entry Readiness Scoring) - TEMPORARILY DISABLED
+    # ====================
+    # try:
+    #     from core.scan_engine.entry_quality_enhancements import enrich_evaluation_with_entry_readiness
+    #     df_evaluated = enrich_evaluation_with_entry_readiness(df_evaluated)
+    #     logger.info("✅ Entry readiness scoring complete (scan-time enhancement)")
+    # except Exception as e:
+    #     logger.warning(f"⚠️ Entry readiness enrichment failed (non-critical): {e}")
+    
     return df_evaluated
 
 

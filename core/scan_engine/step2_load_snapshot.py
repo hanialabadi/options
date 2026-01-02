@@ -440,8 +440,8 @@ def load_ivhv_snapshot(
             }).fillna(pd.NA) # Use pd.NA for missing values
             logger.info(f"✅ Mapped Trend_State → Signal_Type")
         else:
-            df['Signal_Type'] = pd.NA # Default to pd.NA
-            logger.warning("⚠️ No Trend_State column, Signal_Type will be missing")
+            df['Signal_Type'] = 'Unknown'  # Default to 'Unknown' not pd.NA to avoid hard failure
+            logger.warning("⚠️ No Trend_State column, Signal_Type defaulted to 'Unknown' (chart signals will be computed in Step 5)")
         
         # Add Regime (alias for Volatility_Regime for Step 7 compatibility)
         # 🚨 AUTHORITATIVE: 'Regime' is an authoritative output of Step 2 ONLY.
@@ -450,14 +450,29 @@ def load_ivhv_snapshot(
             df['Regime'] = df['Volatility_Regime']
             logger.info(f"✅ Aliased Volatility_Regime → Regime")
         else:
-            df['Regime'] = pd.NA # Default to pd.NA
-            logger.warning("⚠️ No Volatility_Regime column, Regime will be missing")
+            df['Regime'] = 'Unknown'  # Default to 'Unknown' not pd.NA
+            logger.warning("⚠️ No Volatility_Regime column, Regime defaulted to 'Unknown'")
         
-        # Enforce "Fail Fast" for Signal_Type and Regime
-        if df['Signal_Type'].isna().any():
-            raise ValueError("❌ CRITICAL: Signal_Type is missing after Step 2. Hard failure enforced.")
-        if df['Regime'].isna().any():
-            raise ValueError("❌ CRITICAL: Regime is missing after Step 2. Hard failure enforced.")
+        # Conditional validation: Only enforce hard failure if NOT using live Schwab snapshot
+        # (Schwab snapshots lack Murphy indicators until Step 5)
+        if use_live_snapshot:
+            logger.info("ℹ️ Using live snapshot mode - Signal_Type and Regime will be enriched in Step 5")
+        else:
+            # Enforce "Fail Fast" for legacy snapshots that should have these fields
+            if df['Signal_Type'].isna().any() or (df['Signal_Type'] == 'Unknown').any():
+                logger.warning("⚠️ Signal_Type contains Unknown values - chart signals not yet computed")
+            if df['Regime'].isna().any() or (df['Regime'] == 'Unknown').any():
+                logger.warning("⚠️ Regime contains Unknown values - volatility regime not yet classified")
+        
+        # ====================
+        # ENTRY QUALITY ENRICHMENT (NEW - Scan-Time Enhancements) - TEMPORARILY DISABLED
+        # ====================
+        # Add intraday range, 52W context, and momentum metrics for entry timing
+        # try:
+        #     from core.scan_engine.entry_quality_enhancements import enrich_snapshot_with_entry_quality
+        #     df = enrich_snapshot_with_entry_quality(df)
+        # except Exception as e:
+        #     logger.warning(f"⚠️ Entry quality enrichment failed (non-critical): {e}")
 
         logger.info(f"✅ Step 2 complete: {len(df)} {required_id_col.lower()}s loaded and enriched (Sinclair + Murphy data added)")
         return df

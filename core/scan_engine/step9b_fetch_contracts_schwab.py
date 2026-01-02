@@ -1105,6 +1105,17 @@ def fetch_contracts(df: pd.DataFrame, client: SchwabClient) -> pd.DataFrame:
             if count > 0:
                 logger.info(f"   {grade}: {count} ({count/len(ok_contracts)*100:.1f}%)")
     
+    # ====================
+    # ENTRY QUALITY ENRICHMENT (NEW - Execution Quality + Dividend Risk) - TEMPORARILY DISABLED
+    # ====================
+    # try:
+    #     from core.scan_engine.entry_quality_enhancements import enrich_contracts_with_execution_quality
+    #     # Add dividend date/yield from underlying snapshot to contract rows
+    #     # (These fields come from Step 2 snapshot and propagate through Step 7/9A)
+    #     result_df = enrich_contracts_with_execution_quality(result_df)
+    # except Exception as e:
+    #     logger.warning(f"⚠️ Execution quality enrichment failed (non-critical): {e}")
+    
     return result_df
 
 # ============================================================
@@ -1136,14 +1147,19 @@ def fetch_and_select_contracts_schwab(evaluated_strategies_df: pd.DataFrame,
     # Merge evaluated strategies with timeframes
     # Step 11 has: Validation_Status, Theory_Compliance_Score, Execution_State, etc.
     # Step 9A has: Min_DTE, Max_DTE, Target_DTE, Timeframe_Label, etc.
+    
+    # FIX: Both DataFrames have overlapping columns from the snapshot, causing pandas to add suffixes
+    # Solution: Keep only unique columns from timeframes_df (drop duplicates that exist in evaluated_strategies_df)
+    timeframes_unique_cols = ['Ticker', 'Strategy_Name', 'Min_DTE', 'Max_DTE', 'Target_DTE', 'Timeframe_Label', 'DTE_Rationale', 'Expiration_Count_Target']
+    timeframes_df_clean = timeframes_df[timeframes_unique_cols]
+    
     merged = evaluated_strategies_df.merge(
-        timeframes_df,
+        timeframes_df_clean,
         on=['Ticker', 'Strategy_Name'],  # Common join keys
-        how='inner',
-        suffixes=('_step11', '_step9a')
+        how='inner'
     )
     
-    logger.info(f"   Merged {len(merged)} strategies (from {len(evaluated_strategies_df)} evaluated, {len(timeframes_df)} with timeframes)")
+    logger.info(f"   Merged {len(merged)} strategies (from {len(evaluated_strategies_df)} evaluated, {len(timeframes_df_clean)} with timeframes)")
     
     if merged.empty:
         logger.warning("⚠️ No strategies after merge - check join key alignment")
