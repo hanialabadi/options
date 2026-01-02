@@ -574,7 +574,26 @@ def apply_acceptance_logic(df: pd.DataFrame) -> pd.DataFrame:
     
     df_result = df.copy()
     
-    # Initialize acceptance columns
+    # PRE-FILTER: Only evaluate contracts with successful Contract_Status
+    # Reject contracts that failed Step 9B validation (liquidity, DTE, etc.)
+    if 'Contract_Status' in df_result.columns:
+        successful_statuses = ['OK', 'LEAP_FALLBACK']
+        failed_contracts = ~df_result['Contract_Status'].isin(successful_statuses)
+        failed_count = failed_contracts.sum()
+        
+        if failed_count > 0:
+            logger.info(f"🔍 Pre-filter: {failed_count} contracts have failed Contract_Status (will skip acceptance evaluation)")
+            
+            # Mark failed contracts as INCOMPLETE before evaluation
+            df_result.loc[failed_contracts, 'acceptance_status'] = 'INCOMPLETE'
+            df_result.loc[failed_contracts, 'acceptance_reason'] = 'Contract validation failed (Step 9B)'
+            df_result.loc[failed_contracts, 'confidence_band'] = 'LOW'
+            
+            # Log breakdown of failure reasons
+            failed_breakdown = df_result[failed_contracts]['Contract_Status'].value_counts().to_dict()
+            logger.info(f"   Failure breakdown: {failed_breakdown}")
+    
+    # Initialize acceptance columns for successful contracts
     acceptance_cols = [
         'acceptance_status', 'acceptance_reason', 'confidence_band',
         'directional_bias', 'structure_bias', 'timing_quality', 'execution_adjustment'
@@ -584,8 +603,11 @@ def apply_acceptance_logic(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df_result.columns:
             df_result[col] = 'UNKNOWN'
     
-    # Apply acceptance logic to each row
-    for idx, row in df_result.iterrows():
+    # Apply acceptance logic only to contracts with successful Contract_Status
+    successful_mask = df_result['Contract_Status'].isin(['OK', 'LEAP_FALLBACK']) if 'Contract_Status' in df_result.columns else pd.Series([True] * len(df_result))
+    
+    for idx in df_result[successful_mask].index:
+        row = df_result.loc[idx]
         decision = evaluate_acceptance(row)
         
         for key, val in decision.items():
@@ -602,11 +624,14 @@ def apply_acceptance_logic(df: pd.DataFrame) -> pd.DataFrame:
     ready_count = status_counts.get('READY_NOW', 0)
     wait_count = status_counts.get('WAIT', 0)
     avoid_count = status_counts.get('AVOID', 0)
+    incomplete_count = status_counts.get('INCOMPLETE', 0)
     
     logger.info(f"\n📊 Acceptance Summary:")
     logger.info(f"   ✅ READY_NOW: {ready_count} ({ready_count/len(df_result)*100:.1f}%)")
     logger.info(f"   ⏸️  WAIT: {wait_count} ({wait_count/len(df_result)*100:.1f}%)")
     logger.info(f"   ❌ AVOID: {avoid_count} ({avoid_count/len(df_result)*100:.1f}%)")
+    if incomplete_count > 0:
+        logger.info(f"   ⚠️  INCOMPLETE: {incomplete_count} ({incomplete_count/len(df_result)*100:.1f}%)")
     
     return df_result
 
@@ -619,6 +644,8 @@ def filter_ready_contracts(df: pd.DataFrame, min_confidence: str = 'MEDIUM') -> 
     """
     Filter for READY_NOW contracts with minimum confidence level.
     
+    Excludes INCOMPLETE contracts (failed Step 9B validation).
+    
     Args:
         df: DataFrame from apply_acceptance_logic
         min_confidence: 'LOW' | 'MEDIUM' | 'HIGH'
@@ -629,6 +656,7 @@ def filter_ready_contracts(df: pd.DataFrame, min_confidence: str = 'MEDIUM') -> 
     confidence_hierarchy = {'LOW': 1, 'MEDIUM': 2, 'HIGH': 3}
     min_level = confidence_hierarchy.get(min_confidence, 2)
     
+    # Filter for READY_NOW only (excludes WAIT, AVOID, INCOMPLETE)
     df_ready = df[df['acceptance_status'] == 'READY_NOW'].copy()
     
     if not df_ready.empty:

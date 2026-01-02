@@ -1119,6 +1119,26 @@ def fetch_contracts(df: pd.DataFrame, client: SchwabClient) -> pd.DataFrame:
     except Exception as e:
         logger.warning(f"⚠️ Execution quality enrichment failed (non-critical): {e}")
     
+    # ====================
+    # VALIDATION STATUS UPDATE - Fix for Step 8 Compatibility
+    # ====================
+    # Update Validation_Status from 'Pending_Greeks' to 'Valid' for successfully fetched contracts
+    # This ensures Step 8 (position sizing) can process contracts after Step 12 (acceptance logic)
+    if 'Validation_Status' in result_df.columns:
+        # Identify contracts with successful fetches
+        success_statuses = [CONTRACT_STATUS_OK, CONTRACT_STATUS_LEAP_FALLBACK]
+        successful_contracts = result_df['Contract_Status'].isin(success_statuses)
+        pending_greeks = result_df['Validation_Status'] == 'Pending_Greeks'
+        
+        # Update Pending_Greeks → Valid for successfully fetched contracts
+        contracts_to_update = successful_contracts & pending_greeks
+        update_count = contracts_to_update.sum()
+        
+        if update_count > 0:
+            result_df.loc[contracts_to_update, 'Validation_Status'] = 'Valid'
+            logger.info(f"✅ Updated {update_count} contracts: Validation_Status 'Pending_Greeks' → 'Valid'")
+            logger.info(f"   (Ensures Step 8 compatibility after Step 12 acceptance filtering)")
+    
     return result_df
 
 # ============================================================
