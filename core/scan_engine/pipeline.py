@@ -19,6 +19,7 @@ from .step8_position_sizing import allocate_portfolio_capital
 from .step9a_determine_timeframe import determine_timeframe
 from .step9b_fetch_contracts_schwab import fetch_and_select_contracts_schwab  # Production Schwab version
 from .step11_independent_evaluation import evaluate_strategies_independently
+from .step12_acceptance import apply_acceptance_logic, filter_ready_contracts  # Phase 3 acceptance logic
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ def run_full_scan_pipeline(
         Returns all intermediate DataFrames for inspection and debugging.
     
     🚨 AUTHORITATIVE PIPELINE FLOW:
-    Step 2 → Step 3 → Step 5 → Step 6 → Step 7 → Step 11 → Step 9A → Step 9B → Step 8
+    Step 2 → Step 3 → Step 5 → Step 6 → Step 7 → Step 11 → Step 9A → Step 9B → Step 12 → Step 8
     This flow is orchestrated exclusively by `core/scan_engine/pipeline.py`.
     
     # AGENT SAFETY: This file is the ONLY valid entry point for the Scan Engine.
@@ -57,7 +58,8 @@ def run_full_scan_pipeline(
         6. Step 11: Independent Strategy Evaluation (core/scan_engine/step11_independent_evaluation.py)
         7. Step 9A: Determine timeframes for each strategy (core/scan_engine/step9a_determine_timeframe.py)
         8. Step 9B: Fetch option contracts (core/scan_engine/step9b_fetch_contracts.py)
-        9. Step 8: Final selection & position sizing (core/scan_engine/step8_position_sizing.py)
+        9. Step 12: Acceptance Logic - Phase 1-2-3 enrichment (core/scan_engine/step12_acceptance.py)
+        10. Step 8: Final selection & position sizing (core/scan_engine/step8_position_sizing.py)
     
     Args:
         snapshot_path (str): The absolute path to the IV/HV CSV file, resolved by the caller.
@@ -77,6 +79,8 @@ def run_full_scan_pipeline(
             - 'evaluated_strategies': Evaluated strategies (Step 11)
             - 'timeframes': Strategy timeframes (Step 9A)
             - 'selected_contracts': Selected contracts (Step 9B)
+            - 'acceptance_all': All contracts with acceptance status (Step 12)
+            - 'acceptance_ready': READY_NOW contracts with MEDIUM+ confidence (Step 12)
             - 'final_trades': Final selected & sized positions (Step 8)
             Empty dict keys if step fails
     
@@ -234,6 +238,41 @@ def run_full_scan_pipeline(
                 results['selected_contracts'] = pd.DataFrame()
                 evaluated_strategies_with_contracts = results['evaluated_strategies'] # Fallback to original strategies
 
+    # Step 12: Acceptance Logic (Phase 3)
+    if not evaluated_strategies_with_contracts.empty:
+        logger.info("✅ Step 12: Applying acceptance logic (Phase 1-2-3)...")
+        try:
+            # Apply acceptance logic to all contracts
+            evaluated_strategies_with_contracts = apply_acceptance_logic(evaluated_strategies_with_contracts)
+            
+            # Filter for READY_NOW with MEDIUM+ confidence
+            ready_contracts = filter_ready_contracts(evaluated_strategies_with_contracts, min_confidence='MEDIUM')
+            
+            if not ready_contracts.empty:
+                logger.info(f"✅ Step 12 complete: {len(ready_contracts)} READY_NOW contracts (MEDIUM+ confidence)")
+                logger.info(f"   Total evaluated: {len(evaluated_strategies_with_contracts)} | "
+                           f"Filtered: {len(evaluated_strategies_with_contracts) - len(ready_contracts)}")
+            else:
+                logger.info("⚠️ Step 12: No READY_NOW contracts at MEDIUM+ confidence")
+                logger.info(f"   All {len(evaluated_strategies_with_contracts)} contracts filtered by acceptance logic")
+            
+            # Store both full and filtered results
+            results['acceptance_all'] = evaluated_strategies_with_contracts  # All contracts with acceptance status
+            results['acceptance_ready'] = ready_contracts  # Only READY_NOW with MEDIUM+ confidence
+            
+            # Use ready_contracts for Step 8 position sizing
+            evaluated_strategies_with_contracts = ready_contracts
+            
+        except Exception as e:
+            logger.error(f"❌ Step 12 failed: {e}", exc_info=True)
+            # Continue with unfiltered contracts if acceptance logic fails
+            results['acceptance_all'] = pd.DataFrame()
+            results['acceptance_ready'] = pd.DataFrame()
+    else:
+        logger.warning("⚠️ Step 12 skipped: No contracts from Step 9B")
+        results['acceptance_all'] = pd.DataFrame()
+        results['acceptance_ready'] = pd.DataFrame()
+
     # Step 8: Final Selection & Position Sizing
     # Use evaluated_strategies_with_contracts, which is either the enriched DF or the original evaluated_strategies
     if evaluated_strategies_with_contracts.empty:
@@ -271,6 +310,10 @@ def run_full_scan_pipeline(
             results['timeframes'].to_csv(output_dir / f"Step9A_Timeframes_{timestamp}.csv", index=False)
         if not results['selected_contracts'].empty: # Export Step 9B output
             results['selected_contracts'].to_csv(output_dir / f"Step9B_SelectedContracts_{timestamp}.csv", index=False)
+        if not results.get('acceptance_all', pd.DataFrame()).empty: # Export Step 12 all contracts
+            results['acceptance_all'].to_csv(output_dir / f"Step12_Acceptance_{timestamp}.csv", index=False)
+        if not results.get('acceptance_ready', pd.DataFrame()).empty: # Export Step 12 READY_NOW
+            results['acceptance_ready'].to_csv(output_dir / f"Step12_Ready_{timestamp}.csv", index=False)
         if not results['final_trades'].empty:
             results['final_trades'].to_csv(output_dir / f"Step8_Final_{timestamp}.csv", index=False)
         logger.info(f"✅ Exports complete → {output_dir}")
