@@ -82,7 +82,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-def determine_timeframe(df: pd.DataFrame) -> pd.DataFrame: # Renamed function for consistency with import
+def determine_timeframe(df: pd.DataFrame, expiry_intent: str = 'ANY') -> pd.DataFrame:
     """
     Determine optimal DTE range for EACH (Ticker, Strategy) pair independently.
     
@@ -157,6 +157,11 @@ def determine_timeframe(df: pd.DataFrame) -> pd.DataFrame: # Renamed function fo
     
     # Create output columns
     df = df.copy()
+    
+    # Ensure thesis column is preserved
+    if 'thesis' not in df.columns:
+        logger.warning("⚠️ 'thesis' column missing in Step 9A input")
+        
     df['Min_DTE'] = 0
     df['Max_DTE'] = 0
     df['Target_DTE'] = 0
@@ -174,9 +179,20 @@ def determine_timeframe(df: pd.DataFrame) -> pd.DataFrame: # Renamed function fo
         confidence = row.get('Confidence', 70)  # Default to moderate
         iv_rank = row.get('IV_Rank_30D', 50)    # Default to neutral
         
-        min_dte, max_dte, label, rationale = _calculate_dte_range_by_strategy(
-            strategy_name, strategy_type, confidence, iv_rank
-        )
+        # Apply Expiry Intent Overrides
+        if expiry_intent == 'THIS_WEEK':
+            min_dte, max_dte = 0, 7
+            label = 'Weekly'
+            rationale = "Operator Intent: THIS_WEEK (0-7 DTE)"
+        elif expiry_intent == 'NEXT_WEEK':
+            min_dte, max_dte = 8, 14
+            label = 'Next-Week'
+            rationale = "Operator Intent: NEXT_WEEK (8-14 DTE)"
+        else:
+            # Standard strategy-aware logic
+            min_dte, max_dte, label, rationale = _calculate_dte_range_by_strategy(
+                strategy_name, strategy_type, confidence, iv_rank
+            )
         
         df.at[idx, 'Min_DTE'] = min_dte
         df.at[idx, 'Max_DTE'] = max_dte

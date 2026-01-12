@@ -235,6 +235,31 @@ def validate_data_quality(df: pd.DataFrame) -> pd.DataFrame:
     age_dist = df_result['Crossover_Age_Bucket'].value_counts()
     logger.info(f"⏱️ Crossover age distribution: {age_dist.to_dict()}")
     
+    # ============================================================
+    # IV COVERAGE ENFORCEMENT (HARD GATES)
+    # ============================================================
+    # RAG: "Trust > Convenience. Do not analyze partial datasets."
+    
+    iv_populated = df_result['IV_30_D_Call'].notna().sum()
+    total_tickers = len(df_result)
+    iv_coverage_pct = (iv_populated / total_tickers * 100) if total_tickers > 0 else 0
+    
+    df_result['IV_Coverage_Pct'] = iv_coverage_pct
+    
+    if iv_coverage_pct < 40:
+        logger.error(f"🛑 CRITICAL DATA FAILURE: IV coverage is only {iv_coverage_pct:.1f}% (Threshold: 40%)")
+        logger.error("   Suppressing all signals. System cannot operate with this level of missing data.")
+        return pd.DataFrame() # Hard block: return empty
+        
+    elif iv_coverage_pct < 60:
+        logger.error(f"🛑 HARD BLOCK: IV coverage is {iv_coverage_pct:.1f}% (Threshold: 60%)")
+        logger.error("   Blocking execution to prevent unreliable strategy recommendations.")
+        return pd.DataFrame() # Hard block: return empty
+        
+    elif iv_coverage_pct < 80:
+        logger.warning(f"⚠️  LOW DATA QUALITY: IV coverage is {iv_coverage_pct:.1f}% (Threshold: 80%)")
+        logger.warning("   Proceeding with caution. Some high-quality tickers may be missing IV data.")
+
     # Return ALL input rows with added descriptive columns
-    logger.info(f"✅ Step 6 complete: Returning all {len(df_result)} tickers with data quality indicators")
+    logger.info(f"✅ Step 6 complete: Returning {len(df_result)} tickers (IV Coverage: {iv_coverage_pct:.1f}%)")
     return df_result

@@ -50,18 +50,21 @@ def extract_greeks_to_columns(df: pd.DataFrame) -> pd.DataFrame:
     elif 'promoted_strike' in df.columns:
         promoted_strike_source_col = 'promoted_strike'
     
-    # Initialize columns with NaN (use different names to avoid collision)
-    df['Delta'] = np.nan
-    df['Gamma'] = np.nan
-    df['Vega'] = np.nan
-    df['Theta'] = np.nan
-    df['Rho'] = np.nan
-    df['IV_Mid'] = np.nan
-    df['Promoted_Strike_Value'] = np.nan  # Renamed to avoid overwriting source
-    df['Promoted_Reason'] = ''
+    # Initialize columns if they don't exist
+    for col in ['Delta', 'Gamma', 'Vega', 'Theta', 'Rho', 'IV_Mid', 'Promoted_Strike_Value']:
+        if col not in df.columns:
+            df[col] = np.nan
+    if 'Promoted_Reason' not in df.columns:
+        df['Promoted_Reason'] = ''
     
     # Extract Greeks for each row
     for idx, row in df.iterrows():
+        # Check if Greeks already exist as non-null columns (e.g. from Step 9B Schwab)
+        # We check for Delta and Vega specifically as they are critical for PCS
+        if pd.notna(row.get('Delta')) and pd.notna(row.get('Vega')):
+            # Greeks already present, skip extraction unless we want to force refresh
+            continue
+
         # PRIORITY 1: Check for promoted_strike (NEW - check both lowercase and capitalized)
         promoted_json = None
         if 'promoted_strike' in df.columns and not pd.isna(row['promoted_strike']):

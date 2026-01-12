@@ -34,13 +34,26 @@ def scrape_ivhv(ticker, driver):
             EC.presence_of_element_located((By.CSS_SELECTOR, "div.volatility-index-data-table table"))
         )
     except Exception:
-        return {"Ticker": ticker, "timestamp": datetime.now().isoformat(), "Date": TODAY, "Error": "Page Load Fail"}
+        return {
+            "Ticker": ticker, 
+            "scan_timestamp": datetime.utcnow().isoformat(), 
+            "market_date": TODAY, 
+            "Error": "Page Load Fail"
+        }
 
     tables = driver.find_elements(By.CSS_SELECTOR, "div.volatility-index-data-table table")
     soup_iv = BeautifulSoup(tables[0].get_attribute("outerHTML"), "lxml") if len(tables) >= 1 else None
     soup_hv = BeautifulSoup(tables[1].get_attribute("outerHTML"), "lxml") if len(tables) >= 2 else None
 
-    data = {"Ticker": ticker, "timestamp": datetime.now().isoformat(), "Date": TODAY, "Error": None}
+    # FIX 6: Split market_date and scan_timestamp
+    # market_date = Schwab/Fidelity truth (validity date)
+    # scan_timestamp = System truth (capture time)
+    data = {
+        "Ticker": ticker, 
+        "scan_timestamp": datetime.utcnow().isoformat(), 
+        "market_date": TODAY, 
+        "Error": None
+    }
     terms = ["7_D","14_D","21_D","30_D","60_D","90_D","120_D","150_D","180_D","270_D","360_D","720_D","1080_D"]
 
     if soup_iv:
@@ -78,7 +91,10 @@ def save_result(result):
                 combined = pd.concat([existing, df], ignore_index=True)
             else:
                 combined = df
-            combined.drop_duplicates(subset=["Ticker", "Date"], keep="last").to_csv(path, index=False)
+            
+            # Use market_date for deduplication
+            date_col = "market_date" if "market_date" in combined.columns else "Date"
+            combined.drop_duplicates(subset=["Ticker", date_col], keep="last").to_csv(path, index=False)
         except Exception as e:
             print(f"[❌] Failed to save to {path}: {e}")
 

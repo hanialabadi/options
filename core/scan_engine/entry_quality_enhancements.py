@@ -752,7 +752,7 @@ def enrich_contracts_with_execution_quality(df: pd.DataFrame) -> pd.DataFrame:
     
     df_enriched = df.copy()
     
-    # Initialize columns
+    # Initialize columns with explicit dtypes to avoid type pollution
     depth_cols = [
         'bid_size', 'ask_size', 'total_depth', 'depth_imbalance',
         'depth_to_oi_ratio', 'depth_tag', 'balance_tag', 'execution_quality'
@@ -761,19 +761,28 @@ def enrich_contracts_with_execution_quality(df: pd.DataFrame) -> pd.DataFrame:
         'dividend_risk', 'days_to_dividend', 'dividend_yield', 'dividend_notes'
     ]
     
+    # FIX: Create object-dtype Series for string columns to prevent dtype mixing
     for col in depth_cols:
         if col not in df_enriched.columns:
-            df_enriched[col] = np.nan if 'size' in col or 'depth' in col or 'ratio' in col else 'UNKNOWN'
+            if 'size' in col or 'depth' in col or 'ratio' in col:
+                df_enriched[col] = np.nan  # Numeric
+            else:
+                df_enriched[col] = pd.Series(['UNKNOWN'] * len(df_enriched), dtype='object')
     
     for col in dividend_cols:
         if col not in df_enriched.columns:
-            df_enriched[col] = np.nan if 'days' in col or 'yield' in col else 'UNKNOWN'
+            if 'days' in col or 'yield' in col:
+                df_enriched[col] = np.nan  # Numeric
+            else:
+                df_enriched[col] = pd.Series(['UNKNOWN'] * len(df_enriched), dtype='object')
     
     # Apply enrichment functions
     for idx, row in df_enriched.iterrows():
         # Depth quality
         depth = calculate_depth_quality(row)
         for key, val in depth.items():
+            if key in df_enriched.columns and df_enriched[key].dtype != 'object' and isinstance(val, str):
+                df_enriched[key] = df_enriched[key].astype('object')
             df_enriched.at[idx, key] = val
         
         # Dividend risk (if applicable)
@@ -785,6 +794,8 @@ def enrich_contracts_with_execution_quality(df: pd.DataFrame) -> pd.DataFrame:
         if not pd.isna(dte) and not pd.isna(strategy):
             div_risk = calculate_dividend_risk(div_date, div_yield, dte, strategy)
             for key, val in div_risk.items():
+                if key in df_enriched.columns and df_enriched[key].dtype != 'object' and isinstance(val, str):
+                    df_enriched[key] = df_enriched[key].astype('object')
                 df_enriched.at[idx, key] = val
     
     # Log summary

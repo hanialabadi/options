@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 # Strategy family classification
 DIRECTIONAL_STRATEGIES = [
     'Long Call', 'Long Put', 'Long Call LEAP', 'Long Put LEAP',
-    'Bull Call Spread', 'Bear Put Spread'
+    'Bull Call Spread', 'Bear Put Spread', 'Call Debit Spread', 'Put Debit Spread'
 ]
 
 VOLATILITY_STRATEGIES = [
@@ -87,6 +87,14 @@ def evaluate_strategies_independently(
     account_size: float = 10000.0,
     risk_tolerance: str = 'moderate'
 ) -> pd.DataFrame:
+    """
+    Evaluate each strategy independently against its own requirements.
+    """
+    # Ensure 'Strategy' column exists (Step 7 uses 'Strategy_Name')
+    if 'Strategy' not in df.columns and 'Strategy_Name' in df.columns:
+        df['Strategy'] = df['Strategy_Name']
+        logger.info("ℹ️ Aliased Strategy_Name -> Strategy for Step 11 compatibility")
+
     """
     Evaluate each strategy independently against its own requirements.
     
@@ -148,8 +156,17 @@ def evaluate_strategies_independently(
     df_evaluated['Evaluation_Notes'] = ''
     
     # Evaluate each strategy independently
+    iv_maturity = df_evaluated.get('IV_Maturity_State', pd.Series(['MATURE'] * len(df_evaluated)))
+    
     for idx, row in df_evaluated.iterrows():
         status, completeness, missing, compliance, notes = _evaluate_single_strategy(row)
+        
+        # FIX 2: Never penalize IMMATURE data
+        # If IV is immature, we demote the status to DATA_NOT_MATURE instead of Reject/Incomplete
+        maturity = iv_maturity.get(idx, 'MATURE')
+        if maturity == 'IMMATURE' and status in ['Reject', 'Incomplete_Data']:
+            status = 'DATA_NOT_MATURE'
+            notes = f"Diagnostic: IV context still forming ({maturity}). " + notes
         
         df_evaluated.at[idx, 'Validation_Status'] = status
         df_evaluated.at[idx, 'Data_Completeness_Pct'] = completeness
@@ -157,18 +174,9 @@ def evaluate_strategies_independently(
         df_evaluated.at[idx, 'Theory_Compliance_Score'] = compliance
         df_evaluated.at[idx, 'Evaluation_Notes'] = notes
     
-    # Add execution state for downstream clarity (UI, portfolio allocator, alerts)
-    df_evaluated['Execution_State'] = df_evaluated['Validation_Status'].map({
-        'Valid': 'EXECUTE_NOW',
-        'Watch': 'MONITOR',
-        'Deferred_DTE': 'RETRY_LATER',
-        'Deferred_Liquidity': 'RETRY_LATER',
-        'Pending_Greeks': 'DATA_BLOCKED',
-        'Incomplete_Data': 'DATA_BLOCKED',
-        'Reject': 'DO_NOT_EXECUTE'
-    })
-    # Fallback for any unmapped status
-    df_evaluated['Execution_State'] = df_evaluated['Execution_State'].fillna('DO_NOT_EXECUTE')
+    # ACTION 6: Step 11 is DIAGNOSTIC ONLY.
+    # It must NOT emit execution-triggering labels like 'EXECUTE_NOW' or 'acceptance_status'.
+    # All decision authority resides in Step 12.
     
     # Rank within strategy families (NOT cross-strategy)
     df_evaluated = _rank_within_families(df_evaluated)

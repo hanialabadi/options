@@ -7,6 +7,7 @@ Combines all steps into a single run_full_scan_pipeline() function.
 import pandas as pd
 import logging
 import os
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -15,309 +16,362 @@ from .step3_filter_ivhv import filter_ivhv_gap
 from .step5_chart_signals import compute_chart_signals
 from .step6_gem_filter import validate_data_quality
 from .step7_strategy_recommendation import recommend_strategies
-from .step8_position_sizing import allocate_portfolio_capital
+from .step7_5_iv_demand import emit_iv_demand
+from .step8_position_sizing import compute_thesis_capacity
 from .step9a_determine_timeframe import determine_timeframe
 from .step9b_fetch_contracts_schwab import fetch_and_select_contracts_schwab  # Production Schwab version
+from .step10_pcs_recalibration import recalibrate_and_filter
 from .step11_independent_evaluation import evaluate_strategies_independently
 from .step12_acceptance import apply_acceptance_logic, filter_ready_contracts  # Phase 3 acceptance logic
+from .debug_mode import get_debug_manager
+from .market_regime_classifier import classify_market_regime
+from core.data_layer.market_stress_detector import check_market_stress
+from core.governance import audit_harness as audit
 
 logger = logging.getLogger(__name__)
 
+# Deterministic debug universe (RAG-aligned)
+# AAPL, AMZN, NVDA are chosen for high liquidity and reliable option chains
+DEBUG_TICKERS = ["AAPL", "AMZN", "NVDA"]
+
+
+class PipelineContext:
+    """Holds state and configuration for a pipeline run."""
+    def __init__(self, snapshot_path, output_dir, account_balance, max_portfolio_risk, sizing_method, expiry_intent, audit_mode):
+        self.snapshot_path = snapshot_path
+        self.output_dir = Path(output_dir) if output_dir else Path(os.getenv('OUTPUT_DIR', './output'))
+        self.account_balance = account_balance
+        self.max_portfolio_risk = max_portfolio_risk
+        self.sizing_method = sizing_method
+        self.expiry_intent = expiry_intent
+        self.audit_mode = audit_mode
+        self.results = {}
+        self.debug_manager = get_debug_manager()
+        
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.debug_manager.enabled:
+            self.debug_manager.clear()
 
 def run_full_scan_pipeline(
-    snapshot_path: str, # Now a required argument, resolved by caller
+    snapshot_path: str,
     output_dir: str = None,
     account_balance: float = 100000.0,
     max_portfolio_risk: float = 0.20,
-    sizing_method: str = 'volatility_scaled'
+    sizing_method: str = 'volatility_scaled',
+    audit_mode = None,
+    expiry_intent: str = 'ANY',
+    **kwargs
 ) -> dict:
-    """
-    Run the complete scan pipeline.
+    """Modularized pipeline orchestrator."""
+    ctx = PipelineContext(snapshot_path, output_dir, account_balance, max_portfolio_risk, sizing_method, expiry_intent, audit_mode)
     
-    Purpose:
-        Execute all authoritative steps in sequence with automatic error handling and output exports.
-        Returns all intermediate DataFrames for inspection and debugging.
-    
-    🚨 AUTHORITATIVE PIPELINE FLOW:
-    Step 2 → Step 3 → Step 5 → Step 6 → Step 7 → Step 11 → Step 9A → Step 9B → Step 12 → Step 8
-    This flow is orchestrated exclusively by `core/scan_engine/pipeline.py`.
-    
-    # AGENT SAFETY: This file is the ONLY valid entry point for the Scan Engine.
-    # No UI, test, or script is permitted to invoke intermediate steps directly in production contexts.
-    # This prevents agents from "helpfully" resurrecting invalid logic or bypassing architectural boundaries.
-
-    Pipeline Steps:
-        DESCRIPTIVE (Strategy-Neutral):
-        1. Step 2: Load IV/HV snapshot with enrichment (core/scan_engine/step2_load_snapshot.py)
-        2. Step 3: Filter by IVHV gap and classify volatility regimes (core/scan_engine/step3_filter_ivhv.py)
-        3. Step 5: Compute chart signals and regime classification (core/scan_engine/step5_chart_signals.py)
-        4. Step 6: Validate data completeness and quality (core/scan_engine/step6_gem_filter.py)
+    try:
+        if not _step2_load_data(ctx): return _finalize_results(ctx)
+        if not _step3_filter_tickers(ctx): return _finalize_results(ctx)
+        if not _step5_6_enrich_and_validate(ctx): return _finalize_results(ctx)
+        if not _step7_11_recommend_and_evaluate(ctx): return _finalize_results(ctx)
+        if not _step9_select_contracts(ctx): return _finalize_results(ctx)
+        if not _step10_recalibrate_pcs(ctx): return _finalize_results(ctx)
+        _step12_8_acceptance_and_sizing(ctx)
         
-        PRESCRIPTIVE (Strategy-Specific):
-        5. Step 7: Strategy Recommendation - Multi-strategy ledger (core/scan_engine/step7_strategy_recommendation.py)
-        6. Step 11: Independent Strategy Evaluation (core/scan_engine/step11_independent_evaluation.py)
-        7. Step 9A: Determine timeframes for each strategy (core/scan_engine/step9a_determine_timeframe.py)
-        8. Step 9B: Fetch option contracts (core/scan_engine/step9b_fetch_contracts.py)
-        9. Step 12: Acceptance Logic - Phase 1-2-3 enrichment (core/scan_engine/step12_acceptance.py)
-        10. Step 8: Final selection & position sizing (core/scan_engine/step8_position_sizing.py)
+    except Exception as e:
+        ctx.debug_manager.log_exception("pipeline", e, "Pipeline aborted")
+        logger.error(f"❌ Pipeline failed unexpectedly: {e}", exc_info=True)
     
-    Args:
-        snapshot_path (str): The absolute path to the IV/HV CSV file, resolved by the caller.
-        output_dir (str, optional): Directory for CSV exports. Uses OUTPUT_DIR env var if None.
-        account_balance (float): Account size for position sizing. Default $100,000.
-        max_portfolio_risk (float): Max portfolio risk (0-1). Default 0.20 (20%).
-        sizing_method (str): Position sizing method. Options: 'fixed_fractional', 'kelly', 
-                            'volatility_scaled', 'equal_weight'. Default 'volatility_scaled'.
-    
-    Returns:
-        dict: Dictionary with keys:
-            - 'snapshot': Raw IV/HV data (Step 2)
-            - 'filtered': IVHV-filtered tickers (Step 3)
-            - 'charted': Chart-enriched tickers (Step 5)
-            - 'validated_data': Data quality validated tickers (Step 6)
-            - 'recommended_strategies': Multi-strategy recommendations (Step 7)
-            - 'evaluated_strategies': Evaluated strategies (Step 11)
-            - 'timeframes': Strategy timeframes (Step 9A)
-            - 'selected_contracts': Selected contracts (Step 9B)
-            - 'acceptance_all': All contracts with acceptance status (Step 12)
-            - 'acceptance_ready': READY_NOW contracts with MEDIUM+ confidence (Step 12)
-            - 'final_trades': Final selected & sized positions (Step 8)
-            Empty dict keys if step fails
-    
-    Side Effects:
-        - Exports CSV files to output_dir with timestamps:
-          - Step3_Filtered_YYYYMMDD_HHMMSS.csv
-          - Step5_Charted_YYYYMMDD_HHMMSS.csv
-          - Step6_Validated_YYYYMMDD_HHMMSS.csv
-          - Step7_Recommended_YYYYMMDD_HHMMSS.csv
-          - Step11_Evaluated_YYYYMMDD_HHMMSS.csv
-          - Step9A_Timeframes_YYYYMMDD_HHMMSS.csv
-          - Step9B_SelectedContracts_YYYYMMDD_HHMMSS.csv
-          - Step8_Final_YYYYMMDD_HHMMSS.csv
-    
-    Error Handling:
-        - Logs errors at each step
-        - Stops pipeline if critical step fails
-        - Returns partial results if later steps fail
-    
-    Example:
-        >>> # Run full pipeline with all steps
-        >>> results = run_full_scan_pipeline(
-        ...     snapshot_path="data/ivhv_snapshot_20250101.csv",
-        ...     account_balance=50000,
-        ...     max_portfolio_risk=0.15,
-        ...     sizing_method='volatility_scaled'
-        ... )
-        >>> print(f"Final trades: {len(results['final_trades'])}")
-        >>> 
-        >>> # Run descriptive steps only (no strategy or sizing)
-        >>> results = run_full_scan_pipeline(snapshot_path="data/ivhv_snapshot_20250101.csv")
-        >>> validated_df = results['validated_data']
-    
-    Performance:
-        - Step 2: <1 second (file load)
-        - Step 3: <1 second (filtering)
-        - Step 5: ~1 sec per ticker (yfinance API)
-        - Step 6: <1 second (validation)
-        - Step 7: ~0.1 sec per ticker (strategy generation)
-        - Step 11: ~0.1 sec per strategy (evaluation)
-        - Step 9A: <1 second (timeframe assignment)
-        - Step 9B: ~2 sec per ticker (contract fetch)
-        - Step 8: <1 second (position sizing)
-        Total for 50 tickers: ~120 seconds (with contract fetching)
-    """
-    if output_dir is None:
-        output_dir = Path(os.getenv('OUTPUT_DIR', './output'))
-    else:
-        output_dir = Path(output_dir)
-    
-    output_dir.mkdir(parents=True, exist_ok=True)
+    _export_results(ctx)
+    return _finalize_results(ctx)
 
-    results = {}
-    timeframes_df = pd.DataFrame() # Initialize
-    evaluated_strategies_with_contracts = pd.DataFrame() # Initialize
-
-    # Step 2: Load snapshot
+def _step2_load_data(ctx: PipelineContext) -> bool:
     logger.info("📊 Step 2: Loading IV/HV snapshot...")
-    df_snapshot = load_ivhv_snapshot(snapshot_path)
-    results['snapshot'] = df_snapshot
+    t0 = time.time()
+    # Use modularized Step 2
+    df = load_ivhv_snapshot(
+        snapshot_path=ctx.snapshot_path,
+        use_live_snapshot=True if not ctx.snapshot_path else False
+    )
+    audit.profile("step2", df, (time.time()-t0)*1000)
+    audit.save_df("step2_output", df)
 
-    # Step 3: Filter by IVHV gap
-    logger.info("📊 Step 3: Filtering by IVHV gap...")
-    df_filtered = filter_ivhv_gap(df_snapshot)
-    results['filtered'] = df_filtered
-
-    if df_filtered.empty:
-        logger.warning("⚠️ No tickers passed Step 3. Pipeline stopped.")
-        return results
-
-    # Step 5: Chart scoring
-    logger.info("📊 Step 5: Computing chart signals...")
-    df_charted = compute_chart_signals(df_filtered)
-    results['charted'] = df_charted
-
-    if df_charted.empty:
-        logger.warning("⚠️ No tickers passed Step 5. Pipeline stopped.")
-        return results
-
-    # Step 6: Data quality validation
-    logger.info("📊 Step 6: Validating data quality...")
-    validated_data = validate_data_quality(df_charted)
-    results['validated_data'] = validated_data
-
-    if validated_data.empty:
-        logger.warning("⚠️ No tickers passed Step 6. Pipeline stopped.")
-        return results
-
-    # Step 7: Strategy Recommendation (Multi-Strategy Ledger)
-    logger.info("🎯 Step 7: Generating strategy recommendations...")
-    try:
-        recommended_strategies = recommend_strategies(validated_data)
-        results['recommended_strategies'] = recommended_strategies
-        logger.info(f"✅ Step 7 complete: {len(recommended_strategies)} strategies recommended")
-        logger.debug(f"DEBUG: Columns after Step 7: {recommended_strategies.columns.tolist()}")
-    except Exception as e:
-        logger.error(f"❌ Step 7 failed: {e}")
-        results['recommended_strategies'] = pd.DataFrame()
-        return results
-
-    if recommended_strategies.empty:
-        logger.warning("⚠️ No strategies recommended from Step 7. Pipeline stopped.")
-        return results
-
-    # Step 11: Independent Strategy Evaluation
-    logger.info("🎯 Step 11: Independent strategy evaluation...")
-    try:
-        evaluated_strategies = evaluate_strategies_independently(
-            recommended_strategies,
-            user_goal='income',
-            account_size=account_balance,
-            risk_tolerance='moderate'
-        )
-        results['evaluated_strategies'] = evaluated_strategies
-        logger.info(f"✅ Step 11 complete: {len(evaluated_strategies)} strategies independently evaluated")
-        logger.debug(f"DEBUG: Columns after Step 11: {evaluated_strategies.columns.tolist()}")
-    except Exception as e:
-        logger.error(f"❌ Step 11 failed: {e}")
-        results['evaluated_strategies'] = pd.DataFrame()
-
-    # Conditional execution for Step 9A and 9B
-    if results['evaluated_strategies'].empty:
-        logger.warning("⚠️ Step 9A/9B skipped: No evaluated strategies from Step 11")
-        results['timeframes'] = pd.DataFrame()
-        results['selected_contracts'] = pd.DataFrame()
-        evaluated_strategies_with_contracts = pd.DataFrame() # Ensure this is empty if no strategies
-    else:
-        # Step 9A: Determine Timeframe
-        logger.info("⏱️ Step 9A: Determining timeframes for evaluated strategies...")
-        try:
-            timeframes_df = determine_timeframe(results['evaluated_strategies'])
-            results['timeframes'] = timeframes_df
-            logger.info(f"✅ Step 9A complete: {len(timeframes_df)} timeframes determined")
-        except Exception as e:
-            logger.error(f"❌ Step 9A failed: {e}")
-            results['timeframes'] = pd.DataFrame()
-            timeframes_df = pd.DataFrame() # Ensure timeframes_df is empty on failure
-
-        if timeframes_df.empty:
-            logger.warning("⚠️ Step 9B skipped: No timeframes from Step 9A")
-            results['selected_contracts'] = pd.DataFrame()
-            evaluated_strategies_with_contracts = results['evaluated_strategies'] # Pass original strategies if no contracts
+    # Deterministic Debug Mode Override
+    if ctx.debug_manager.enabled:
+        logger.info(f"🧪 DEBUG MODE ENABLED: Overriding universe with {DEBUG_TICKERS}")
+        # Identify ID column (Symbol or Ticker)
+        id_col = 'Symbol' if 'Symbol' in df.columns else 'Ticker'
+        if id_col in df.columns:
+            df = df[df[id_col].isin(DEBUG_TICKERS)].copy()
+            logger.info(f"   Universe filtered to {len(df)} debug tickers")
         else:
-            # Step 9B: Fetch and Select Contracts (Schwab Production)
-            logger.info("⛓️ Step 9B: Fetching and selecting contracts from Schwab...")
-            try:
-                evaluated_strategies_with_contracts = fetch_and_select_contracts_schwab(
-                    results['evaluated_strategies'],
-                    timeframes_df
-                )
-                results['selected_contracts'] = evaluated_strategies_with_contracts
-                logger.info(f"✅ Step 9B complete: {len(evaluated_strategies_with_contracts)} contracts selected")
-            except Exception as e:
-                logger.error(f"❌ Step 9B failed: {e}", exc_info=True) # Added exc_info
-                results['selected_contracts'] = pd.DataFrame()
-                evaluated_strategies_with_contracts = results['evaluated_strategies'] # Fallback to original strategies
+            logger.warning("   Could not find ID column for debug filtering")
 
-    # Step 12: Acceptance Logic (Phase 3)
-    if not evaluated_strategies_with_contracts.empty:
-        logger.info("✅ Step 12: Applying acceptance logic (Phase 1-2-3)...")
-        try:
-            # Apply acceptance logic to all contracts
-            evaluated_strategies_with_contracts = apply_acceptance_logic(evaluated_strategies_with_contracts)
-            
-            # Filter for READY_NOW with MEDIUM+ confidence
-            ready_contracts = filter_ready_contracts(evaluated_strategies_with_contracts, min_confidence='MEDIUM')
-            
-            if not ready_contracts.empty:
-                logger.info(f"✅ Step 12 complete: {len(ready_contracts)} READY_NOW contracts (MEDIUM+ confidence)")
-                logger.info(f"   Total evaluated: {len(evaluated_strategies_with_contracts)} | "
-                           f"Filtered: {len(evaluated_strategies_with_contracts) - len(ready_contracts)}")
-            else:
-                logger.info("⚠️ Step 12: No READY_NOW contracts at MEDIUM+ confidence")
-                logger.info(f"   All {len(evaluated_strategies_with_contracts)} contracts filtered by acceptance logic")
-            
-            # Store both full and filtered results
-            results['acceptance_all'] = evaluated_strategies_with_contracts  # All contracts with acceptance status
-            results['acceptance_ready'] = ready_contracts  # Only READY_NOW with MEDIUM+ confidence
-            
-            # Use ready_contracts for Step 8 position sizing
-            evaluated_strategies_with_contracts = ready_contracts
-            
-        except Exception as e:
-            logger.error(f"❌ Step 12 failed: {e}", exc_info=True)
-            # Continue with unfiltered contracts if acceptance logic fails
-            results['acceptance_all'] = pd.DataFrame()
-            results['acceptance_ready'] = pd.DataFrame()
-    else:
-        logger.warning("⚠️ Step 12 skipped: No contracts from Step 9B")
-        results['acceptance_all'] = pd.DataFrame()
-        results['acceptance_ready'] = pd.DataFrame()
+    ctx.results['snapshot'] = df
+    ctx.debug_manager.record_step('step2_snapshot', len(df), df)
+    
+    if ctx.audit_mode:
+        df = ctx.audit_mode.filter_to_audit_tickers(df)
+        df = ctx.audit_mode.save_step(df, "snapshot_enriched", "Raw snapshot + IV surface + earnings enrichment")
+        ctx.results['snapshot'] = df
+    return not df.empty
 
-    # Step 8: Final Selection & Position Sizing
-    # Use evaluated_strategies_with_contracts, which is either the enriched DF or the original evaluated_strategies
-    if evaluated_strategies_with_contracts.empty:
-        logger.warning("⚠️ Step 8 skipped: No evaluated strategies or contracts for sizing")
-        results['final_trades'] = pd.DataFrame()
-    else:
-        logger.info("💰 Step 8: Portfolio capital allocation...")
-        try:
-            final_trades = allocate_portfolio_capital(
-                evaluated_strategies_with_contracts,
-                account_balance=account_balance,
-                max_portfolio_risk=max_portfolio_risk,
-                max_trade_risk=0.02,
-                min_compliance_score=60.0,
-                max_strategies_per_ticker=50,
-                sizing_method=sizing_method
-            )
-            results['final_trades'] = final_trades
-            logger.info(f"✅ Step 8 complete: {len(final_trades)} final trades selected")
-        except Exception as e:
-            logger.error(f"❌ Step 8 failed: {e}", exc_info=True) # Added exc_info
-            results['final_trades'] = pd.DataFrame()
+def _step3_filter_tickers(ctx: PipelineContext) -> bool:
+    logger.info("📊 Step 3: Filtering by IVHV gap...")
+    df_input = ctx.results['snapshot']
+    audit.save_df("step3_input", df_input)
+    t0 = time.time()
+    df = filter_ivhv_gap(df_input)
+    audit.profile("step3", df, (time.time()-t0)*1000)
+    audit.save_df("step3_output", df)
+    ctx.results['filtered'] = df
+    ctx.debug_manager.record_step('step3_filtered', len(df), df)
+    
+    if ctx.audit_mode:
+        df = ctx.audit_mode.save_step(df, "ivhv_filtered", "IVHV gap filter applied")
+        
+    if df.empty:
+        ctx.debug_manager.log_event("step3", "WARN", "EMPTY_FILTER_RESULT", "No tickers passed IVHV gap criteria")
+    return not df.empty
 
-    # Export results
+def _step5_6_enrich_and_validate(ctx: PipelineContext) -> bool:
+    logger.info("📊 Step 5: Computing chart signals...")
+    df_input = ctx.results['filtered']
+    audit.save_df("step5_input", df_input)
+    t0 = time.time()
+    df_charted = compute_chart_signals(df_input)
+    audit.profile("step5", df_charted, (time.time()-t0)*1000)
+    audit.save_df("step5_output", df_charted)
+    ctx.results['charted'] = df_charted
+    ctx.debug_manager.record_step('step5_charted', len(df_charted), df_charted)
+    
+    if ctx.audit_mode:
+        ctx.audit_mode.save_step(df_charted, "chart_signals", "Technical analysis")
+
+    if df_charted.empty: return False
+
+    logger.info("📊 Step 6: Validating data quality...")
+    validated = validate_data_quality(df_charted)
+    ctx.results['validated_data'] = validated
+    ctx.debug_manager.record_step('step6_validated', len(validated), validated)
+    
+    if ctx.audit_mode:
+        ctx.audit_mode.save_step(validated, "data_validated", "Data quality validation")
+    return not validated.empty
+
+def _step7_11_recommend_and_evaluate(ctx: PipelineContext) -> bool:
+    logger.info("🎯 Step 7: Generating strategy recommendations...")
+    recommended = recommend_strategies(ctx.results['validated_data'])
+    ctx.results['recommended_strategies'] = recommended
+    ctx.debug_manager.record_step('step7_recommended', len(recommended), recommended)
+    
+    # Phase 7.5: IV Demand Emission (Demand-Driven Architecture)
+    df_demand = emit_iv_demand(recommended)
+    audit.save_demand(df_demand)
+    ctx.results['iv_demand'] = df_demand
+
+    if recommended.empty: return False
+
+    logger.info("🎯 Step 11: Independent strategy evaluation...")
+    evaluated = evaluate_strategies_independently(recommended, account_size=ctx.account_balance)
+    ctx.results['evaluated_strategies'] = evaluated
+    ctx.debug_manager.record_step('step11_evaluated', len(evaluated), evaluated)
+    return not evaluated.empty
+
+def _step9_select_contracts(ctx: PipelineContext) -> bool:
+    logger.info(f"⏱️ Step 9A: Determining timeframes...")
+    timeframes = determine_timeframe(ctx.results['evaluated_strategies'], expiry_intent=ctx.expiry_intent)
+    ctx.results['timeframes'] = timeframes
+    if timeframes.empty: return False
+
+    logger.info(f"⛓️ Step 9B: Fetching contracts from Schwab...")
+    contracts = fetch_and_select_contracts_schwab(ctx.results['evaluated_strategies'], timeframes, expiry_intent=ctx.expiry_intent)
+    
+    # Re-evaluate with real Greeks
+    contracts = evaluate_strategies_independently(contracts, account_size=ctx.account_balance)
+    ctx.results['selected_contracts'] = contracts
+    ctx.debug_manager.record_step('step9b_contracts', len(contracts), contracts)
+    return not contracts.empty
+
+def _step10_recalibrate_pcs(ctx: PipelineContext) -> bool:
+    logger.info(f"📈 Step 10: Recalibrating PCS scores...")
+    # Step 10 expects 'Primary_Strategy' but Step 7/9B uses 'Strategy_Name'
+    df = ctx.results['selected_contracts'].copy()
+    if 'Primary_Strategy' not in df.columns and 'Strategy_Name' in df.columns:
+        df['Primary_Strategy'] = df['Strategy_Name']
+        
+    recalibrated = recalibrate_and_filter(df)
+    ctx.results['recalibrated_contracts'] = recalibrated
+    ctx.debug_manager.record_step('step10_recalibrated', len(recalibrated), recalibrated)
+    return not recalibrated.empty
+
+def _step12_8_acceptance_and_sizing(ctx: PipelineContext):
+    logger.info(f"✅ Step 12: Applying acceptance logic...")
+    # Use recalibrated contracts if available
+    input_df = ctx.results.get('recalibrated_contracts', ctx.results['selected_contracts'])
+    audit.save_df("step12_input", input_df)
+    t0 = time.time()
+    all_acceptance = apply_acceptance_logic(input_df, expiry_intent=ctx.expiry_intent)
+    audit.profile("step12", all_acceptance, (time.time()-t0)*1000)
+    audit.save_df("step12_output", all_acceptance)
+    audit.export_ready_now_evidence(all_acceptance)
+    
+    ctx.results['acceptance_all'] = all_acceptance
+    
+    # Action 1: Enforce READY_NOW Exclusivity
+    # Step 12 is a semantic firewall. Only READY_NOW is permitted to proceed to sizing.
+    ready = all_acceptance[all_acceptance['acceptance_status'] == 'READY_NOW'].copy()
+    
+    # Audit 1: Acceptance Determinism Audit
+    # Prove Step 12 is purely functional: Same input -> same output.
+    # We run it again on a copy and assert equality.
+    re_acceptance = apply_acceptance_logic(input_df.copy(), expiry_intent=ctx.expiry_intent)
+    assert all_acceptance.equals(re_acceptance), "❌ GOVERNANCE VIOLATION: Step 12 is non-deterministic!"
+    
+    # Audit 2: Discovery Explosion Control
+    # Track strategy density to prevent combinatorial explosion.
+    if not all_acceptance.empty:
+        ticker_counts = all_acceptance.groupby('Ticker').size()
+        avg_density = ticker_counts.mean()
+        max_density = ticker_counts.max()
+        
+        ctx.results['strategy_density'] = {
+            'avg_strategies_per_ticker': avg_density,
+            'max_strategies_per_ticker': max_density,
+            'density_exceeded': max_density > 50  # Diagnostic ceiling
+        }
+        
+        logger.info(f"📊 Strategy Density: Avg={avg_density:.2f}, Max={max_density} (Ceiling: 50)")
+        if max_density > 50:
+            logger.warning(f"⚠️ Discovery Explosion Detected: {max_density} strategies for a single ticker")
+
+    ctx.results['acceptance_ready'] = ready
+    
+    if not ready.empty:
+        logger.info(f"💰 Step 8: Computing thesis capacity...")
+        audit.save_df("step8_input", ready)
+        t0 = time.time()
+        envelopes = compute_thesis_capacity(ready, account_balance=ctx.account_balance, sizing_method=ctx.sizing_method)
+        audit.profile("step8", envelopes, (time.time()-t0)*1000)
+        audit.save_df("step8_output", envelopes)
+        ctx.results['thesis_envelopes'] = envelopes
+        ctx.debug_manager.record_step('step8_thesis_envelopes', len(envelopes), envelopes)
+
+def _finalize_results(ctx: PipelineContext) -> dict:
+    res = ctx.results
+    res['pipeline_health'] = _generate_health_summary_dict(res)
+    stress_level, median_iv, stress_basis = check_market_stress()
+    
+    # FIX 8: Surface IV Clock State
+    # market_date = Schwab/Fidelity truth (validity date)
+    # scan_timestamp = System truth (capture time)
+    last_market_date = "UNKNOWN"
+    history_days = 0
+    if 'acceptance_all' in res and not res['acceptance_all'].empty:
+        df = res['acceptance_all']
+        if 'iv_surface_date' in df.columns:
+            last_market_date = df['iv_surface_date'].max()
+        if 'iv_history_count' in df.columns:
+            history_days = df['iv_history_count'].max()
+
+    # Determine Clock State from Data Provenance
+    # ADVANCING: Market is open and data is fresh
+    # PAUSED_MARKET_CLOSED: Weekend or holiday
+    # PAUSED_DATA_GAP: Scraper failure or ingestion lag
+    
+    # FIX 9: Derive market state from snapshot, not runtime clock.
+    # We use the 'market_status' field present in the raw snapshot (Step 0).
+    market_status = "UNKNOWN"
+    if 'snapshot' in res and not res['snapshot'].empty:
+        if 'market_status' in res['snapshot'].columns:
+            market_status = res['snapshot']['market_status'].iloc[0]
+    
+    clock_state = "ADVANCING"
+    if market_status == "CLOSED":
+        clock_state = "PAUSED_MARKET_CLOSED"
+    elif market_status == "UNKNOWN":
+        clock_state = "PAUSED_DATA_GAP"
+    
+    res['market_stress'] = {
+        'level': stress_level, 
+        'median_iv': median_iv, 
+        'basis': stress_basis,
+        'last_market_date': str(last_market_date),
+        'scan_timestamp': datetime.utcnow().isoformat(),
+        'iv_history_days': f"{history_days} / 120",
+        'iv_clock_state': clock_state,
+        'market_status_source': "SNAPSHOT"
+    }
+    
+    # OPERATIONAL FIX: Provenance Telemetry
+    # Track distribution of data sources and maturity states for scaling visibility.
+    if 'acceptance_all' in res and not res['acceptance_all'].empty:
+        df = res['acceptance_all']
+        if 'iv_surface_source' in df.columns:
+            res['provenance_telemetry'] = {
+                'source_distribution': df['iv_surface_source'].value_counts().to_dict(),
+                'maturity_distribution': df.get('IV_Maturity_State', pd.Series(['UNKNOWN']*len(df))).value_counts().to_dict()
+            }
+            logger.info(f"📊 Provenance Telemetry: {res['provenance_telemetry']['source_distribution']}")
+
+    if 'charted' in res and 'filtered' in res:
+        res['regime_info'] = classify_market_regime(res['charted'], res['filtered'])
+    
+    if ctx.debug_manager.enabled:
+        res['debug_summary'] = ctx.debug_manager.get_summary()
+    
+    _log_pipeline_health_summary(res)
+    return res
+
+def _export_results(ctx: PipelineContext):
     try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        df_filtered.to_csv(output_dir / f"Step3_Filtered_{timestamp}.csv", index=False)
-        df_charted.to_csv(output_dir / f"Step5_Charted_{timestamp}.csv", index=False)
-        validated_data.to_csv(output_dir / f"Step6_Validated_{timestamp}.csv", index=False)
-        if not results.get('recommended_strategies', pd.DataFrame()).empty:
-            results['recommended_strategies'].to_csv(output_dir / f"Step7_Recommended_{timestamp}.csv", index=False)
-        if not results['evaluated_strategies'].empty:
-            results['evaluated_strategies'].to_csv(output_dir / f"Step11_Evaluated_{timestamp}.csv", index=False)
-        if not results['timeframes'].empty: # Export Step 9A output
-            results['timeframes'].to_csv(output_dir / f"Step9A_Timeframes_{timestamp}.csv", index=False)
-        if not results['selected_contracts'].empty: # Export Step 9B output
-            results['selected_contracts'].to_csv(output_dir / f"Step9B_SelectedContracts_{timestamp}.csv", index=False)
-        if not results.get('acceptance_all', pd.DataFrame()).empty: # Export Step 12 all contracts
-            results['acceptance_all'].to_csv(output_dir / f"Step12_Acceptance_{timestamp}.csv", index=False)
-        if not results.get('acceptance_ready', pd.DataFrame()).empty: # Export Step 12 READY_NOW
-            results['acceptance_ready'].to_csv(output_dir / f"Step12_Ready_{timestamp}.csv", index=False)
-        if not results['final_trades'].empty:
-            results['final_trades'].to_csv(output_dir / f"Step8_Final_{timestamp}.csv", index=False)
-        logger.info(f"✅ Exports complete → {output_dir}")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for key, df in ctx.results.items():
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df.to_csv(ctx.output_dir / f"{key}_{ts}.csv", index=False)
     except Exception as e:
-        logger.error(f"❌ Export failed: {e}", exc_info=True) # Added exc_info
+        logger.error(f"❌ Export failed: {e}")
 
-    return results
+
+def _generate_health_summary_dict(results: dict) -> dict:
+    selected_contracts = results.get('selected_contracts', pd.DataFrame())
+    acceptance_all = results.get('acceptance_all', pd.DataFrame())
+    acceptance_ready = results.get('acceptance_ready', pd.DataFrame())
+    thesis_envelopes = results.get('thesis_envelopes', pd.DataFrame())
+    
+    step9b_total = len(selected_contracts)
+    step9b_valid = 0
+    if not selected_contracts.empty and 'Validation_Status' in selected_contracts.columns:
+        step9b_valid = (selected_contracts['Validation_Status'] == 'Valid').sum()
+    
+    step12_total = len(acceptance_all)
+    step12_ready_now = 0
+    if not acceptance_all.empty and 'acceptance_status' in acceptance_all.columns:
+        step12_ready_now = (acceptance_all['acceptance_status'] == 'READY_NOW').sum()
+    
+    step8_count = len(thesis_envelopes)
+    
+    quality = {
+        'step9b_success_rate': (step9b_valid / step9b_total * 100) if step9b_total > 0 else 0,
+        'step12_acceptance_rate': (step12_ready_now / step12_total * 100) if step12_total > 0 else 0,
+        'step8_annotation_rate': (step8_count / step12_ready_now * 100) if step12_ready_now > 0 else 0,
+        'end_to_end_rate': (step8_count / step9b_total * 100) if step9b_total > 0 else 0
+    }
+    
+    return {
+        'step9b': {'total_contracts': step9b_total, 'valid': step9b_valid},
+        'step12': {'total_evaluated': step12_total, 'ready_now': step12_ready_now},
+        'step8': {'thesis_envelopes': step8_count},
+        'quality': quality
+    }
+
+
+def _log_pipeline_health_summary(results: dict):
+    logger.info("\n" + "="*80)
+    logger.info("📊 PIPELINE HEALTH SUMMARY (Phase 1-2-3)")
+    logger.info("="*80)
+    
+    selected_contracts = results.get('selected_contracts', pd.DataFrame())
+    acceptance_all = results.get('acceptance_all', pd.DataFrame())
+    thesis_envelopes = results.get('thesis_envelopes', pd.DataFrame())
+    
+    logger.info(f"🔗 Step 9B: Contract Selection - Total: {len(selected_contracts)}")
+    logger.info(f"✅ Step 12: Acceptance Logic - READY_NOW: {len(results.get('acceptance_ready', pd.DataFrame()))}")
+    logger.info(f"💰 Step 8: Thesis Capacity - Envelopes Generated: {len(thesis_envelopes)}")
+    logger.info("\n" + "="*80 + "\n")

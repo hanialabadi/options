@@ -139,7 +139,31 @@ def recalibrate_and_filter(
     # ========================================
     logger.info("📈 Phase 2: Calculating enhanced PCS scores...")
     try:
+        # FIX 3: Disable PCS pre-maturity (Early Exit)
+        # PCS is illegal without mature IV.
+        if 'IV_Maturity_State' in df.columns:
+            immature_mask = df['IV_Maturity_State'] != 'MATURE'
+            if immature_mask.all():
+                logger.info("⚠️ Skipping PCS execution: All rows have IMMATURE IV")
+                df['PCS_Status'] = 'INACTIVE'
+                df['PCS_Score_V2'] = np.nan
+                df['PCS_Score'] = np.nan
+                df['Filter_Reason'] = 'IV_NOT_MATURE'
+                return _finalize_step10(df)
+            elif immature_mask.any():
+                logger.info(f"⚠️ Partial PCS execution: Skipping {immature_mask.sum()} immature IV rows")
+                # We will process the whole DF but overwrite immature rows after
+        
         df = calculate_pcs_score_v2(df)
+        
+        if 'IV_Maturity_State' in df.columns:
+            immature_mask = df['IV_Maturity_State'] != 'MATURE'
+            if immature_mask.any():
+                df.loc[immature_mask, 'PCS_Status'] = 'INACTIVE'
+                df.loc[immature_mask, 'PCS_Score_V2'] = np.nan
+                df.loc[immature_mask, 'PCS_Score'] = np.nan
+                df.loc[immature_mask, 'Filter_Reason'] = 'IV_NOT_MATURE'
+        
         analysis = analyze_pcs_distribution(df)
         logger.info(f"   ✅ PCS scoring complete")
         logger.info(f"      Mean score: {analysis.get('mean_score', 0):.1f}")
@@ -205,6 +229,24 @@ def recalibrate_and_filter(
     # Log summary
     _log_filter_summary(df)
     
+    return df
+
+
+def _finalize_step10(df: pd.DataFrame) -> pd.DataFrame:
+    """Helper to finalize Step 10 columns and promotion logic."""
+    if 'PCS_Status' in df.columns:
+        df['Pre_Filter_Status'] = df['PCS_Status']
+        if 'PCS_Score_V2' in df.columns:
+            df['PCS_Score'] = df['PCS_Score_V2']
+    
+    df['Execution_Ready'] = False
+    for idx, row in df.iterrows():
+        status = row.get('Pre_Filter_Status')
+        if status == 'Valid' and row.get('Contract_Intent') == 'Scan':
+            df.at[idx, 'Contract_Intent'] = 'Execution_Candidate'
+            df.at[idx, 'Execution_Ready'] = True
+            
+    _log_filter_summary(df)
     return df
 
 

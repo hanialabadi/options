@@ -22,104 +22,8 @@ from .utils import validate_input
 
 logger = logging.getLogger(__name__)
 
-# Import Schwab client for price history (Schwab-first migration)
-try:
-    from .schwab_api_client import SchwabClient
-    SCHWAB_AVAILABLE = True
-except ImportError:
-    SCHWAB_AVAILABLE = False
-    logger.warning("⚠️ Schwab API client not available, falling back to yfinance")
-    
-# Fallback to yfinance if Schwab unavailable (defensive)
-try:
-    import yfinance as yf
-    YFINANCE_AVAILABLE = True
-except ImportError:
-    YFINANCE_AVAILABLE = False
-    logger.warning("⚠️ yfinance not available")
-
-
-def fetch_schwab_price_history(client: 'SchwabClient', ticker: str, days: int = 180) -> tuple[pd.DataFrame | None, str]:
-    """
-    Fetch price history from Schwab with retry logic.
-    
-    This mirrors the logic from step0_schwab_snapshot.py for consistency.
-    
-    Args:
-        client: SchwabClient instance
-        ticker: Stock ticker symbol
-        days: Number of days of history (default 180 for chart signals)
-    
-    Returns:
-        Tuple of (DataFrame with OHLC data, status string)
-        Status: "OK", "TIMEOUT", "RATE_LIMIT", "AUTH_ERROR", "INSUFFICIENT_DATA", "UNKNOWN"
-    """
-    max_attempts = 2
-    backoff = [0.5, 1.0]
-    
-    for attempt in range(max_attempts):
-        try:
-            # Schwab API call
-            response = client.get_price_history(
-                symbol=ticker,
-                periodType="day",
-                period=1,  # Get all available data
-                frequencyType="daily",
-                frequency=1
-            )
-            
-            if not response or 'candles' not in response or not response['candles']:
-                return None, "INSUFFICIENT_DATA"
-            
-            # Convert to DataFrame
-            candles = response['candles']
-            df = pd.DataFrame(candles)
-            
-            # Rename columns to match yfinance format
-            df = df.rename(columns={
-                'open': 'Open',
-                'high': 'High',
-                'low': 'Low',
-                'close': 'Close',
-                'volume': 'Volume'
-            })
-            
-            # Convert datetime
-            if 'datetime' in df.columns:
-                df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
-                df = df.set_index('datetime')
-            
-            # Filter to requested days
-            if len(df) > days:
-                df = df.tail(days)
-            
-            if len(df) < 30:
-                return None, "INSUFFICIENT_DATA"
-            
-            return df, "OK"
-            
-        except requests.exceptions.Timeout:
-            if attempt < max_attempts - 1:
-                time.sleep(backoff[attempt])
-            else:
-                return None, "TIMEOUT"
-                
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
-                if attempt < max_attempts - 1:
-                    time.sleep(backoff[attempt])
-                else:
-                    return None, "RATE_LIMIT"
-            elif e.response.status_code == 401:
-                return None, "AUTH_ERROR"
-            else:
-                return None, "UNKNOWN"
-                
-        except Exception as e:
-            logger.debug(f"Schwab price history error for {ticker}: {e}")
-            return None, "UNKNOWN"
-    
-    return None, "UNKNOWN"
+from .price_history_loader import load_price_history
+from .schwab_api_client import SchwabClient
 
 
 def classify_regime(row: dict) -> str:
@@ -247,48 +151,23 @@ def compute_chart_signals(df: pd.DataFrame) -> pd.DataFrame:
     
     # Initialize Schwab client if available
     schwab_client = None
-    if SCHWAB_AVAILABLE:
-        try:
-            # Load credentials from env (same as Step 0)
-            client_id = os.getenv("SCHWAB_APP_KEY")
-            client_secret = os.getenv("SCHWAB_APP_SECRET")
-            
-            if client_id and client_secret:
-                schwab_client = SchwabClient(client_id, client_secret)
-                logger.info("✅ Using Schwab for price history (Schwab-only mode)")
-            else:
-                logger.warning("⚠️ Schwab credentials not found - chart signals will use snapshot data only")
-        except Exception as e:
-            logger.warning(f"⚠️ Schwab client initialization failed: {e} - using snapshot data only")
-            schwab_client = None
-    else:
-        logger.warning("⚠️ Schwab API not available - using snapshot data only")
+    try:
+        # Load credentials from env (same as Step 0)
+        client_id = os.getenv("SCHWAB_APP_KEY")
+        client_secret = os.getenv("SCHWAB_APP_SECRET")
+        
+        if client_id and client_secret:
+            schwab_client = SchwabClient(client_id, client_secret)
+            logger.info("✅ Using Schwab for price history (Schwab-first mode)")
+    except Exception as e:
+        logger.warning(f"⚠️ Schwab client initialization failed: {e} - falling back to cache/yfinance")
     
     for idx, (_, row) in enumerate(df.iterrows()):
         ticker = row['Ticker']
         
-        # Rate limiting
-        if idx > 0 and idx % 10 == 0:
-            time.sleep(0.5)
-        
         try:
-            # Fetch price history: Schwab-only
-            hist = None
-            chart_source = "Unknown"
-            
-            if schwab_client is not None:
-                hist, status = fetch_schwab_price_history(schwab_client, ticker, days=180)
-                if status == "OK" and hist is not None:
-                    logger.debug(f"✅ {ticker}: Schwab price history ({len(hist)} days)")
-                    chart_source = "Schwab"
-                else:
-                    logger.debug(f"⚠️ {ticker}: Schwab status {status} - using snapshot-derived data")
-                    hist = None
-                    chart_source = "Snapshot"
-            else:
-                # No Schwab client - use snapshot data with minimal chart signals
-                chart_source = "Snapshot"
-                logger.debug(f"📊 {ticker}: Using snapshot-derived signals only")
+            # Fetch price history using unified loader
+            hist, chart_source = load_price_history(ticker, days=180, client=schwab_client)
             
             # Skip if no data available and cannot derive from snapshot
             if hist is None or len(hist) < 30:
@@ -404,14 +283,26 @@ def compute_chart_signals(df: pd.DataFrame) -> pd.DataFrame:
     # Merge with original data
     # 🚨 ASSERTION: Ensure original 'Signal_Type' and 'Regime' are NOT overwritten.
     # They are authoritative from Step 2.
-    df_charted = pd.merge(df, chart_df, on="Ticker", how="inner", suffixes=('_original', '_chart'))
+    df_charted = pd.merge(df, chart_df, on="Ticker", how="inner", suffixes=('', '_chart'))
     
-    # Explicitly drop any potentially conflicting columns from the merge if they were not namespaced
-    # (This is a defensive measure, as the above code should already namespace them)
-    for col in ['Regime_chart', 'Signal_Type_chart']:
-        if col in df_charted.columns:
-            df_charted = df_charted.drop(columns=[col])
+    # Drop chart-suffixed duplicates to preserve original columns
+    # This keeps Price_vs_SMA20, Price_vs_SMA50 etc from Step 2
+    chart_suffix_cols = [col for col in df_charted.columns if col.endswith('_chart')]
+    if chart_suffix_cols:
+        logger.debug(f"Dropping {len(chart_suffix_cols)} chart-suffixed duplicates: {chart_suffix_cols[:5]}")
+        df_charted = df_charted.drop(columns=chart_suffix_cols)
     
-    logger.info(f"✅ Merge complete: {len(df_charted)} rows")
+    logger.info(f"✅ Merge complete: {len(df_charted)} rows, {len(df_charted.columns)} columns")
+    
+    # 🛡️ GOVERNANCE: Lock Phase 3 Hard Gate (Technicals)
+    from core.governance.contracts import validate_phase_output
+    validate_phase_output(
+        df_charted, 
+        phase="P3",
+        required_cols=['Signal_Type', 'Regime'],
+        enum_checks={
+            'Signal_Type': ['Bullish', 'Bearish', 'Bidirectional']
+        }
+    )
     
     return df_charted

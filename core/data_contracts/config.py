@@ -11,6 +11,10 @@ but can be overridden via environment variables.
 import os
 from pathlib import Path
 
+# === Management Safe Mode ===
+# When True, disables Scan-only logic, IV maturity gating, and discovery noise.
+MANAGEMENT_SAFE_MODE = os.getenv("MANAGEMENT_SAFE_MODE", "True").lower() == "true"
+
 # === Project Root ===
 PROJECT_ROOT = Path(__file__).parent.parent.parent  # options/
 

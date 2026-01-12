@@ -35,7 +35,7 @@ def print_divider(title=""):
 def main():
     print_divider("🧪 FULL CLI PIPELINE TEST: SCHWAB-FIRST (20 TICKERS)")
     
-    # Test tickers (first 20 from tickers copy.csv)
+    # Test tickers (first 20 from tickers.csv)
     test_tickers = [
         "BKNG", "AZO", "MELI", "MKL", "FCNCA",
         "FICO", "TDG", "NFLX", "MTD", "TPL",

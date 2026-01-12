@@ -28,14 +28,12 @@ from .step6_gem_filter import validate_data_quality
 from .step7_strategy_recommendation import recommend_strategies
 from .step0_resolve_snapshot import resolve_snapshot_path
 from .step7b_multi_strategy_ranker import generate_multi_strategy_suggestions, rank_strategies_by_criteria
-from .step8_position_sizing import allocate_portfolio_capital # Use the new function directly
+from .step8_position_sizing import compute_thesis_capacity
 from .step9a_determine_timeframe import determine_timeframe
 
-# Force reload step9b_fetch_contracts to avoid caching issues during development
-import sys
-if 'core.scan_engine.step9b_fetch_contracts' in sys.modules:
-    del sys.modules['core.scan_engine.step9b_fetch_contracts']
-from .step9b_fetch_contracts import fetch_and_select_contracts # This is now the public wrapper
+# Schwab-native option chain fetcher (Step 9B)
+# Note: step9b_fetch_contracts.py (Tradier version) archived to _archived_legacy/
+from .step9b_fetch_contracts_schwab import fetch_and_select_contracts_schwab as fetch_and_select_contracts
 
 from .step10_pcs_recalibration import recalibrate_and_filter
 from .step11_independent_evaluation import evaluate_strategies_independently # Correct import for Step 11
@@ -84,7 +82,7 @@ __all__ = [
     'recommend_strategies',
     'generate_multi_strategy_suggestions',
     'rank_strategies_by_criteria',
-    'allocate_portfolio_capital',
+    'compute_thesis_capacity',
     'determine_timeframe',
     'fetch_and_select_contracts', # This is now the public wrapper
     'recalibrate_and_filter',
@@ -95,4 +93,3 @@ __all__ = [
 ]
 
 __version__ = '1.0.0'
-# Force module reload for development purposes

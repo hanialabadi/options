@@ -91,6 +91,11 @@ def calculate_pcs_score_v2(df: pd.DataFrame) -> pd.DataFrame:
         base_score -= risk_penalty
         penalties.extend(risk_reasons)
         
+        # 5. History Quality penalties (Volatility Identity Card)
+        history_penalty, history_reasons = _calculate_history_penalties(row)
+        base_score -= history_penalty
+        penalties.extend(history_reasons)
+        
         # Floor at 0
         final_score = max(0.0, base_score)
         
@@ -326,6 +331,43 @@ def _calculate_risk_penalties(row: pd.Series) -> Tuple[float, List[str]]:
         total_penalty += penalty
         penalties.append(f'High Risk (${risk:,.0f}, -{penalty:.0f} pts)')
     
+    return total_penalty, penalties
+
+
+def _calculate_history_penalties(row: pd.Series) -> Tuple[float, List[str]]:
+    """
+    Calculate penalties based on IV History quality (Volatility Identity Card).
+    
+    Rules:
+    - iv_data_stale: -15 pts (unreliable recent trend)
+    - regime_confidence < 0.5: -10 pts (fragmented history)
+    - history_depth_ok is False: -10 pts (insufficient lookback)
+    
+    Returns:
+        (total_penalty, list_of_reasons)
+    """
+    iv_data_stale = row.get('iv_data_stale', True)
+    regime_confidence = row.get('regime_confidence', 0.0)
+    history_depth_ok = row.get('history_depth_ok', False)
+    
+    penalties = []
+    total_penalty = 0.0
+    
+    if iv_data_stale:
+        penalty = 15.0
+        total_penalty += penalty
+        penalties.append(f'Stale IV History (-{penalty:.0f} pts)')
+        
+    if regime_confidence < 0.5:
+        penalty = 10.0
+        total_penalty += penalty
+        penalties.append(f'Low Regime Confidence ({regime_confidence:.2f}, -{penalty:.0f} pts)')
+        
+    if not history_depth_ok:
+        penalty = 10.0
+        total_penalty += penalty
+        penalties.append(f'Insufficient History Depth (-{penalty:.0f} pts)')
+        
     return total_penalty, penalties
 
 

@@ -53,7 +53,8 @@ def run_full_revalidation_pipeline():
 
     # Step 4: Rerun V6 overlay
     print("🧠 Running V6 overlay...")
-    run_v6_overlay()
+    df = run_v6_overlay(df)
+    save_active_master(df)
 
     print("✅ Revalidation complete.")
 

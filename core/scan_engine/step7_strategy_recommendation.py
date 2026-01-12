@@ -124,13 +124,13 @@ def _validate_long_put(ticker: str, row: pd.Series) -> Optional[Dict]:
     gap_30d = row.get('IVHV_gap_30D', 0)
     
     # Calculate longer-term gaps
-    iv_180 = row.get('IV_180_D_Put', 0)
-    hv_180 = row.get('HV_180_D_Cur', 0)
-    gap_180d = (iv_180 - hv_180) if (iv_180 and hv_180) else 0
+    iv_180 = row.get('IV_180_D_Put')
+    hv_180 = row.get('HV_180_D_Cur')
+    gap_180d = (float(iv_180) - float(hv_180)) if (pd.notna(iv_180) and pd.notna(hv_180)) else 0.0
     
-    iv_60 = row.get('IV_60_D_Put', 0)
-    hv_60 = row.get('HV_60_D_Cur', 0)
-    gap_60d = (iv_60 - hv_60) if (iv_60 and hv_60) else 0
+    iv_60 = row.get('IV_60_D_Put')
+    hv_60 = row.get('HV_60_D_Cur')
+    gap_60d = (float(iv_60) - float(hv_60)) if (pd.notna(iv_60) and pd.notna(hv_60)) else 0.0
     
     # Rejection criteria
     if signal not in ['Bearish']:
@@ -180,7 +180,7 @@ def _validate_csp(ticker: str, row: pd.Series) -> Optional[Dict]:
     if gap_30d <= 0:
         return None  # IV not rich
     if iv_rank > 70:
-        return None  # Prefer Buy-Write when IV very rich
+        return None  # IV Rank exceeds CSP risk-mitigation threshold
     
     return {
         'Ticker': ticker,
@@ -270,7 +270,7 @@ def _validate_buy_write(ticker: str, row: pd.Series) -> Optional[Dict]:
     if gap_30d <= 0:
         return None
     if iv_rank <= 50: # Relaxed to match audit's 'Positive gap or IV_Rank > 50'
-        return None  # Prefer CSP when IV moderately rich
+        return None  # IV Rank below Buy-Write premium threshold
     
     return {
         'Ticker': ticker,
@@ -327,7 +327,7 @@ def _validate_long_straddle(ticker: str, row: pd.Series) -> Optional[Dict]:
         return None
     if gap_180d >= 0 and gap_60d >= 0:
         return None  # IV not cheap
-    if iv_rank >= 40: # Adjusted to match audit's 'IV_Rank < 40'
+    if iv_rank >= 40: # IV Rank threshold for straddle entry
         return None  # Not cheap enough
     
     return {
@@ -392,7 +392,7 @@ def _validate_long_strangle(ticker: str, row: pd.Series) -> Optional[Dict]:
         'Strategy_Name': 'Long Strangle',
         'Strategy_Tier': 1,
         'Valid_Reason': f"Expansion + Moderately Cheap IV (IV_Rank={iv_rank:.0f})",
-        'Theory_Source': 'Natenberg Ch.9 - OTM volatility (cheaper, needs bigger move)',
+        'Theory_Source': 'Natenberg Ch.9 - OTM volatility (requires significant price movement)',
         'Regime_Context': signal if signal == 'Bidirectional' else 'Expansion',
         'IV_Context': f"gap_30d={gap_30d:.1f}, gap_60d={gap_60d:.1f}, gap_180d={gap_180d:.1f}, IV_Rank={iv_rank:.0f}",
         'Capital_Requirement': capital_req,
@@ -414,8 +414,8 @@ def _validate_long_call_leap(ticker: str, row: pd.Series) -> Optional[Dict]:
     
     LEAP-Specific Criteria (distinguish from short-term Long Call):
     - Sustained bullish signal (not just short-term momentum)
-    - IV_Rank < 40 (prefer buying when IV suppressed for long term)
-    - gap_180d < -5 (want cheap long-term IV)
+    - IV_Rank < 40 (long-term structural entry)
+    - gap_180d < -5 (cheap long-term IV)
     - Capital-heavy but defined risk (typical $2000-$5000 per contract)
     """
     stock_price = _calculate_approx_stock_price(row)
@@ -472,7 +472,7 @@ def _validate_long_put_leap(ticker: str, row: pd.Series) -> Optional[Dict]:
     
     LEAP-Specific Criteria:
     - Sustained bearish signal or hedge rationale
-    - IV_Rank < 40 (don't overpay for long-term protection)
+    - IV_Rank < 40 (long-term protection cost-efficiency)
     - gap_180d < -5 (cheap long-term IV)
     """
     stock_price = _calculate_approx_stock_price(row)
@@ -487,13 +487,13 @@ def _validate_long_put_leap(ticker: str, row: pd.Series) -> Optional[Dict]:
     iv_rank = row.get('IV_Rank_XS', 50)
     
     # Calculate longer-term gaps
-    iv_180 = row.get('IV_180_D_Put', 0)
-    hv_180 = row.get('HV_180_D_Cur', 0)
-    gap_180d = (iv_180 - hv_180) if (iv_180 and hv_180) else 0
+    iv_180 = row.get('IV_180_D_Put')
+    hv_180 = row.get('HV_180_D_Cur')
+    gap_180d = (float(iv_180) - float(hv_180)) if (pd.notna(iv_180) and pd.notna(hv_180)) else 0.0
     
-    iv_60 = row.get('IV_60_D_Put', 0)
-    hv_60 = row.get('HV_60_D_Cur', 0)
-    gap_60d = (iv_60 - hv_60) if (iv_60 and hv_60) else 0
+    iv_60 = row.get('IV_60_D_Put')
+    hv_60 = row.get('HV_60_D_Cur')
+    gap_60d = (float(iv_60) - float(hv_60)) if (pd.notna(iv_60) and pd.notna(hv_60)) else 0.0
     
     # LEAP criteria
     if signal not in ['Sustained Bearish', 'Bearish']:
@@ -614,7 +614,7 @@ def _validate_csp(ticker: str, row: pd.Series) -> Optional[Dict]:
     if gap_30d <= 0:
         return None  # IV not rich
     if iv_rank > 70:
-        return None  # Prefer Buy-Write when IV very rich
+        return None  # IV Rank exceeds CSP risk-mitigation threshold
     
     return {
         'Ticker': ticker,
@@ -685,7 +685,7 @@ def _validate_buy_write(ticker: str, row: pd.Series) -> Optional[Dict]:
     if gap_30d <= 0:
         return None
     if iv_rank <= 50: # Relaxed to match audit's 'Positive gap or IV_Rank > 50'
-        return None  # Prefer CSP when IV moderately rich
+        return None  # IV Rank below Buy-Write premium threshold
     
     return {
         'Ticker': ticker,
@@ -735,7 +735,7 @@ def _validate_long_straddle(ticker: str, row: pd.Series) -> Optional[Dict]:
         return None
     if gap_180d >= 0 and gap_60d >= 0:
         return None  # IV not cheap
-    if iv_rank >= 40: # Adjusted to match audit's 'IV_Rank < 40'
+    if iv_rank >= 40: # IV Rank threshold for straddle entry
         return None  # Not cheap enough
     
     return {
@@ -793,7 +793,7 @@ def _validate_long_strangle(ticker: str, row: pd.Series) -> Optional[Dict]:
         'Strategy_Name': 'Long Strangle',
         'Strategy_Tier': 1,
         'Valid_Reason': f"Expansion + Moderately Cheap IV (IV_Rank={iv_rank:.0f})",
-        'Theory_Source': 'Natenberg Ch.9 - OTM volatility (cheaper, needs bigger move)',
+        'Theory_Source': 'Natenberg Ch.9 - OTM volatility (requires significant price movement)',
         'Regime_Context': signal if signal == 'Bidirectional' else 'Expansion',
         'IV_Context': f"gap_30d={gap_30d:.1f}, gap_60d={gap_60d:.1f}, gap_180d={gap_180d:.1f}, IV_Rank={iv_rank:.0f}",
         'Capital_Requirement': 5000,
@@ -815,8 +815,8 @@ def _validate_long_call_leap(ticker: str, row: pd.Series) -> Optional[Dict]:
     
     LEAP-Specific Criteria (distinguish from short-term Long Call):
     - Sustained bullish signal (not just short-term momentum)
-    - IV_Rank < 40 (prefer buying when IV suppressed for long term)
-    - gap_180d < -5 (want cheap long-term IV)
+    - IV_Rank < 40 (long-term structural entry)
+    - gap_180d < -5 (cheap long-term IV)
     - Capital-heavy but defined risk (typical $2000-$5000 per contract)
     """
     signal = row.get('Signal_Type', '')
@@ -866,7 +866,7 @@ def _validate_long_put_leap(ticker: str, row: pd.Series) -> Optional[Dict]:
     
     LEAP-Specific Criteria:
     - Sustained bearish signal or hedge rationale
-    - IV_Rank < 40 (don't overpay for long-term protection)
+    - IV_Rank < 40 (long-term protection cost-efficiency)
     - gap_180d < -5 (cheap long-term IV)
     """
     signal = row.get('Signal_Type', '')
@@ -1123,6 +1123,10 @@ def recommend_strategies(
         return df
     
     df_ledger = pd.DataFrame(strategies)
+    
+    # Ensure 'thesis' column exists (required by Step 11/Dashboard)
+    if not df_ledger.empty and 'Valid_Reason' in df_ledger.columns:
+        df_ledger['thesis'] = df_ledger['Valid_Reason']
     
     # Log multi-strategy stats
     strategies_per_ticker = df_ledger.groupby('Ticker').size()

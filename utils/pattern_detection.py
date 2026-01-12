@@ -13,7 +13,7 @@ import pandas as pd
 import numpy as np
 import logging
 from typing import Tuple, Optional
-import yfinance as yf
+from core.scan_engine.price_history_loader import load_price_history
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +50,7 @@ def detect_bulkowski_patterns(ticker: str, df_price: pd.DataFrame = None) -> Tup
     try:
         # Fetch price data if not provided
         if df_price is None or df_price.empty:
-            df_price = yf.download(ticker, period='90d', interval='1d', progress=False, auto_adjust=True)
-            
-            # Flatten MultiIndex columns if present (yfinance with auto_adjust=True)
-            if isinstance(df_price.columns, pd.MultiIndex):
-                df_price.columns = [col[0] for col in df_price.columns]
+            df_price, source = load_price_history(ticker, days=90)
         
         if df_price.empty or len(df_price) < 20:
             return (None, 0.0)
@@ -222,11 +218,7 @@ def detect_nison_candlestick(ticker: str, df_price: pd.DataFrame = None) -> Tupl
     try:
         # Fetch price data if not provided
         if df_price is None or df_price.empty:
-            df_price = yf.download(ticker, period='30d', interval='1d', progress=False, auto_adjust=True)
-            
-            # Flatten MultiIndex columns if present (yfinance with auto_adjust=True)
-            if isinstance(df_price.columns, pd.MultiIndex):
-                df_price.columns = [col[0] for col in df_price.columns]
+            df_price, source = load_price_history(ticker, days=30)
         
         if df_price.empty or len(df_price) < 5:
             return (None, None)

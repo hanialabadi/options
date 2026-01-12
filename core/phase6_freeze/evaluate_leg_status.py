@@ -2,15 +2,27 @@ import pandas as pd
 import os
 from datetime import datetime
 
-def evaluate_leg_status(df: pd.DataFrame, legs_dir: str = "/Users/haniabadi/Documents/Windows/Optionrec/legs") -> pd.DataFrame:
+def evaluate_leg_status(df: pd.DataFrame, legs_dir: str = None) -> pd.DataFrame:
     """
     Compares the current df (by TradeID) to the most recent legs snapshot.
     Adds LegStatus and Structure_Intact columns.
+    
+    Note: legs_dir should come from data_contracts in production.
+    Falls back to a default path if not provided.
     """
-    print("\n🧠 Phase 6.2: Evaluating Leg Structure Status...")
-
+    print("\n🧠 Phase 6: Evaluating Leg Structure Status...")
+    
+    # Use data_contracts if available, otherwise fall back
+    if legs_dir is None:
+        try:
+            from core.data_contracts import SNAPSHOT_DIR
+            legs_dir = os.path.join(SNAPSHOT_DIR, "legs")
+        except ImportError:
+            # Fallback for legacy compatibility
+            legs_dir = "data/snapshots/legs"
+    
     if not os.path.exists(legs_dir):
-        print("❌ No legs directory found.")
+        print(f"❌ No legs directory found at {legs_dir}")
         df["LegStatus"] = "Unknown"
         df["Structure_Intact"] = True
         return df

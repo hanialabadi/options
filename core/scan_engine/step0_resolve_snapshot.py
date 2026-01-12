@@ -55,10 +55,29 @@ def resolve_snapshot_path(
     if resolved_path is None:
         archive_dir = Path(snapshots_dir).resolve()
         if archive_dir.is_dir():
-            # Snapshots are expected to be named like 'snapshot_YYYYMMDD_HHMMSS.csv'
+            # Support both legacy 'snapshot_*.csv' and new 'ivhv_snapshot_live_*.csv'
+            patterns = ["ivhv_snapshot_live_*.csv", "snapshot_*.csv"]
+            all_snapshots = []
+            for pattern in patterns:
+                all_snapshots.extend(list(archive_dir.glob(pattern)))
+            
+            def extract_timestamp(f):
+                stem = f.stem
+                if stem.startswith("ivhv_snapshot_live_"):
+                    ts_str = stem.replace("ivhv_snapshot_live_", "")
+                elif stem.startswith("snapshot_"):
+                    ts_str = stem.replace("snapshot_", "")
+                else:
+                    return datetime.min
+                
+                try:
+                    return datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+                except ValueError:
+                    return datetime.min
+
             snapshots = sorted(
-                archive_dir.glob("snapshot_*.csv"),
-                key=lambda f: datetime.strptime(f.stem, "snapshot_%Y%m%d_%H%M%S"),
+                all_snapshots,
+                key=extract_timestamp,
                 reverse=True
             )
             if snapshots:
@@ -76,9 +95,15 @@ def resolve_snapshot_path(
         )
 
     # Log file metadata
-    file_stat = resolved_path.stat()
-    mod_time = datetime.fromtimestamp(file_stat.st_mtime)
-    logger.info(f"📊 Snapshot filename: {resolved_path.name}")
-    logger.info(f"📊 File modification time: {mod_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    # Deterministic Age: Use filename timestamp instead of filesystem mtime
+    ts = extract_timestamp(resolved_path)
+    if ts != datetime.min:
+        logger.info(f"📊 Snapshot filename: {resolved_path.name}")
+        logger.info(f"📊 Snapshot Market Date: {ts.strftime('%Y-%m-%d %H:%M:%S')}")
+    else:
+        file_stat = resolved_path.stat()
+        mod_time = datetime.fromtimestamp(file_stat.st_mtime)
+        logger.info(f"📊 Snapshot filename: {resolved_path.name}")
+        logger.info(f"📊 File modification time (fallback): {mod_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     return str(resolved_path)

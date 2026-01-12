@@ -28,6 +28,7 @@ INPUTS (from Step 9A):
     
 OUTPUTS:
     **Contract Status:**
+    - Contract_Status: 'OK' / 'NO_CHAIN_RETURNED' / 'NO_EXPIRATIONS_IN_WINDOW' / etc.
     - Contract_Selection_Status: 'Contracts_Available' / 'No_Chains_Available' / 'No_Expirations_In_DTE_Window'
     
     **Contract Details (when available):**
@@ -35,19 +36,14 @@ OUTPUTS:
     - Actual_DTE: Days to expiration
     - Selected_Strike: Strike price (single) or JSON array for multi-leg
     - Contract_Symbol: OCC symbol(s)
-    - Option_Type: 'call' / 'put' / 'straddle' / 'strangle'
+    - Option_Type: 'call' / 'put' / 'straddle' / 'strangle' / 'vertical'
     
     **Greeks (per contract):**
     - Delta, Gamma, Vega, Theta, Rho
-    - Delta_Total: Sum of deltas for multi-leg
-    - Theta_Total: Sum of thetas for multi-leg
-    - Vega_Total: Sum of vegas for multi-leg
     
     **Pricing:**
     - Bid, Ask, Mid, Last
     - Bid_Ask_Spread_Pct: (ask - bid) / mid * 100
-    - Total_Debit: For debit spreads
-    - Total_Credit: For credit spreads
     
     **Liquidity:**
     - Open_Interest: Total OI
@@ -301,15 +297,16 @@ def find_atm_strike(chain_df: pd.DataFrame, underlying_price: float, option_type
     }
 
 def grade_liquidity(bid: float, ask: float, mid: float, oi: int, volume: int, 
-                    market_open: bool = True) -> Tuple[str, int, str]:
+                    market_open: bool = True, expiry_intent: str = 'ANY') -> Tuple[str, int, str]:
     """
-    Grade contract liquidity with market-hours awareness.
+    Grade contract liquidity with market-hours and expiry-intent awareness.
     
     Args:
         bid, ask, mid: Pricing
         oi: Open interest
         volume: Daily volume
         market_open: Whether market is currently open (relaxes thresholds)
+        expiry_intent: THIS_WEEK | NEXT_WEEK | ANY
     
     Returns:
         (grade, score, reason)
@@ -319,12 +316,19 @@ def grade_liquidity(bid: float, ask: float, mid: float, oi: int, volume: int,
     else:
         spread_pct = (ask - bid) / mid * 100
     
-    # Adjust thresholds based on market hours
-    oi_acceptable = OI_ACCEPTABLE if market_open else OI_ACCEPTABLE_OFFHOURS
-    spread_acceptable = SPREAD_ACCEPTABLE if market_open else SPREAD_ACCEPTABLE_OFFHOURS
+    # Adjust thresholds based on market hours and expiry intent
+    # Weekly intent requires stricter liquidity (Passarelli/Natenberg)
+    if expiry_intent == 'THIS_WEEK':
+        oi_excellent_target = 1000
+        oi_acceptable = 500
+        spread_acceptable = 0.05 # 5%
+    else:
+        oi_excellent_target = OI_EXCELLENT
+        oi_acceptable = OI_ACCEPTABLE if market_open else OI_ACCEPTABLE_OFFHOURS
+        spread_acceptable = SPREAD_ACCEPTABLE if market_open else SPREAD_ACCEPTABLE_OFFHOURS
     
     # Calculate liquidity score (0-100)
-    oi_score = min(100, (oi / OI_EXCELLENT) * 50)
+    oi_score = min(100, (oi / oi_excellent_target) * 50)
     spread_score = max(0, 50 - (spread_pct / spread_acceptable) * 50)
     score = int(oi_score + spread_score)
     
@@ -493,9 +497,89 @@ def select_strangle_contracts(chain_df: pd.DataFrame, underlying_price: float) -
         'option_type': 'strangle',
     }
 
-# ============================================================
-# MAIN CONTRACT FETCHING LOGIC
-# ============================================================
+def select_vertical_spread_contracts(chain_df: pd.DataFrame, underlying_price: float, 
+                                     strategy_name: str, market_open: bool) -> Tuple[Optional[Dict], Optional[str]]:
+    """
+    Select contracts for Vertical Spreads (Debit/Credit).
+    
+    Follows Passarelli Doctrine: Each leg must justify itself.
+    
+    Returns:
+        (contract_dict, failure_reason)
+    """
+    is_call = 'Call' in strategy_name
+    is_debit = 'Debit' in strategy_name
+    
+    option_type = 'call' if is_call else 'put'
+    
+    # 1. Select Legs
+    if is_debit:
+        # Long leg: Target delta ~0.60 for calls, ~-0.60 for puts
+        long_target = (0.55, 0.65) if is_call else (-0.65, -0.55)
+        long_leg = find_strike_by_delta(chain_df, long_target, underlying_price, option_type)
+        
+        if not long_leg: return None, "Could not find suitable long leg"
+        
+        # Short leg: Target delta ~0.40 for calls, ~-0.40 for puts (OTM)
+        short_target = (0.35, 0.45) if is_call else (-0.45, -0.35)
+        short_leg = find_strike_by_delta(chain_df, short_target, underlying_price, option_type)
+        if not short_leg: return None, "Could not find suitable short leg"
+    else:
+        # Credit Spreads (e.g. Bull Put Spread)
+        # Short leg: Target delta ~0.30
+        short_target = (0.25, 0.35) if is_call else (-0.35, -0.25)
+        short_leg = find_strike_by_delta(chain_df, short_target, underlying_price, option_type)
+        
+        if not short_leg: return None, "Could not find suitable short leg"
+        
+        # Long leg (Protection): Target delta ~0.15
+        long_target = (0.10, 0.20) if is_call else (-0.20, -0.10)
+        long_leg = find_strike_by_delta(chain_df, long_target, underlying_price, option_type)
+        if not long_leg: return None, "Could not find suitable long leg"
+
+    # Ensure they are different strikes
+    if long_leg['strike'] == short_leg['strike']:
+        return None, "Long and short legs selected same strike"
+
+    # Validate each leg independently (Passarelli Doctrine)
+    for leg_name, leg in [("Long", long_leg), ("Short", short_leg)]:
+        grade, _, reason = grade_liquidity(
+            leg['bid'], leg['ask'], leg['mark'],
+            leg['open_interest'], leg['volume'],
+            market_open=market_open
+        )
+        if grade == 'Illiquid':
+            return None, f"{leg_name} leg failed liquidity: {reason}"
+
+    # Aggregate pricing
+    if is_debit:
+        net_price = long_leg['mark'] - short_leg['mark']
+    else:
+        net_price = short_leg['mark'] - long_leg['mark']
+        
+    if net_price <= 0: 
+        return None, f"Invalid net price for spread: {net_price}"
+
+    # Combine details
+    return {
+        'strike': json.dumps([long_leg['strike'], short_leg['strike']]),
+        'symbol': json.dumps([long_leg['symbol'], short_leg['symbol']]),
+        'delta': long_leg['delta'] - short_leg['delta'] if is_debit else short_leg['delta'] - long_leg['delta'],
+        'gamma': long_leg['gamma'] - short_leg['gamma'],
+        'vega': long_leg['vega'] - short_leg['vega'],
+        'theta': long_leg['theta'] - short_leg['theta'],
+        'rho': long_leg.get('rho', 0) - short_leg.get('rho', 0),
+        'bid': long_leg['bid'] - short_leg['ask'] if is_debit else short_leg['bid'] - long_leg['ask'],
+        'ask': long_leg['ask'] - short_leg['bid'] if is_debit else short_leg['ask'] - long_leg['bid'],
+        'last': long_leg['last'] - short_leg['last'],
+        'mark': net_price,
+        'volume': min(long_leg['volume'], short_leg['volume']),
+        'open_interest': min(long_leg['open_interest'], short_leg['open_interest']),
+        'implied_volatility': (long_leg['implied_volatility'] + short_leg['implied_volatility']) / 2,
+        'option_type': 'vertical',
+        'long_leg': long_leg,
+        'short_leg': short_leg
+    }, None
 
 # ============================================================
 # MAIN CONTRACT FETCHING LOGIC
@@ -504,7 +588,7 @@ def select_strangle_contracts(chain_df: pd.DataFrame, underlying_price: float) -
 def fetch_contracts_for_strategy(chain_data: Dict, ticker: str, strategy_name: str,
                                  trade_bias: str, min_dte: int, max_dte: int, 
                                  target_dte: int, underlying_price: float,
-                                 market_open: bool) -> Dict:
+                                 market_open: bool, expiry_intent: str = 'ANY') -> Dict:
     """
     Fetch option contracts for a single strategy from CACHED chain data.
     
@@ -695,6 +779,11 @@ def fetch_contracts_for_strategy(chain_data: Dict, ticker: str, strategy_name: s
             else:
                 failure_reason = 'Could not find matching OTM call+put for strangle'
         
+        elif 'Spread' in strategy_name:
+            contract, failure_reason = select_vertical_spread_contracts(chain_df, underlying_price, strategy_name, market_open)
+            if contract:
+                result['Option_Type'] = 'vertical'
+
         else:
             result['Failure_Reason'] = f'Unknown strategy type: {strategy_name}'
             result['Chain_Rejection_Reason'] = result['Failure_Reason']
@@ -741,6 +830,7 @@ def fetch_contracts_for_strategy(chain_data: Dict, ticker: str, strategy_name: s
         result['Ask'] = contract['ask']
         result['Last'] = contract['last']
         result['Mid'] = contract['mark']
+        result['Total_Debit'] = contract['mark']  # Set Total_Debit for Step 8
         result['Volume'] = contract['volume']
         result['Open_Interest'] = contract['open_interest']
         result['Implied_Volatility'] = contract['implied_volatility']
@@ -754,11 +844,35 @@ def fetch_contracts_for_strategy(chain_data: Dict, ticker: str, strategy_name: s
         result['Bid_Ask_Spread_Pct'] = spread_pct
         
         # Grade liquidity (market-aware)
-        grade, score, reason = grade_liquidity(
-            contract['bid'], contract['ask'], mid,
-            contract['open_interest'], contract['volume'],
-            market_open=market_open
-        )
+        if result['Option_Type'] == 'vertical':
+            # Spread liquidity grade = min(legs)
+            l_grade, l_score, l_reason = grade_liquidity(
+                contract['long_leg']['bid'], contract['long_leg']['ask'], contract['long_leg']['mark'],
+                contract['long_leg']['open_interest'], contract['long_leg']['volume'],
+                market_open=market_open, expiry_intent=expiry_intent
+            )
+            s_grade, s_score, s_reason = grade_liquidity(
+                contract['short_leg']['bid'], contract['short_leg']['ask'], contract['short_leg']['mark'],
+                contract['short_leg']['open_interest'], contract['short_leg']['volume'],
+                market_open=market_open, expiry_intent=expiry_intent
+            )
+            
+            # Min logic for grades
+            grade_map = {'Excellent': 4, 'Good': 3, 'Acceptable': 2, 'Thin': 1, 'Illiquid': 0}
+            inv_grade_map = {v: k for k, v in grade_map.items()}
+            
+            min_grade_val = min(grade_map[l_grade], grade_map[s_grade])
+            grade = inv_grade_map[min_grade_val]
+            score = min(l_score, s_score)
+            reason = f"Long: {l_reason} | Short: {s_reason}"
+        else:
+            grade, score, reason = grade_liquidity(
+                contract['bid'], contract['ask'], mid,
+                contract['open_interest'], contract['volume'],
+                market_open=market_open,
+                expiry_intent=expiry_intent
+            )
+            
         result['Liquidity_Grade'] = grade
         result['Liquidity_Score'] = score
         result['Liquidity_Reason'] = reason
@@ -783,176 +897,8 @@ def fetch_contracts_for_strategy(chain_data: Dict, ticker: str, strategy_name: s
         result['Chain_Rejection_Reason'] = result['Failure_Reason']
     
     return result
-    """
-    Fetch option contracts for a single strategy.
-    
-    Returns:
-        Dict with contract details and status
-    """
-    result = {
-        'Contract_Selection_Status': 'No_Chains_Available',
-        'Selected_Expiration': None,
-        'Actual_DTE': None,
-        'Selected_Strike': None,
-        'Contract_Symbol': None,
-        'Option_Type': None,
-        'Delta': None,
-        'Gamma': None,
-        'Vega': None,
-        'Theta': None,
-        'Rho': None,
-        'Bid': None,
-        'Ask': None,
-        'Mid': None,
-        'Last': None,
-        'Bid_Ask_Spread_Pct': None,
-        'Open_Interest': None,
-        'Volume': None,
-        'Implied_Volatility': None,
-        'Liquidity_Grade': None,
-        'Liquidity_Score': None,
-        'Liquidity_Reason': None,
-        'Chain_Rejection_Reason': None,
-        'Expirations_Checked': 0,
-        'Strikes_Available': 0,
-    }
-    
-    try:
-        # Fetch option chain from Schwab
-        # Parameters: strikeCount controls how many strikes around ATM
-        # range: 'ALL' gives all strikes
-        # strategy: 'SINGLE' for standard chains
-        chain_data = client.get_chains(
-            symbol=ticker,
-            strikeCount=50,  # Get 50 strikes around ATM
-            range='ALL',
-            strategy='SINGLE'
-        )
-        
-        if not chain_data or 'callExpDateMap' not in chain_data:
-            result['Chain_Rejection_Reason'] = 'No option chains returned from API'
-            return result
-        
-        # Extract available expirations
-        expirations = []
-        if 'callExpDateMap' in chain_data:
-            for key in chain_data['callExpDateMap'].keys():
-                exp_date = key.split(':')[0]  # Format: "2025-02-14:10"
-                if exp_date not in expirations:
-                    expirations.append(exp_date)
-        
-        if not expirations:
-            result['Chain_Rejection_Reason'] = 'No expirations found in chain data'
-            return result
-        
-        result['Expirations_Checked'] = len(expirations)
-        
-        # Find best expiration within DTE window
-        best_exp = find_best_expiration(expirations, min_dte, max_dte, target_dte)
-        
-        if not best_exp:
-            result['Contract_Selection_Status'] = 'No_Expirations_In_DTE_Window'
-            result['Chain_Rejection_Reason'] = f'No expirations in DTE range {min_dte}-{max_dte} (target: {target_dte})'
-            return result
-        
-        actual_dte = calculate_dte(best_exp)
-        result['Selected_Expiration'] = best_exp
-        result['Actual_DTE'] = actual_dte
-        
-        # Parse chain for this expiration
-        chain_df = parse_schwab_chain_to_dataframe(chain_data, best_exp)
-        
-        if chain_df.empty:
-            result['Chain_Rejection_Reason'] = f'No contracts found for expiration {best_exp}'
-            return result
-        
-        result['Strikes_Available'] = len(chain_df['strikePrice'].unique())
-        
-        # Select contract based on strategy
-        contract = None
-        
-        if 'Long Call' in strategy_name:
-            contract = select_long_call_contract(chain_df, underlying_price, strategy_name)
-            if contract:
-                result['Option_Type'] = 'call'
-        
-        elif 'Long Put' in strategy_name:
-            contract = select_long_put_contract(chain_df, underlying_price, strategy_name)
-            if contract:
-                result['Option_Type'] = 'put'
-        
-        elif 'CSP' in strategy_name or 'Cash-Secured Put' in strategy_name:
-            contract = select_csp_contract(chain_df, underlying_price)
-            if contract:
-                result['Option_Type'] = 'put'
-        
-        elif 'Covered Call' in strategy_name or 'Buy-Write' in strategy_name:
-            contract = select_covered_call_contract(chain_df, underlying_price)
-            if contract:
-                result['Option_Type'] = 'call'
-        
-        elif 'Straddle' in strategy_name:
-            contract = select_straddle_contracts(chain_df, underlying_price)
-            if contract:
-                result['Option_Type'] = 'straddle'
-        
-        elif 'Strangle' in strategy_name:
-            contract = select_strangle_contracts(chain_df, underlying_price)
-            if contract:
-                result['Option_Type'] = 'strangle'
-        
-        else:
-            result['Chain_Rejection_Reason'] = f'Unknown strategy type: {strategy_name}'
-            return result
-        
-        if not contract:
-            result['Chain_Rejection_Reason'] = f'No suitable contracts found matching strategy criteria'
-            return result
-        
-        # Populate result with contract details
-        result['Contract_Selection_Status'] = 'Contracts_Available'
-        result['Selected_Strike'] = contract['strike']
-        result['Contract_Symbol'] = contract['symbol']
-        result['Delta'] = contract['delta']
-        result['Gamma'] = contract['gamma']
-        result['Vega'] = contract['vega']
-        result['Theta'] = contract['theta']
-        result['Rho'] = contract.get('rho', 0)
-        result['Bid'] = contract['bid']
-        result['Ask'] = contract['ask']
-        result['Last'] = contract['last']
-        result['Mid'] = contract['mark']
-        result['Volume'] = contract['volume']
-        result['Open_Interest'] = contract['open_interest']
-        result['Implied_Volatility'] = contract['implied_volatility']
-        
-        # Calculate spread
-        mid = contract['mark']
-        if mid > 0:
-            spread_pct = (contract['ask'] - contract['bid']) / mid * 100
-        else:
-            spread_pct = 100.0
-        result['Bid_Ask_Spread_Pct'] = spread_pct
-        
-        # Grade liquidity
-        grade, score, reason = grade_liquidity(
-            contract['bid'], contract['ask'], mid,
-            contract['open_interest'], contract['volume']
-        )
-        result['Liquidity_Grade'] = grade
-        result['Liquidity_Score'] = score
-        result['Liquidity_Reason'] = reason
-        
-        # Clear rejection reason on success
-        result['Chain_Rejection_Reason'] = None
-        
-    except Exception as e:
-        logger.error(f"Error fetching contracts for {ticker} {strategy_name}: {e}")
-        result['Chain_Rejection_Reason'] = f'API error: {str(e)}'
-    
-    return result
 
-def fetch_contracts(df: pd.DataFrame, client: SchwabClient) -> pd.DataFrame:
+def fetch_contracts(df: pd.DataFrame, client: SchwabClient, expiry_intent: str = 'ANY') -> pd.DataFrame:
     """
     Fetch option contracts for all strategies in DataFrame.
     Uses ticker-level chain caching (fetch once per ticker, reuse for all strategies).
@@ -1021,7 +967,7 @@ def fetch_contracts(df: pd.DataFrame, client: SchwabClient) -> pd.DataFrame:
             contract_data = fetch_contracts_for_strategy(
                 chain_data, ticker, strategy_name, trade_bias,
                 min_dte, max_dte, target_dte, underlying_price,
-                row_market_open
+                row_market_open, expiry_intent=expiry_intent
             )
             
             cache_hits += 1  # Using cached chain
@@ -1146,7 +1092,8 @@ def fetch_contracts(df: pd.DataFrame, client: SchwabClient) -> pd.DataFrame:
 # ============================================================
 
 def fetch_and_select_contracts_schwab(evaluated_strategies_df: pd.DataFrame, 
-                                       timeframes_df: pd.DataFrame) -> pd.DataFrame:
+                                       timeframes_df: pd.DataFrame,
+                                       expiry_intent: str = 'ANY') -> pd.DataFrame:
     """
     Pipeline-compatible wrapper for Step 9B Schwab contract fetching.
     
@@ -1174,6 +1121,11 @@ def fetch_and_select_contracts_schwab(evaluated_strategies_df: pd.DataFrame,
     # FIX: Both DataFrames have overlapping columns from the snapshot, causing pandas to add suffixes
     # Solution: Keep only unique columns from timeframes_df (drop duplicates that exist in evaluated_strategies_df)
     timeframes_unique_cols = ['Ticker', 'Strategy_Name', 'Min_DTE', 'Max_DTE', 'Target_DTE', 'Timeframe_Label', 'DTE_Rationale', 'Expiration_Count_Target']
+    
+    # Ensure thesis is preserved if it's in timeframes but not in evaluated (though it should be in both)
+    if 'thesis' in timeframes_df.columns and 'thesis' not in evaluated_strategies_df.columns:
+        timeframes_unique_cols.append('thesis')
+        
     timeframes_df_clean = timeframes_df[timeframes_unique_cols]
     
     merged = evaluated_strategies_df.merge(
@@ -1203,7 +1155,7 @@ def fetch_and_select_contracts_schwab(evaluated_strategies_df: pd.DataFrame,
     client = SchwabClient()
     
     # Fetch contracts
-    result_df = fetch_contracts(merged, client)
+    result_df = fetch_contracts(merged, client, expiry_intent=expiry_intent)
     
     logger.info(f"✅ Pipeline Step 9B complete: {len(result_df)} contracts enriched")
     

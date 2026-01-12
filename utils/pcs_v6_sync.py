@@ -17,7 +17,9 @@ def run_pcs_v6_sync_pipeline(master_path="/Users/haniabadi/Documents/Windows/Opt
 
     # Step 2: Run V6 overlay
     print("🧠 Running V6 overlay...")
-    df = run_v6_overlay(master_path)
+    # Load the dataframe from the path since run_v6_overlay expects a DF
+    df_to_overlay = pd.read_csv(master_path)
+    df = run_v6_overlay(df_to_overlay)
 
     # Step 3: Validate overlay fields exist
     required_cols = ["PCS_Live", "PCS_Health_Score", "Rec_V6", "Action"]

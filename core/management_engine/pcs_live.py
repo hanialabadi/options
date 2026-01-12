@@ -1,5 +1,6 @@
 import pandas as pd
 from core.data_contracts import load_active_master, save_active_master
+from core.data_contracts.config import MANAGEMENT_SAFE_MODE
 
 
 def pcs_engine_v3_2_strategy_aware(df):
@@ -53,6 +54,11 @@ def pcs_engine_v3_2_strategy_aware(df):
 
     df["Strategy_Match_Rank"] = df["PCS_PersonaScore"].apply(match_rank)
     df["Persona_Violation"] = df["Strategy_Match_Rank"] == "Violated"
+
+    # Management Safe Mode: Disable violations
+    if MANAGEMENT_SAFE_MODE:
+        df["Persona_Violation"] = False
+        df.loc[df["Strategy_Match_Rank"] == "Violated", "Strategy_Match_Rank"] = "Moderate"
 
     # === Signal and Unified Scoring ===
     df["PCS_SignalScore"] = (

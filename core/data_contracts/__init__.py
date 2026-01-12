@@ -36,6 +36,7 @@ from .config import (
     ACTIVE_MASTER_PATH,
     SNAPSHOT_DIR,
     ARCHIVE_DIR,
+    MANAGEMENT_SAFE_MODE,
     ensure_data_directories
 )
 
@@ -60,5 +61,6 @@ __all__ = [
     "ACTIVE_MASTER_PATH",
     "SNAPSHOT_DIR",
     "ARCHIVE_DIR",
+    "MANAGEMENT_SAFE_MODE",
     "ensure_data_directories",
 ]

@@ -31,7 +31,7 @@ from core.scan_engine.step0_schwab_snapshot import (
     is_market_open_schwab
 )
 
-TICKER_FILE = Path(__file__).parent.parent / "core" / "scraper" / "tickers copy.csv"
+TICKER_FILE = Path(__file__).parent.parent / "core" / "scraper" / "tickers.csv"
 TEST_TICKER_COUNT = 25
 
 

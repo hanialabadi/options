@@ -16,7 +16,7 @@ DESIGN PRINCIPLES:
     - No strategy logic (pure data acquisition)
 
 CONTRACT:
-    Input:  core/scraper/tickers copy.csv (single 'symbol' column)
+    Input:  core/scraper/tickers.csv (single 'symbol' column)
     Output: data/snapshots/ivhv_snapshot_live_YYYYMMDD.csv
     
     Output schema must match Step 2 expectations:
@@ -79,7 +79,7 @@ CACHE_DIR = project_root / "data" / "cache" / "price_history"
 CACHE_TTL_HOURS = 24  # Reuse cached price history if <24 hours old
 
 # Ticker Universe
-TICKER_FILE = project_root / "core" / "scraper" / "tickers copy.csv"
+TICKER_FILE = project_root / "core" / "scraper" / "tickers.csv"
 
 # Output Configuration
 SNAPSHOT_DIR = project_root / "data" / "snapshots"
@@ -481,12 +481,36 @@ def fetch_batch_quotes(
             else:
                 volume = None
             
+            # ENHANCEMENT: Extract additional quote fields for entry quality analysis
+            # (Per SCHWAB_API_DATA_INVENTORY.md recommendations)
+            high_price = quote_block.get('highPrice')
+            low_price = quote_block.get('lowPrice')
+            open_price = quote_block.get('openPrice')
+            close_price = quote_block.get('closePrice')
+            high_52w = quote_block.get('52WeekHigh')
+            low_52w = quote_block.get('52WeekLow')
+            net_change = quote_block.get('netChange')
+            net_pct_change = quote_block.get('netPercentChange')
+            dividend_date = quote_block.get('dividendDate')
+            dividend_yield = quote_block.get('dividendYield')
+            
             results[ticker] = {
                 'last_price': price,
                 'volume': volume,
                 'price_source': source,
                 'quote_time': quote_time,
                 'trade_time': trade_time,
+                # Entry quality fields (for scan-time analysis)
+                'highPrice': high_price,
+                'lowPrice': low_price,
+                'openPrice': open_price,
+                'closePrice': close_price,
+                '52WeekHigh': high_52w,
+                '52WeekLow': low_52w,
+                'netChange': net_change,
+                'netPercentChange': net_pct_change,
+                'dividendDate': dividend_date,
+                'dividendYield': dividend_yield,
                 'raw_quote': quote_block  # Keep for debugging
             }
             
@@ -862,7 +886,8 @@ def generate_live_snapshot(
     client: SchwabClient,
     tickers: List[str],
     use_cache: bool = True,
-    fetch_iv: bool = True
+    fetch_iv: bool = True,
+    discovery_mode: bool = False
 ) -> pd.DataFrame:
     """
     Generate live IV/HV snapshot for all tickers.
@@ -953,32 +978,45 @@ def generate_live_snapshot(
         logger.info(f"     {status}: {count}")
     
     # Step 3: Fetch IV proxy (slow, throttled)
-    iv_data = {}
+    iv_data = {ticker: _empty_iv_dict() for ticker in tickers}
     if fetch_iv:
-        logger.info("🔍 Step 3/4: Fetching IV proxies (throttled at 1 req/sec)...")
+        # Discovery Mode: Prune tickers to high-interest only
+        iv_tickers = tickers
+        if discovery_mode:
+            iv_tickers = []
+            for t in tickers:
+                hv_30 = hv_data.get(t, {}).get(30, 0)
+                net_pct = quotes.get(t, {}).get('netPercentChange', 0)
+                if pd.isna(net_pct): net_pct = 0
+                
+                # High interest = High Vol (HV30 > 25%) OR High Momentum (|change| > 1.5%)
+                if hv_30 > 25.0 or abs(net_pct) > 1.5:
+                    iv_tickers.append(t)
+            
+            logger.info(f"🔭 Discovery Mode: Pruned IV fetch from {len(tickers)} to {len(iv_tickers)} high-interest tickers")
+
+        logger.info(f"🔍 Step 3/4: Fetching IV proxies for {len(iv_tickers)} tickers (throttled at 1 req/sec)...")
         failed_iv = []
-        
-        for i, ticker in enumerate(tickers, 1):
+
+        for i, ticker in enumerate(iv_tickers, 1):
             if i % 25 == 0:
-                logger.info(f"  Progress: {i}/{len(tickers)} tickers")
-            
+                logger.info(f"  Progress: {i}/{len(iv_tickers)} tickers")
+
             last_price = quotes[ticker]['last_price']
-            
+
             if np.isnan(last_price):
                 logger.warning(f"Cannot fetch IV for {ticker} (missing last_price)")
-                iv_data[ticker] = _empty_iv_dict()
                 failed_iv.append(ticker)
                 continue
-            
+
             iv_data[ticker] = fetch_iv_proxy(client, ticker, last_price)
-            
+
             # Throttle to avoid rate limits
             time.sleep(CHAIN_THROTTLE_SECONDS)
-        
-        logger.info(f"✅ IV fetched for {len(tickers) - len(failed_iv)}/{len(tickers)} tickers")
+
+        logger.info(f"✅ IV fetched for {len(iv_tickers) - len(failed_iv)}/{len(iv_tickers)} tickers")
     else:
         logger.info("⏭️  Step 3/4: Skipping IV fetch (fetch_iv=False)")
-        iv_data = {ticker: _empty_iv_dict() for ticker in tickers}
     
     # Step 4: Assemble DataFrame
     logger.info("📦 Step 4/4: Assembling snapshot DataFrame...")
@@ -1093,6 +1131,22 @@ def generate_live_snapshot(
             'hv_slope': hv_slope,
             'volatility_regime': volatility_regime,
             
+            # ENTRY QUALITY FIELDS (NEW - for scan-time analysis)
+            # Intraday range & compression (from quotes)
+            'highPrice': quote.get('highPrice'),
+            'lowPrice': quote.get('lowPrice'),
+            'openPrice': quote.get('openPrice'),
+            'closePrice': quote.get('closePrice'),
+            # 52-week context
+            '52WeekHigh': quote.get('52WeekHigh'),
+            '52WeekLow': quote.get('52WeekLow'),
+            # Daily momentum
+            'netChange': quote.get('netChange'),
+            'netPercentChange': quote.get('netPercentChange'),
+            # Dividend assignment risk
+            'dividendDate': quote.get('dividendDate'),
+            'dividendYield': quote.get('dividendYield'),
+            
             # Snapshot metadata
             'snapshot_ts': snapshot_ts
         }
@@ -1199,7 +1253,8 @@ def main(
     test_mode: bool = False,
     test_ticker: str = "AAPL",
     use_cache: bool = True,
-    fetch_iv: bool = True
+    fetch_iv: bool = True,
+    discovery_mode: bool = False
 ):
     """
     Main entry point for Step 0 snapshot generation.
@@ -1209,6 +1264,7 @@ def main(
         test_ticker: Ticker to use in test mode
         use_cache: Whether to use cached price history
         fetch_iv: Whether to fetch IV (can disable for faster testing)
+        discovery_mode: If True, prunes IV fetching to high-interest tickers only
     """
     # Configure logging
     logging.basicConfig(
@@ -1250,7 +1306,8 @@ def main(
         client,
         tickers,
         use_cache=use_cache,
-        fetch_iv=fetch_iv
+        fetch_iv=fetch_iv,
+        discovery_mode=discovery_mode
     )
     
     # Save to CSV
@@ -1287,10 +1344,10 @@ def main(
 
 
 if __name__ == "__main__":
-    # Run in test mode for AAPL only
+    # Run FULL scan with liquid tickers
     df = main(
-        test_mode=True,
-        test_ticker="AAPL",
+        test_mode=False,
+        test_ticker=None,
         use_cache=True,
         fetch_iv=True
     )

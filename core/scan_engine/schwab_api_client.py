@@ -7,6 +7,10 @@ import base64
 import tempfile
 from urllib.parse import urlparse, parse_qs, urlencode
 from loguru import logger
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # --- Configuration Constants (Use placeholders) ---
 SCHWAB_API_BASE_URL = "https://api.schwabapi.com"
@@ -51,7 +55,7 @@ def load_tokens(token_file_path: str = TOKEN_FILE) -> dict | None:
 
 ## No OAuth flow, no code exchange, no browser logic
 
-def _refresh_token_flow(refresh_token: str, client_id: str, client_secret: str) -> dict:
+def _refresh_token_flow(refresh_token: str, client_id: str, client_secret: str, redirect_uri: str = DEFAULT_CALLBACK_URL) -> dict:
     """
     Refreshes an expired access token using the refresh token.
     """
@@ -63,10 +67,15 @@ def _refresh_token_flow(refresh_token: str, client_id: str, client_secret: str) 
     }
     data = {
         "grant_type": "refresh_token",
-        "refresh_token": refresh_token
+        "refresh_token": refresh_token,
+        "redirect_uri": redirect_uri
     }
-    logger.info("Attempting to refresh access token...")
+    logger.info(f"Attempting to refresh access token (URI: {redirect_uri})...")
     response = requests.post(SCHWAB_TOKEN_URL, headers=headers, data=data, timeout=15)
+    
+    if not response.ok:
+        logger.error(f"Refresh failed: {response.status_code} - {response.text}")
+    
     response.raise_for_status()
     tokens = response.json()
     tokens['expires_at'] = time.time() + tokens['expires_in'] - 60  # 1 minute buffer for access token
@@ -158,22 +167,19 @@ class SchwabClient:
     def _refresh_token(self):
         refresh_token = self._tokens.get('refresh_token')
         if not refresh_token:
-            raise Exception("No refresh token found. Run: python tools/reauth_schwab.py")
-        data = {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "redirect_uri": DEFAULT_CALLBACK_URL,
-        }
-        resp = requests.post(SCHWAB_TOKEN_URL, data=data, timeout=15)
-        if not resp.ok:
-            raise Exception(f"Failed to refresh token: {resp.text}")
-        tokens = resp.json()
-        now = int(time.time())
+            raise Exception("No refresh_token found. Run: python tools/reauth_schwab.py")
+        
+        # Use the consolidated flow
+        new_tokens = _refresh_token_flow(
+            refresh_token,
+            self.client_id,
+            self.client_secret,
+            self.callback_url
+        )
+        
         return {
-            "access_token": tokens["access_token"],
-            "access_expires_at": now + tokens.get("expires_in", 1800),
+            "access_token": new_tokens["access_token"],
+            "access_expires_at": new_tokens["expires_at"],
         }
     
     def _get_access_token(self) -> str:
@@ -224,7 +230,8 @@ class SchwabClient:
                 new_tokens = _refresh_token_flow(
                     self._tokens['refresh_token'],
                     self.client_id,
-                    self.client_secret
+                    self.client_secret,
+                    self.callback_url
                 )
                 # Update only access token related fields, keep original refresh token expiry
                 self._tokens.update({
@@ -287,7 +294,8 @@ class SchwabClient:
                 new_tokens = _refresh_token_flow(
                     self._tokens['refresh_token'],
                     self.client_id,
-                    self.client_secret
+                    self.client_secret,
+                    self.callback_url
                 )
                 # Only update access-token fields; keep refresh token + refresh expiry
                 self._tokens.update({
@@ -362,7 +370,8 @@ class SchwabClient:
                 new_tokens = _refresh_token_flow(
                     self._tokens['refresh_token'],
                     self.client_id,
-                    self.client_secret
+                    self.client_secret,
+                    self.callback_url
                 )
                 self._tokens.update({
                     'access_token': new_tokens['access_token'],
@@ -436,7 +445,8 @@ class SchwabClient:
                 new_tokens = _refresh_token_flow(
                     self._tokens['refresh_token'],
                     self.client_id,
-                    self.client_secret
+                    self.client_secret,
+                    self.callback_url
                 )
                 self._tokens.update({
                     'access_token': new_tokens['access_token'],

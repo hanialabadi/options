@@ -49,6 +49,8 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Optional
 import logging
+from .debug_mode import get_debug_manager
+from core.data_layer.market_stress_detector import check_market_stress, get_halt_reason
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +382,34 @@ def apply_volatility_rules(compression: str, regime_52w: str, momentum: str,
 # PHASE 2 MODIFIERS
 # ============================================================
 
+def apply_phase3_history_modifiers(base_decision: Dict, history_depth_ok: bool, 
+                                  iv_data_stale: bool, regime_confidence: float) -> Dict:
+    """
+    Apply Phase 3 History modifiers (Volatility Identity Card).
+    
+    Rules:
+    - history_depth_ok: If False, cap confidence at LOW.
+    - iv_data_stale: If True, reduce execution adjustment (caution) and add warning.
+    - regime_confidence: Informational (used in PCS weighting).
+    
+    CRITICAL: These flags do NOT change acceptance_status (READY_NOW/WAIT).
+    They only refine confidence and sizing guidance.
+    """
+    result = base_decision.copy()
+    
+    # 1. History Depth Cap
+    if not history_depth_ok:
+        result['confidence_band'] = 'LOW'
+        result['acceptance_reason'] += " (Low history depth - capping confidence)"
+        
+    # 2. Data Staleness Modifier
+    if iv_data_stale:
+        result['execution_adjustment'] = 'CAUTION'
+        result['acceptance_reason'] += " (STALE IV HISTORY - use caution)"
+        
+    return result
+
+
 def apply_phase2_modifiers(base_decision: Dict, exec_quality: str, balance: str, 
                           div_risk: str, strategy_type: str) -> Dict:
     """
@@ -473,6 +503,13 @@ def evaluate_acceptance(row: pd.Series) -> Dict:
         Dict with acceptance_status, acceptance_reason, confidence_band, 
         directional_bias, structure_bias, timing_quality, execution_adjustment
     """
+    # ACTION 7: Step 12 is the SOVEREIGN decision authority.
+    # It MUST NOT consume or be influenced by Step 11's 'Validation_Status' or 'Theory_Compliance_Score'.
+    # We explicitly ignore these fields to ensure semantic isolation.
+    
+    # FIX 5: Explain Immature IV
+    # If IV is immature, we allow execution but cap confidence and explain why.
+    iv_maturity = row.get('IV_Maturity_State', 'MATURE')
     
     # Extract Phase 1 inputs (always available)
     compression = row.get('compression_tag', 'UNKNOWN')
@@ -486,6 +523,16 @@ def evaluate_acceptance(row: pd.Series) -> Dict:
     exec_quality = row.get('execution_quality', 'UNKNOWN')
     balance = row.get('balance_tag', 'UNKNOWN')
     div_risk = row.get('dividend_risk', 'UNKNOWN')
+    
+    # Extract Phase 3 History inputs (Volatility Identity Card)
+    history_depth_ok = row.get('history_depth_ok', False)
+    iv_data_stale = row.get('iv_data_stale', True)
+    regime_confidence = row.get('regime_confidence', 0.0)
+    
+    # BOOTSTRAP OVERRIDE: If history is accumulating but not yet mature,
+    # we allow READY_NOW but mark it as STRUCTURALLY_READY for shadow mode tracking.
+    # This prevents "forced" trades while history is bootstrapping.
+    is_bootstrapping = not history_depth_ok
     
     # Extract strategy info
     strategy_name = row.get('Strategy_Name', 'UNKNOWN')
@@ -547,6 +594,43 @@ def evaluate_acceptance(row: pd.Series) -> Dict:
         base_decision, exec_quality, balance, div_risk, strategy_type
     )
     
+    # Step 6: Apply Phase 3 History modifiers (Volatility Identity Card)
+    final_decision = apply_phase3_history_modifiers(
+        final_decision, history_depth_ok, iv_data_stale, regime_confidence
+    )
+
+    # FIX 5: Explain Immature IV (Continued)
+    if iv_maturity != 'MATURE' and final_decision['acceptance_status'] == 'READY_NOW':
+        final_decision['confidence_band'] = 'LOW'
+        final_decision['acceptance_reason'] += f" (IV data {iv_maturity.lower()}; execution allowed but volatility context limited)"
+
+    # Step 7: Strategy-Aware IV Gating (Demand-Driven Architecture)
+    # Rules:
+    # - Volatility: Hard Gate (No IV -> WAIT)
+    # - Directional: Optional (No IV -> READY_NOW with confidence cap)
+    # - Income: Not Required (No IV -> READY_NOW)
+    has_iv = pd.notna(row.get('IV_Rank_30D')) or pd.notna(row.get('IV_Rank_XS'))
+    
+    if not has_iv:
+        if strategy_type == 'VOLATILITY':
+            final_decision['acceptance_status'] = 'WAIT'
+            final_decision['acceptance_reason'] = 'MISSING_IV_HARD_GATE: Volatility strategies require historical IV context'
+            final_decision['confidence_band'] = 'LOW'
+        elif strategy_type == 'DIRECTIONAL':
+            # Allowed but capped
+            if final_decision['confidence_band'] == 'HIGH':
+                final_decision['confidence_band'] = 'MEDIUM'
+            final_decision['acceptance_reason'] += " (No IV context - confidence capped)"
+        elif strategy_type == 'INCOME':
+            # No change needed - income strategies are IV-independent for discovery
+            pass
+    
+    # SEMANTIC FIX: "READY_NOW means READY_NOW"
+    # We no longer downgrade to STRUCTURALLY_READY during bootstrap.
+    # Instead, we allow them to remain READY_NOW with LOW confidence.
+    # This ensures they are visible in the primary dashboard tab.
+    # STRUCTURALLY_READY is deprecated for execution paths.
+    
     return final_decision
 
 
@@ -554,7 +638,7 @@ def evaluate_acceptance(row: pd.Series) -> Dict:
 # PIPELINE INTEGRATION
 # ============================================================
 
-def apply_acceptance_logic(df: pd.DataFrame) -> pd.DataFrame:
+def apply_acceptance_logic(df: pd.DataFrame, expiry_intent: str = 'ANY') -> pd.DataFrame:
     """
     Apply acceptance logic to all contracts in DataFrame.
     
@@ -562,11 +646,19 @@ def apply_acceptance_logic(df: pd.DataFrame) -> pd.DataFrame:
     
     Args:
         df: DataFrame from Step 9B (with Phase 1 + Phase 2 enrichment)
+        expiry_intent: THIS_WEEK | NEXT_WEEK | ANY
     
     Returns:
         DataFrame with acceptance columns added
     """
     logger.info("🎯 Step 12: Applying acceptance logic...")
+    
+    # ACTION 8: Market Stress Hard Gate
+    # UNKNOWN market stress must NEVER block execution (informational only).
+    # Only RED status triggers a HARD HALT.
+    # DESIGN INVARIANT: UNKNOWN is informational by design. Do not gate.
+    stress_level, median_iv, stress_basis = check_market_stress()
+    is_halted = (stress_level == 'RED')
     
     if df.empty:
         logger.warning("Empty DataFrame - no contracts to evaluate")
@@ -606,12 +698,29 @@ def apply_acceptance_logic(df: pd.DataFrame) -> pd.DataFrame:
     # Apply acceptance logic only to contracts with successful Contract_Status
     successful_mask = df_result['Contract_Status'].isin(['OK', 'LEAP_FALLBACK']) if 'Contract_Status' in df_result.columns else pd.Series([True] * len(df_result))
     
+    debug_manager = get_debug_manager()
     for idx in df_result[successful_mask].index:
         row = df_result.loc[idx]
-        decision = evaluate_acceptance(row)
         
-        for key, val in decision.items():
-            df_result.at[idx, key] = val
+        # Handle Market Stress Halt
+        if is_halted:
+            df_result.at[idx, 'acceptance_status'] = 'HALTED_MARKET_STRESS'
+            df_result.at[idx, 'acceptance_reason'] = get_halt_reason(median_iv)
+            df_result.at[idx, 'confidence_band'] = 'LOW'
+            continue
+
+        try:
+            decision = evaluate_acceptance(row)
+            for key, val in decision.items():
+                df_result.at[idx, key] = val
+        except Exception as e:
+            if debug_manager.enabled:
+                debug_manager.log_exception(
+                    step="step12",
+                    exception=e,
+                    recovery_action="Skipping contract evaluation",
+                    context={"ticker": row.get('Ticker'), "strategy": row.get('Strategy_Name')}
+                )
     
     # Log summary
     status_counts = df_result['acceptance_status'].value_counts().to_dict()
@@ -640,11 +749,12 @@ def apply_acceptance_logic(df: pd.DataFrame) -> pd.DataFrame:
 # FILTERING UTILITIES
 # ============================================================
 
-def filter_ready_contracts(df: pd.DataFrame, min_confidence: str = 'MEDIUM') -> pd.DataFrame:
+def filter_ready_contracts(df: pd.DataFrame, min_confidence: str = 'LOW') -> pd.DataFrame:
     """
-    Filter for READY_NOW contracts with minimum confidence level.
+    Filter for READY_NOW contracts.
     
-    Excludes INCOMPLETE contracts (failed Step 9B validation).
+    SEMANTIC FIX: We now default to 'LOW' to allow all READY_NOW trades 
+    regardless of confidence level (critical for bootstrap).
     
     Args:
         df: DataFrame from apply_acceptance_logic
@@ -654,7 +764,7 @@ def filter_ready_contracts(df: pd.DataFrame, min_confidence: str = 'MEDIUM') -> 
         Filtered DataFrame
     """
     confidence_hierarchy = {'LOW': 1, 'MEDIUM': 2, 'HIGH': 3}
-    min_level = confidence_hierarchy.get(min_confidence, 2)
+    min_level = confidence_hierarchy.get(min_confidence, 1)
     
     # Filter for READY_NOW only (excludes WAIT, AVOID, INCOMPLETE)
     df_ready = df[df['acceptance_status'] == 'READY_NOW'].copy()
