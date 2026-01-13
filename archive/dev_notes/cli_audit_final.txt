@@ -1,0 +1,497 @@
+CLI-based pipeline validation with theory-first approach
+No UI dependency • RAG-backed validation • Execution-last design
+
+📦 Running Steps 1-6 via scan_pipeline...
+📊 Step 2: Loading IV/HV snapshot...
+✅ Loaded snapshot: /Users/haniabadi/Documents/Windows/OptionsSnapshots/fidelity_ivhv_snapshot.csv (175 rows, 115 cols)
+⚠️ Snapshot is 2986.0 hours old (threshold: 48h). Data may be stale.
+✅ Fixed data types for 8 HV columns
+✅ Calculated IV_Rank_30D (per-ticker percentile)
+✅ Classified IV term structure
+✅ Detected IV_Trend_7D
+✅ Detected HV_Trend_30D
+✅ Step 2 complete: 175 tickers loaded and enriched
+📊 Step 3: Filtering by IVHV gap...
+📊 Liquidity filter: 175 → 169 rows (IV ≥ 15, HV > 0)
+📊 Gap statistics before flag calculation:
+   - IVHV_gap_30D range: -64.82 to 28.36
+   - IVHV_gap_30D mean: -3.82
+   - Non-NaN count: 169 / 169
+📊 Flag counts (before filtering):
+   - ShortTerm_IV_Edge: 127
+   - ShortTerm_IV_Rich: 46
+   - ShortTerm_IV_Cheap: 81
+✅ After dedup: 127 unique tickers
+📉 Mean reversion pattern detected: 8 tickers
+📈 Expansion pattern detected: 13 tickers
+✅ IVHV filtering complete: 127 tickers qualified
+📊 Step 5: Computing chart signals...
+✅ Step 5: 127 rows, all required columns present
+✅ Chart processing: 127 tickers charted (0 skipped)
+✅ Merge complete: 127 rows
+📊 Step 6: Validating data quality...
+✅ Step 6: 127 rows, all required columns present
+📊 Universal data completeness: 127/127 tickers
+📊 Directional data completeness: 127/127 tickers
+📊 Income-strategy ready (universal only): 0 tickers
+⏱️ Crossover age distribution: {'Age_16_plus': 82, 'Age_6_15': 26, 'Age_0_5': 19}
+✅ Step 6 complete: Returning all 127 tickers with data quality indicators
+🎯 Step 7: Generating strategy recommendations...
+✅ Step 7: 127 rows, all required columns present
+🎯 Step 7: Generating strategies for 127/127 tickers with complete data
+📊 Strategy distribution: {'Directional': 127}
+🎯 Trade bias: {'Bullish': 85, 'Bearish': 42}
+⭐ High priority entries: 49/127
+🎚️ Confidence: High=49, Medium=78, Low=0
+📈 Average success probability: 65.35%
+🔒 TIER-1 FILTER: 127/127 strategies are Tier-1 (executable)
+   Non-Tier-1 strategies excluded for safety (use exploration_mode=True to see all)
+✅ Step 7: Final dtypes - {'Primary_Strategy': string[python], 'Secondary_Strategy': string[python], 'Strategy_Type': string[python], 'Confidence': dtype('float64'), 'Success_Probability': dtype('float64'), 'Trade_Bias': string[python], 'Entry_Priority': string[python], 'Risk_Level': string[python], 'Strategy_Tier': dtype('int64'), 'EXECUTABLE': dtype('bool')}
+⚠️ Column 'Strategy_Tier' has dtype int64, expected string
+⚠️ Column 'EXECUTABLE' has dtype bool, expected string
+✅ Arrow compatibility validated for 10 columns
+✅ Step 7 complete: 127 tickers with strategy recommendations
+💰 Step 8: Calculating position sizing...
+✅ Step 8: 127 rows, all required columns present
+💰 Step 8: Sizing 127 positions | Method: volatility_scaled | Account: $100,000
+⚠️ Portfolio heat exceeded ($173800 > $20000). Scaling by 0.12
+📊 Position Sizing Summary:
+   Valid positions: 127/127
+   Total allocation: $20,000 (20.0%)
+   Total risk: $20,000 (20.0% of account)
+   Max allowed risk: $20,000 (20%)
+   Total contracts: 273
+   Average R:R ratio: 2.12
+   By strategy type: {'Directional': 127}
+/Users/haniabadi/Documents/Github/options/core/scan_engine/step8_position_sizing.py:187: FutureWarning: Setting an item of incompatible dtype is deprecated and will raise in a future error of pandas. Value '[149.5972382  161.10471807 149.5972382  149.5972382  149.5972382
+ 184.11967779 161.10471807 149.5972382  149.5972382  149.5972382
+ 161.10471807 149.5972382  184.11967779 149.5972382  149.5972382
+ 149.5972382  149.5972382  161.10471807 149.5972382  149.5972382
+ 149.5972382  149.5972382  161.10471807 149.5972382  184.11967779
+ 161.10471807 184.11967779 149.5972382  161.10471807 149.5972382
+ 149.5972382  149.5972382  184.11967779 184.11967779 161.10471807
+ 149.5972382  149.5972382  161.10471807 161.10471807 161.10471807
+ 161.10471807 149.5972382  149.5972382  161.10471807 149.5972382
+ 149.5972382  149.5972382  184.11967779 149.5972382  149.5972382
+ 161.10471807 149.5972382  149.5972382  149.5972382  149.5972382
+ 161.10471807 161.10471807 149.5972382  149.5972382  149.5972382
+ 149.5972382  161.10471807 161.10471807 161.10471807 161.10471807
+ 184.11967779 184.11967779 149.5972382  161.10471807 149.5972382
+ 149.5972382  149.5972382  149.5972382  149.5972382  149.5972382
+ 149.5972382  161.10471807 184.11967779 149.5972382  161.10471807
+ 184.11967779 149.5972382  161.10471807 149.5972382  149.5972382
+ 149.5972382  149.5972382  149.5972382  161.10471807 149.5972382
+ 149.5972382  184.11967779 149.5972382  149.5972382  149.5972382
+ 184.11967779 149.5972382  161.10471807 149.5972382  149.5972382
+ 149.5972382  149.5972382  149.5972382  184.11967779 184.11967779
+ 149.5972382  161.10471807 149.5972382  184.11967779 149.5972382
+ 184.11967779 149.5972382  149.5972382  149.5972382  149.5972382
+ 184.11967779 161.10471807 184.11967779 149.5972382  161.10471807
+ 149.5972382  149.5972382  149.5972382  149.5972382  149.5972382
+ 149.5972382  161.10471807]' has dtype incompatible with int64, please explicitly cast to a compatible dtype first.
+  df.update(df_trades)
+/Users/haniabadi/Documents/Github/options/core/scan_engine/step8_position_sizing.py:187: FutureWarning: Setting an item of incompatible dtype is deprecated and will raise in a future error of pandas. Value '[149.5972382  161.10471807 149.5972382  149.5972382  149.5972382
+ 184.11967779 161.10471807 149.5972382  149.5972382  149.5972382
+ 161.10471807 149.5972382  184.11967779 149.5972382  149.5972382
+ 149.5972382  149.5972382  161.10471807 149.5972382  149.5972382
+ 149.5972382  149.5972382  161.10471807 149.5972382  184.11967779
+ 161.10471807 184.11967779 149.5972382  161.10471807 149.5972382
+ 149.5972382  149.5972382  184.11967779 184.11967779 161.10471807
+ 149.5972382  149.5972382  161.10471807 161.10471807 161.10471807
+ 161.10471807 149.5972382  149.5972382  161.10471807 149.5972382
+ 149.5972382  149.5972382  184.11967779 149.5972382  149.5972382
+ 161.10471807 149.5972382  149.5972382  149.5972382  149.5972382
+ 161.10471807 161.10471807 149.5972382  149.5972382  149.5972382
+ 149.5972382  161.10471807 161.10471807 161.10471807 161.10471807
+ 184.11967779 184.11967779 149.5972382  161.10471807 149.5972382
+ 149.5972382  149.5972382  149.5972382  149.5972382  149.5972382
+ 149.5972382  161.10471807 184.11967779 149.5972382  161.10471807
+ 184.11967779 149.5972382  161.10471807 149.5972382  149.5972382
+ 149.5972382  149.5972382  149.5972382  161.10471807 149.5972382
+ 149.5972382  184.11967779 149.5972382  149.5972382  149.5972382
+ 184.11967779 149.5972382  161.10471807 149.5972382  149.5972382
+ 149.5972382  149.5972382  149.5972382  184.11967779 184.11967779
+ 149.5972382  161.10471807 149.5972382  184.11967779 149.5972382
+ 184.11967779 149.5972382  149.5972382  149.5972382  149.5972382
+ 184.11967779 161.10471807 184.11967779 149.5972382  161.10471807
+ 149.5972382  149.5972382  149.5972382  149.5972382  149.5972382
+ 149.5972382  161.10471807]' has dtype incompatible with int64, please explicitly cast to a compatible dtype first.
+  df.update(df_trades)
+✅ Step 8 complete: 127/127 valid positions
+📅 Step 9A: Determining optimal option timeframes...
+✅ Step 9A: 127 rows, all required columns present
+🎯 Step 9A: Determining optimal DTE ranges for 127 tickers
+📊 Step 9A Summary:
+   Timeframe distribution: {'Medium': 108, 'Short-Medium': 19}
+   Average DTE range: 55-85 days (preferred: 70)
+   Shortest window: 30-60 days
+   Longest window: 60-90 days
+✅ Step 9A complete: DTE ranges determined for 127 positions
+🔗 Step 9B: Fetching option chains and selecting contracts...
+✅ TIER-1 VALIDATION PASSED: All 127 strategies are Tier-1 (executable)
+📊 Step 9B Execution Gate:
+   Tier-1 strategies validated: 127
+   Proceeding to fetch option chains...
+🔎 Scanning option chains for 127 Tier-1 strategies...
+📊 BKNG: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ BKNG: Selected 2026-03-20 (DTE=82) with strikes [5400.0]
+📊 AZO: Fetching chains for DTE range 45-60 days (preferred: 52) (Covered Call (if holding stock))
+⚠️ AZO: No liquid contracts found (DTE=54, min_oi=50, max_spread=10.0%)
+📊 MELI: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ MELI: Selected 2026-03-20 (DTE=82) with strikes [2140.0]
+📊 MKL: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ MKL: No expirations found in DTE range 60-90
+📊 FCNCA: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ FCNCA: No expirations found in DTE range 60-90
+📊 FICO: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Put)
+⚠️ FICO: No liquid contracts found (DTE=54, min_oi=50, max_spread=10.0%)
+📊 TDG: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+⚠️ TDG: No expirations found in DTE range 60-90
+📊 MTD: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+⚠️ MTD: No expirations found in DTE range 60-90
+📊 TPL: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+⚠️ TPL: No liquid contracts found (DTE=82, min_oi=25, max_spread=15.0%)
+📊 GWW: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ GWW: No expirations found in DTE range 60-90
+📊 COST: Fetching chains for DTE range 45-60 days (preferred: 52) (Covered Call (if holding stock))
+No underlying_price in chain data, using strike midpoint as fallback
+✅ COST: Selected 2026-02-20 (DTE=54) with strikes [np.float64(910.0)]
+📊 KLAC: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ KLAC: Selected 2026-03-20 (DTE=82) with strikes [1140.0]
+📊 AXON: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+⚠️ AXON: No suitable strikes found for Long Call
+📊 INTU: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ INTU: Selected 2026-03-20 (DTE=82) with strikes [680.0]
+📊 LLY: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ LLY: Selected 2026-03-20 (DTE=82) with strikes [920.0]
+📊 SPOT: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ SPOT: Selected 2026-03-20 (DTE=82) with strikes [610.0]
+📊 URI: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ URI: Selected 2026-03-20 (DTE=82) with strikes [810.0]
+📊 MPWR: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ MPWR: Selected 2026-03-20 (DTE=82) with strikes [940.0]
+📊 META: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ META: Selected 2026-03-20 (DTE=82) with strikes [665.0]
+📊 MCK: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ MCK: Selected 2026-03-20 (DTE=82) with strikes [800.0]
+📊 GS: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ GS: Selected 2026-03-20 (DTE=82) with strikes [810.0]
+📊 TYL: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+⚠️ TYL: No liquid contracts found (DTE=82, min_oi=25, max_spread=15.0%)
+📊 MSCI: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ MSCI: No liquid contracts found (DTE=82, min_oi=25, max_spread=15.0%)
+📊 LII: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ LII: No liquid contracts found (DTE=82, min_oi=25, max_spread=15.0%)
+📊 CHE: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+⚠️ CHE: No liquid contracts found (DTE=54, min_oi=50, max_spread=10.0%)
+📊 MA: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ MA: Selected 2026-03-20 (DTE=82) with strikes [550.0]
+📊 FIX: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+⚠️ FIX: No liquid contracts found (DTE=54, min_oi=50, max_spread=10.0%)
+📊 ISRG: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ ISRG: Selected 2026-03-20 (DTE=82) with strikes [520.0]
+📊 IDXX: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+⚠️ IDXX: No expirations found in DTE range 60-90
+📊 AMP: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ AMP: No liquid contracts found (DTE=82, min_oi=25, max_spread=15.0%)
+📊 REGN: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ REGN: Selected 2026-03-20 (DTE=82) with strikes [650.0]
+📊 GEV: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ GEV: Selected 2026-03-20 (DTE=82) with strikes [620.0]
+📊 DE: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Put)
+⚠️ DE: No liquid contracts found (DTE=40, min_oi=50, max_spread=10.0%)
+📊 TDY: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+⚠️ TDY: No liquid contracts found (DTE=54, min_oi=50, max_spread=10.0%)
+📊 CASY: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ CASY: No expirations found in DTE range 60-90
+📊 CACC: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ CACC: No expirations found in DTE range 60-90
+📊 SNPS: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ SNPS: Selected 2026-03-20 (DTE=82) with strikes [470.0]
+📊 NOC: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ NOC: Selected 2026-03-20 (DTE=82) with strikes [570.0]
+📊 KNSL: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ KNSL: No expirations found in DTE range 60-90
+📊 LIN: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ LIN: Selected 2026-03-20 (DTE=82) with strikes [430.0]
+📊 LMT: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ LMT: Selected 2026-03-20 (DTE=82) with strikes [470.0]
+📊 ULTA: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ ULTA: Selected 2026-03-20 (DTE=82) with strikes [570.0]
+📊 GPI: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ GPI: No expirations found in DTE range 60-90
+📊 WSO: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+⚠️ WSO: No suitable strikes found for Long Put
+📊 TT: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+⚠️ TT: No liquid contracts found (DTE=82, min_oi=25, max_spread=15.0%)
+📊 CVCO: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ CVCO: No liquid contracts found (DTE=82, min_oi=25, max_spread=15.0%)
+📊 DUOL: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ DUOL: Selected 2026-03-20 (DTE=82) with strikes [200.0]
+📊 TMO: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+⚠️ TMO: No liquid contracts found (DTE=40, min_oi=50, max_spread=10.0%)
+📊 MUSA: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ MUSA: No expirations found in DTE range 60-90
+📊 HUBB: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+⚠️ HUBB: No suitable strikes found for Long Call
+📊 IT: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ IT: Selected 2026-03-20 (DTE=82) with strikes [240.0]
+📊 CHTR: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ CHTR: Selected 2026-03-20 (DTE=82) with strikes [230.0]
+📊 SYK: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ SYK: Selected 2026-03-20 (DTE=82) with strikes [370.0]
+📊 ADBE: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ ADBE: Selected 2026-03-20 (DTE=82) with strikes [340.0]
+📊 ELV: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ ELV: Selected 2026-03-20 (DTE=82) with strikes [330.0]
+📊 PWR: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+⚠️ PWR: No suitable strikes found for Long Put
+📊 HCA: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ HCA: Selected 2026-03-20 (DTE=82) with strikes [465.0]
+📊 CSL: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+⚠️ CSL: No suitable strikes found for Long Call
+📊 HD: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ HD: Selected 2026-03-20 (DTE=82) with strikes [360.0]
+📊 LPLA: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ LPLA: No expirations found in DTE range 60-90
+📊 ETN: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ ETN: Selected 2026-03-20 (DTE=82) with strikes [320.0]
+📊 AON: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+⚠️ AON: No liquid contracts found (DTE=82, min_oi=25, max_spread=15.0%)
+📊 WAT: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+⚠️ WAT: No expirations found in DTE range 60-90
+📊 V: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ V: Selected 2026-03-20 (DTE=82) with strikes [335.0]
+📊 WING: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ WING: Selected 2026-03-20 (DTE=82) with strikes [270.0]
+📊 NVDA: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ NVDA: Selected 2026-02-06 (DTE=40) with strikes [180.0]
+📊 AMZN: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+⚠️ AMZN: No suitable strikes found for Long Call
+📊 GOOG: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ GOOG: Selected 2026-03-20 (DTE=82) with strikes [270.0]
+📊 AVGO: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ AVGO: Selected 2026-03-20 (DTE=82) with strikes [320.0]
+📊 TSLA: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ TSLA: Selected 2026-03-20 (DTE=82) with strikes [380.0]
+📊 JPM: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ JPM: Selected 2026-03-20 (DTE=82) with strikes [290.0]
+📊 WMT: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ WMT: Selected 2026-03-20 (DTE=82) with strikes [92.5]
+📊 ORCL: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ ORCL: Selected 2026-03-20 (DTE=82) with strikes [190.0]
+📊 PG: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ PG: Selected 2026-03-20 (DTE=82) with strikes [145.0]
+📊 JNJ: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ JNJ: Selected 2026-03-20 (DTE=82) with strikes [175.0]
+📊 PLTR: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ PLTR: Selected 2026-03-20 (DTE=82) with strikes [145.0]
+📊 PM: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ PM: Selected 2026-03-20 (DTE=82) with strikes [160.0]
+📊 UNH: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Put)
+⚠️ UNH: No liquid contracts found (DTE=40, min_oi=50, max_spread=10.0%)
+📊 CSCO: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ CSCO: Selected 2026-03-20 (DTE=82) with strikes [70.0]
+📊 GE: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ GE: Selected 2026-03-20 (DTE=82) with strikes [270.0]
+📊 IBM: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+⚠️ IBM: No liquid contracts found (DTE=40, min_oi=50, max_spread=10.0%)
+📊 TMUS: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ TMUS: Selected 2026-03-20 (DTE=82) with strikes [200.0]
+📊 CRM: Fetching chains for DTE range 45-60 days (preferred: 52) (Cash-Secured Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ CRM: Selected 2026-02-20 (DTE=54) with strikes [260.0]
+📊 WFC: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ WFC: Selected 2026-03-20 (DTE=82) with strikes [75.0]
+📊 ABT: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ ABT: Selected 2026-03-20 (DTE=82) with strikes [120.0]
+📊 AMD: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ AMD: Selected 2026-03-20 (DTE=82) with strikes [175.0]
+📊 MS: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ MS: Selected 2026-03-20 (DTE=82) with strikes [155.0]
+📊 T: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ T: Selected 2026-03-20 (DTE=82) with strikes [24.0]
+📊 ACN: Fetching chains for DTE range 45-60 days (preferred: 52) (Cash-Secured Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ ACN: Selected 2026-02-20 (DTE=54) with strikes [265.0]
+📊 UBER: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ UBER: Selected 2026-03-20 (DTE=82) with strikes [80.0]
+📊 TXN: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ TXN: Selected 2026-03-20 (DTE=82) with strikes [175.0]
+📊 PEP: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Put)
+⚠️ PEP: No liquid contracts found (DTE=40, min_oi=50, max_spread=10.0%)
+📊 QCOM: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ QCOM: Selected 2026-03-20 (DTE=82) with strikes [165.0]
+📊 BA: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ BA: Selected 2026-03-20 (DTE=82) with strikes [185.0]
+📊 PGR: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+⚠️ PGR: No suitable strikes found for Long Call
+📊 AMGN: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+⚠️ AMGN: No liquid contracts found (DTE=40, min_oi=50, max_spread=10.0%)
+📊 SHOP: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ SHOP: Selected 2026-03-20 (DTE=82) with strikes [145.0]
+📊 HON: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ HON: Selected 2026-03-20 (DTE=82) with strikes [195.0]
+📊 AMAT: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ AMAT: Selected 2026-03-20 (DTE=82) with strikes [210.0]
+📊 NEE: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ NEE: Selected 2026-03-20 (DTE=82) with strikes [77.5]
+📊 DHR: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ DHR: Selected 2026-03-20 (DTE=82) with strikes [210.0]
+📊 MU: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ MU: Selected 2026-03-20 (DTE=82) with strikes [210.0]
+📊 UNP: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ UNP: Selected 2026-03-20 (DTE=82) with strikes [240.0]
+📊 GILD: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+⚠️ GILD: No liquid contracts found (DTE=40, min_oi=50, max_spread=10.0%)
+📊 PFE: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Put)
+⚠️ PFE: No liquid contracts found (DTE=40, min_oi=50, max_spread=10.0%)
+📊 PANW: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ PANW: Selected 2026-03-20 (DTE=82) with strikes [180.0]
+📊 CMCSA: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ CMCSA: Selected 2026-03-20 (DTE=82) with strikes [32.5]
+📊 LOW: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ LOW: Selected 2026-03-20 (DTE=82) with strikes [240.0]
+📊 ANET: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+⚠️ ANET: No liquid contracts found (DTE=40, min_oi=50, max_spread=10.0%)
+📊 CRWD: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ CRWD: Selected 2026-03-20 (DTE=82) with strikes [450.0]
+📊 APH: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ APH: Selected 2026-02-20 (DTE=54) with strikes [135.0]
+📊 ADI: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ ADI: Selected 2026-03-20 (DTE=82) with strikes [260.0]
+📊 COP: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ COP: Selected 2026-03-20 (DTE=82) with strikes [90.0]
+📊 VRTX: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ VRTX: Selected 2026-03-20 (DTE=82) with strikes [450.0]
+📊 GOOGL: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ GOOGL: Selected 2026-03-20 (DTE=82) with strikes [270.0]
+📊 QQQ: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ QQQ: Selected 2026-02-06 (DTE=40) with strikes [620.0]
+📊 XLE: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ XLE: Selected 2026-03-20 (DTE=82) with strikes [41.5]
+📊 XLK: Fetching chains for DTE range 30-60 days (preferred: 45) (Long Call)
+⚠️ XLK: No liquid contracts found (DTE=40, min_oi=50, max_spread=10.0%)
+📊 XLP: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ XLP: Selected 2026-03-20 (DTE=82) with strikes [75.0]
+📊 SMH: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ SMH: Selected 2026-03-20 (DTE=82) with strikes [315.0]
+📊 DKNG: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ DKNG: Selected 2026-03-20 (DTE=82) with strikes [37.5]
+📊 COIN: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ COIN: Selected 2026-03-20 (DTE=82) with strikes [220.0]
+📊 U: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ U: Selected 2026-03-20 (DTE=82) with strikes [42.0]
+📊 PYPL: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ PYPL: Selected 2026-03-20 (DTE=82) with strikes [65.0]
+📊 BIDU: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ BIDU: Selected 2026-03-20 (DTE=82) with strikes [120.0]
+📊 MDB: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Call)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ MDB: Selected 2026-03-20 (DTE=82) with strikes [360.0]
+📊 CLS: Fetching chains for DTE range 60-90 days (preferred: 75) (Long Put)
+No underlying_price in chain data, using strike midpoint as fallback
+✅ CLS: Selected 2026-03-20 (DTE=82) with strikes [270.0]
+📊 Step 9B Summary:
+   Status distribution: {'Success': 84, 'Low_Liquidity': 23, 'No_Expirations': 13, 'No_Suitable_Strikes': 7}
+   Successful selections: 84/127
+   Average DTE: 80 days
+   Average OI: 2191
+   Average spread: 6.35%
+❌ Step 9B failed: name 'tier2_plus' is not defined
+⚠️ Step 10 skipped: No selected contracts from Step 9B
+⚠️ Step 11 skipped: No filtered contracts from Step 10
+✅ Exports complete → output
+❌ Pipeline failed - no Step 6 output
+   Available keys: ['snapshot', 'filtered', 'charted', 'validated_data', 'recommendations', 'sized_positions', 'timeframed_positions', 'selected_contracts', 'filtered_contracts', 'final_strategies']
+
+====================================================================================================
+TIER-1 STRATEGY THEORY AUDIT
+====================================================================================================
+

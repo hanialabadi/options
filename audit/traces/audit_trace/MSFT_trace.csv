@@ -1,0 +1,11 @@
+step,step_name,description,rows,status,acceptance_status,acceptance_reason,iv_rank_available,iv_history_days,iv_surface_source,iv_surface_age_days,notes
+step01,snapshot_enriched,Raw snapshot + IV surface + earnings enrichment (AUDIT TICKERS ONLY),1,PRESENT,,,,,historical_latest,1.0,
+step02,ivhv_filtered,IVHV gap filter applied,1,PRESENT,,,,,historical_latest,1.0,
+step03,chart_signals,Technical analysis and chart scoring,1,PRESENT,,,,,historical_latest,1.0,
+step04,data_validated,Data quality and schema validation,1,PRESENT,,,,,historical_latest,1.0,
+step05,strategies_recommended,Multi-strategy ledger generation,2,PRESENT,,,,,historical_latest,1.0,
+step06,strategies_evaluated,Independent RAG scoring and theory compliance,2,PRESENT,,,,,historical_latest,1.0,
+step07,timeframes_determined,DTE selection for each strategy,2,PRESENT,,,,,historical_latest,1.0,
+step08,contracts_fetched,Contract fetching and selection from Schwab,2,PRESENT,,,,,historical_latest,1.0,
+step09,acceptance_applied,Acceptance logic applied (READY_NOW/STRUCTURALLY_READY/WAIT/AVOID),2,PRESENT,INCOMPLETE,Contract validation failed (Step 9B),,,historical_latest,1.0,
+step10,final_trades,Portfolio sizing and final trade selection,0,DROPPED,,,,,,,Ticker not present in this step

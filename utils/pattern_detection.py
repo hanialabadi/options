@@ -13,7 +13,7 @@ import pandas as pd
 import numpy as np
 import logging
 from typing import Tuple, Optional
-from core.scan_engine.price_history_loader import load_price_history
+from core.data_layer.price_history_loader import load_price_history
 
 logger = logging.getLogger(__name__)
 

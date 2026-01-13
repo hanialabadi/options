@@ -1,0 +1,72 @@
+
+======================================================================
+PCS V2 INTEGRATION TEST SUITE
+======================================================================
+
+======================================================================
+TEST 1: FULL PIPELINE (JSON → Greeks → PCS)
+======================================================================
+
+Step 1: Extract Greeks from JSON
+  Coverage: 100.0%
+  Quality: GOOD
+
+Step 2: Calculate PCS scores
+  Mean score: 90.9
+  Distribution: 83.3% Valid, 16.7% Watch, 0.0% Rejected
+
+Results:
+        Strategy  Delta  Vega  PCS_Score_V2 PCS_Status
+       Long Call   0.52  0.25         100.0      Valid
+        Long Put  -0.48  0.25         100.0      Valid
+   Long Straddle   0.04  0.50         100.0      Valid
+   Long Strangle   0.03  0.80          74.0      Watch
+Bull Call Spread   0.07  0.03          81.5      Valid
+    Covered Call   0.52  0.30          90.0      Valid
+
+✅ Full pipeline working
+
+======================================================================
+TEST 2: EDGE CASES
+======================================================================
+
+Edge case results:
+     Strategy  Delta  PCS_Score_V2 PCS_Status
+    Long Call    NaN          95.0      Valid
+    Long Call    NaN          95.0      Valid
+Long Straddle   0.99          83.2      Valid
+    Long Call   0.35         100.0      Valid
+    Long Call   0.01          39.9   Rejected
+
+✅ Edge cases handled correctly
+
+======================================================================
+TEST 3: STRATEGY AWARENESS
+======================================================================
+
+Same Greeks, different strategies:
+     Strategy  Delta  Vega  PCS_Score_V2 PCS_Status                                                     PCS_Penalties
+    Long Call    0.2  0.15          91.6      Valid  Low Delta (0.20 < 0.35, -7 pts) | Low Vega (0.15 < 0.18, -1 pts)
+Long Straddle    0.2  0.15          95.0      Valid Low Vega (0.15 < 0.25, -4 pts) | High Delta (0.20 > 0.15, -1 pts)
+ Covered Call    0.2  0.30          90.0      Valid                                 Weak Theta (0.25 ≤ Vega, -10 pts)
+
+✅ Strategy-aware validation working
+
+======================================================================
+TEST 4: GRADIENT SCORING
+======================================================================
+
+Gradient scores with worsening spread:
+  Spread  5.0% → Score 100.0 (Valid)
+  Spread  8.0% → Score 100.0 (Valid)
+  Spread 10.0% → Score  96.0 (Valid)
+  Spread 12.0% → Score  92.0 (Valid)
+  Spread 15.0% → Score  86.0 (Valid)
+  Spread 18.0% → Score  80.0 (Valid)
+
+
+======================================================================
+❌ TEST FAILED
+======================================================================
+Error: Should span multiple status levels, got ['Valid']
+

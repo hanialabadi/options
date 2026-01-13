@@ -1,0 +1,105 @@
+{
+  "run_id": "20260102_155959",
+  "start_time": "2026-01-02T15:59:59.656124",
+  "pipeline_version": "1.0",
+  "debug_mode": true,
+  "input_snapshot": {
+    "original_path": "data/snapshots/ivhv_snapshot_live_20260102_124337.csv",
+    "row_count": 177,
+    "column_count": 68
+  },
+  "config": {
+    "account_balance": 100000.0,
+    "max_portfolio_risk": 0.2,
+    "sizing_method": "volatility_scaled",
+    "snapshot_path": "data/snapshots/ivhv_snapshot_live_20260102_124337.csv"
+  },
+  "steps": {
+    "step2_snapshot": {
+      "row_count": 177,
+      "column_count": 109,
+      "description": "Loaded IV/HV snapshot with Phase 1 enrichment",
+      "timestamp": "2026-01-02T16:01:55.891890"
+    },
+    "step3_filtered": {
+      "row_count": 143,
+      "column_count": 143,
+      "description": "Filtered by IVHV gap criteria",
+      "timestamp": "2026-01-02T16:01:55.912661"
+    },
+    "step5_charted": {
+      "row_count": 143,
+      "column_count": 155,
+      "description": "Chart signals and technical indicators",
+      "timestamp": "2026-01-02T16:02:42.716069"
+    },
+    "step6_validated": {
+      "row_count": 143,
+      "column_count": 160,
+      "description": "Data quality validation and schema checks",
+      "timestamp": "2026-01-02T16:02:42.738790"
+    },
+    "step7_recommended": {
+      "row_count": 372,
+      "column_count": 175,
+      "description": "Multi-strategy recommendations",
+      "timestamp": "2026-01-02T16:02:42.826563"
+    },
+    "step11_evaluated": {
+      "row_count": 372,
+      "column_count": 183,
+      "description": "Independent strategy evaluation with RAG scores",
+      "timestamp": "2026-01-02T16:02:42.924600"
+    },
+    "step9a_timeframes": {
+      "row_count": 372,
+      "column_count": 189,
+      "description": "Option expiration timeframes for each strategy",
+      "timestamp": "2026-01-02T16:02:42.999547"
+    },
+    "step9b_contracts": {
+      "row_count": 372,
+      "column_count": 228,
+      "description": "Fetched contracts with Phase 2 enrichment + validation status",
+      "timestamp": "2026-01-02T16:05:44.338511"
+    },
+    "step12_acceptance_all": {
+      "row_count": 372,
+      "column_count": 235,
+      "description": "All contracts with acceptance status (READY_NOW/WAIT/AVOID/INCOMPLETE)",
+      "timestamp": "2026-01-02T16:05:44.397344"
+    },
+    "step12_acceptance_ready": {
+      "row_count": 15,
+      "column_count": 235,
+      "description": "READY_NOW contracts with MEDIUM+ confidence",
+      "timestamp": "2026-01-02T16:05:44.400482"
+    }
+  },
+  "pipeline_health": {
+    "step9b": {
+      "total_contracts": 372,
+      "valid": 87,
+      "failed": 285
+    },
+    "step12": {
+      "total_evaluated": 372,
+      "ready_now": 15,
+      "wait": 55,
+      "avoid": 17,
+      "incomplete": 285
+    },
+    "step8": {
+      "final_trades": 0
+    },
+    "quality": {
+      "step9b_success_rate": 23.387096774193548,
+      "step12_acceptance_rate": 4.032258064516129,
+      "step8_conversion_rate": 0.0,
+      "end_to_end_rate": 0.0
+    }
+  },
+  "end_time": "2026-01-02T16:05:44.612696",
+  "success": true,
+  "duration_seconds": 344.956572
+}

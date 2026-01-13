@@ -1,0 +1,72 @@
+2025-12-27 17:16:46,710 - ERROR - ❌ Step 7: Missing columns ['IVHV_gap_30D', 'IV_Rank_30D', 'Signal_Type', 'Regime', 'Crossover_Age_Bucket', 'Data_Complete']
+Traceback (most recent call last):
+  File "/Users/haniabadi/Documents/Github/options/audit_tier1_pipeline.py", line 316, in audit_step7_strategy_discovery
+    df_all = recommend_strategies(
+        df.copy(),
+        tier_filter='all_tiers',
+        exploration_mode=True
+    )
+  File "/Users/haniabadi/Documents/Github/options/core/scan_engine/step7_strategy_recommendation.py", line 148, in recommend_strategies
+    validate_input(df, required_cols, 'Step 7')
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/haniabadi/Documents/Github/options/core/scan_engine/utils.py", line 38, in validate_input
+    raise ValueError(f"Cannot proceed: {missing}")
+ValueError: Cannot proceed: ['IVHV_gap_30D', 'IV_Rank_30D', 'Signal_Type', 'Regime', 'Crossover_Age_Bucket', 'Data_Complete']
+
+================================================================================
+TIER-1 PIPELINE AUDIT - CLI VALIDATION
+================================================================================
+
+Theory-first, RAG-backed, execution-last validation
+Ensuring all Tier-1 strategies have equal representation
+
+
+================================================================================
+STEP 1: RAW UNIVERSE INGESTION
+================================================================================
+
+✅ Loaded 175 tickers from snapshot
+   Columns: 115
+   Sample tickers: ['BKNG', 'AZO', 'MELI', 'MKL', 'FCNCA', 'FICO', 'TDG', 'NFLX', 'MTD', 'TPL']
+
+================================================================================
+STEP 3: VOLATILITY REGIME DETECTION
+================================================================================
+
+❌ ERROR in Step 3: No module named 'core.scan_engine.step3_ivhv_filter'
+
+================================================================================
+STEP 5: TECHNICAL SIGNALS & CONTEXT
+================================================================================
+
+❌ ERROR in Step 5: No module named 'core.scan_engine.step5_pcs_score'
+
+================================================================================
+STEP 6: DATA COMPLETENESS ASSESSMENT
+================================================================================
+
+❌ ERROR in Step 6: No module named 'core.scan_engine.step6_gem'
+
+================================================================================
+STEP 7: STRATEGY DISCOVERY (TIER-1 AUDIT)
+================================================================================
+
+Running Step 7 in EXPLORATION mode (all tiers)...
+
+❌ ERROR in Step 7: Cannot proceed: ['IVHV_gap_30D', 'IV_Rank_30D', 'Signal_Type', 'Regime', 'Crossover_Age_Bucket', 'Data_Complete']
+
+================================================================================
+FINAL AUDIT REPORT
+================================================================================
+
+SUMMARY:
+  - Input tickers: 175
+  - Step 7 output (all): 0
+  - Step 7 output (tier1): 0
+
+VIOLATIONS:
+  None found ✅
+
+RECOMMENDATIONS:
+  1. CRITICAL: Step 7 generating zero Tier-1 strategies
+     Action: Add Tier-1 strategy logic to _select_strategy()

@@ -1,0 +1,48 @@
+{
+  "run_id": "20260110_094141",
+  "start_time": "2026-01-10T09:41:41.629069",
+  "pipeline_version": "1.0",
+  "debug_mode": true,
+  "input_snapshot": {
+    "original_path": "/Users/haniabadi/Documents/Github/options/data/snapshots/ivhv_snapshot_live_20260109_112456.csv",
+    "row_count": 177,
+    "column_count": 68
+  },
+  "config": {
+    "account_balance": 100000.0,
+    "max_portfolio_risk": 0.2,
+    "sizing_method": "volatility_scaled",
+    "snapshot_path": "/Users/haniabadi/Documents/Github/options/data/snapshots/ivhv_snapshot_live_20260109_112456.csv",
+    "expiry_intent": "ANY"
+  },
+  "steps": {
+    "step2_snapshot": {
+      "row_count": 177,
+      "column_count": 122,
+      "description": "Loaded IV/HV snapshot with Phase 1 enrichment",
+      "timestamp": "2026-01-10T09:43:38.705064"
+    },
+    "step3_filtered": {
+      "row_count": 148,
+      "column_count": 156,
+      "description": "Filtered by IVHV gap criteria",
+      "timestamp": "2026-01-10T09:43:38.726643"
+    },
+    "step5_charted": {
+      "row_count": 148,
+      "column_count": 166,
+      "description": "Chart signals and technical indicators",
+      "timestamp": "2026-01-10T09:44:24.663491"
+    },
+    "step6_validated": {
+      "row_count": 148,
+      "column_count": 172,
+      "description": "Data quality validation and schema checks",
+      "timestamp": "2026-01-10T09:44:24.683073"
+    }
+  },
+  "end_time": "2026-01-10T09:44:24.733682",
+  "success": false,
+  "error": "Step 7 failed: boolean value of NA is ambiguous",
+  "duration_seconds": 163.104613
+}

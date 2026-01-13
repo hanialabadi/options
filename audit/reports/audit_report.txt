@@ -1,0 +1,29 @@
+=== Comprehensive RAG-to-Strategy Consistency Audit ===
+Target File: temp_export.csv
+
+1. Ticker Fact Consistency: ✅ PASS
+
+2. Global Gate Consistency: ✅ PASS
+
+3. Strategy Isolation & Internal Justification: ❌ FAIL
+   - AAPL Covered Call: READY with weak Delta (0.29)
+   - ABBV Long Put: Implicit competition found ('better') in reason/notes
+   - ABBV Put Debit Spread: Implicit competition found ('better') in reason/notes
+   - ADBE Long Put: Implicit competition found ('better') in reason/notes
+   - ADBE Put Debit Spread: Implicit competition found ('better') in reason/notes
+   - AMD Long Put: Implicit competition found ('better') in reason/notes
+   - AMD Long Put LEAP: Implicit competition found ('better') in reason/notes
+   - AMD Put Debit Spread: Implicit competition found ('better') in reason/notes
+   - AMZN Long Call: Implicit competition found ('better') in reason/notes
+   - AMZN Long Call LEAP: Implicit competition found ('better') in reason/notes
+   - AMZN Call Debit Spread: Implicit competition found ('better') in reason/notes
+   - ANET Long Call: Implicit competition found ('better') in reason/notes
+   - ANET Long Call LEAP: Implicit competition found ('better') in reason/notes
+Traceback (most recent call last):
+  File "/Users/haniabadi/Documents/Github/options/comprehensive_rag_strategy_audit.py", line 125, in <module>
+    run_comprehensive_audit()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/Users/haniabadi/Documents/Github/options/comprehensive_rag_strategy_audit.py", line 112, in run_comprehensive_audit
+    if other_strat.lower() in str(r).lower() and other_strat.lower() != tdf[tdf['acceptance_reason'] == r]['Strategy_Name'].iloc[0].lower():
+       ^^^^^^^^^^^^^^^^^
+AttributeError: 'float' object has no attribute 'lower'

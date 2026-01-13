@@ -1,0 +1,260 @@
+================================================================================
+STEP-BY-STEP DECISION LEDGER
+Source: audit_steps/ and audit_trace/ CSV files
+================================================================================
+
+================================================================================
+TICKER: AAPL
+================================================================================
+
+Step 01 – Snapshot Enrichment
+  Used fields: IV_30_D_Call, iv_surface_source, iv_surface_age_days
+  Values:
+    IV_30_D_Call = 22.093
+    iv_surface_source = historical_latest
+    iv_surface_age_days = 4
+  Result: PASS
+
+Step 02 – IVHV Filter
+  Used fields: IVHV_gap_30D, IV_Rank_30D
+  Values:
+    IVHV_gap_30D = 8.941086094869824
+    IV_Rank_30D = nan
+  Result: PASS
+
+Step 03 – Chart Signals
+  Used fields: Chart_Score, RSI, ADX
+  Values:
+    Chart_Score = N/A
+    RSI = 31.10879702249065
+    ADX = 41.13171389470322
+  Result: PASS
+
+Step 04 – Data Validation
+  Used fields: data quality checks
+  Result: PASS
+
+Step 05 – Strategy Recommendation
+  Strategies generated: 2
+    - N/A
+    - N/A
+  Result: PASS (2 strategies)
+
+Step 06 – Strategy Evaluation
+  Evaluated: 2 strategies
+    Score: 50.0
+    Score: 50.0
+  Result: PASS
+
+Step 09 – Acceptance Logic (CRITICAL GATE)
+
+  Strategy: N/A
+    acceptance_status = INCOMPLETE
+    acceptance_reason = Contract validation failed (Step 9B)
+    Validation_Status = Pending_Greeks
+    Contract_Status = FAILED_LIQUIDITY_FILTER
+    iv_rank_available = False
+    iv_history_days = 4
+    confidence_band = LOW
+
+  Strategy: N/A
+    acceptance_status = WAIT
+    acceptance_reason = Wait for clearer directional setup or better timing
+    Validation_Status = Valid
+    Contract_Status = OK
+    iv_rank_available = False
+    iv_history_days = 4
+    confidence_band = LOW
+
+================================================================================
+BLOCKING STEP: Step 09 (Acceptance Logic)
+================================================================================
+Blocking Condition: acceptance_status != 'READY_NOW'
+
+Evidence:
+  acceptance_status = INCOMPLETE
+  acceptance_reason = Contract validation failed (Step 9B)
+  iv_rank_available = False
+  iv_history_days = 4
+  Validation_Status = Pending_Greeks
+  Contract_Status = FAILED_LIQUIDITY_FILTER
+
+Root Cause Analysis:
+  ❌ iv_rank_available = False (need 120+ days, have 4)
+  ❌ Validation failed: Pending_Greeks
+  ❌ Contract failed: FAILED_LIQUIDITY_FILTER
+
+
+================================================================================
+TICKER: MSFT
+================================================================================
+
+Step 01 – Snapshot Enrichment
+  Used fields: IV_30_D_Call, iv_surface_source, iv_surface_age_days
+  Values:
+    IV_30_D_Call = 27.147
+    iv_surface_source = historical_latest
+    iv_surface_age_days = 4
+  Result: PASS
+
+Step 02 – IVHV Filter
+  Used fields: IVHV_gap_30D, IV_Rank_30D
+  Values:
+    IVHV_gap_30D = 7.893121591918529
+    IV_Rank_30D = nan
+  Result: PASS
+
+Step 03 – Chart Signals
+  Used fields: Chart_Score, RSI, ADX
+  Values:
+    Chart_Score = N/A
+    RSI = 36.912756768976
+    ADX = 11.447531822317645
+  Result: PASS
+
+Step 04 – Data Validation
+  Used fields: data quality checks
+  Result: PASS
+
+Step 05 – Strategy Recommendation
+  Strategies generated: 2
+    - N/A
+    - N/A
+  Result: PASS (2 strategies)
+
+Step 06 – Strategy Evaluation
+  Evaluated: 2 strategies
+    Score: 50.0
+    Score: 50.0
+  Result: PASS
+
+Step 09 – Acceptance Logic (CRITICAL GATE)
+
+  Strategy: N/A
+    acceptance_status = INCOMPLETE
+    acceptance_reason = Contract validation failed (Step 9B)
+    Validation_Status = Pending_Greeks
+    Contract_Status = FAILED_LIQUIDITY_FILTER
+    iv_rank_available = False
+    iv_history_days = 4
+    confidence_band = LOW
+
+  Strategy: N/A
+    acceptance_status = WAIT
+    acceptance_reason = Wait for clearer directional setup or better timing
+    Validation_Status = Valid
+    Contract_Status = OK
+    iv_rank_available = False
+    iv_history_days = 4
+    confidence_band = LOW
+
+================================================================================
+BLOCKING STEP: Step 09 (Acceptance Logic)
+================================================================================
+Blocking Condition: acceptance_status != 'READY_NOW'
+
+Evidence:
+  acceptance_status = INCOMPLETE
+  acceptance_reason = Contract validation failed (Step 9B)
+  iv_rank_available = False
+  iv_history_days = 4
+  Validation_Status = Pending_Greeks
+  Contract_Status = FAILED_LIQUIDITY_FILTER
+
+Root Cause Analysis:
+  ❌ iv_rank_available = False (need 120+ days, have 4)
+  ❌ Validation failed: Pending_Greeks
+  ❌ Contract failed: FAILED_LIQUIDITY_FILTER
+
+
+================================================================================
+TICKER: NVDA
+================================================================================
+
+Step 01 – Snapshot Enrichment
+  Used fields: IV_30_D_Call, iv_surface_source, iv_surface_age_days
+  Values:
+    IV_30_D_Call = 38.031
+    iv_surface_source = historical_latest
+    iv_surface_age_days = 4
+  Result: PASS
+
+Step 02 – IVHV Filter
+  Used fields: IVHV_gap_30D, IV_Rank_30D
+  Values:
+    IVHV_gap_30D = 6.978240146615828
+    IV_Rank_30D = nan
+  Result: PASS
+
+Step 03 – Chart Signals
+  Used fields: Chart_Score, RSI, ADX
+  Values:
+    Chart_Score = N/A
+    RSI = 59.30452758700307
+    ADX = 14.591838175070263
+  Result: PASS
+
+Step 04 – Data Validation
+  Used fields: data quality checks
+  Result: PASS
+
+Step 05 – Strategy Recommendation
+  Strategies generated: 3
+    - N/A
+    - N/A
+    - N/A
+  Result: PASS (3 strategies)
+
+Step 06 – Strategy Evaluation
+  Evaluated: 3 strategies
+    Score: 50.0
+    Score: 50.0
+    Score: 50.0
+  Result: PASS
+
+Step 09 – Acceptance Logic (CRITICAL GATE)
+
+  Strategy: N/A
+    acceptance_status = STRUCTURALLY_READY
+    acceptance_reason = NORMAL range in MID_RANGE - ideal for income strategies (awaiting full evaluation - score < 60)
+    Validation_Status = Valid
+    Contract_Status = OK
+    iv_rank_available = False
+    iv_history_days = 4
+    confidence_band = MEDIUM
+
+  Strategy: N/A
+    acceptance_status = WAIT
+    acceptance_reason = Unknown strategy type - manual review required
+    Validation_Status = Valid
+    Contract_Status = OK
+    iv_rank_available = False
+    iv_history_days = 4
+    confidence_band = LOW
+
+  Strategy: N/A
+    acceptance_status = STRUCTURALLY_READY
+    acceptance_reason = BULLISH_MODERATE setup with range_bound structure (awaiting full evaluation - score < 60)
+    Validation_Status = Valid
+    Contract_Status = OK
+    iv_rank_available = False
+    iv_history_days = 4
+    confidence_band = MEDIUM
+
+================================================================================
+BLOCKING STEP: Step 09 (Acceptance Logic)
+================================================================================
+Blocking Condition: acceptance_status != 'READY_NOW'
+
+Evidence:
+  acceptance_status = STRUCTURALLY_READY
+  acceptance_reason = NORMAL range in MID_RANGE - ideal for income strategies (awaiting full evaluation - score < 60)
+  iv_rank_available = False
+  iv_history_days = 4
+  Validation_Status = Valid
+  Contract_Status = OK
+
+Root Cause Analysis:
+  ❌ iv_rank_available = False (need 120+ days, have 4)
+  ⚠️  Structurally valid but score < 60
+

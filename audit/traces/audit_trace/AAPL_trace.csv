@@ -1,0 +1,5 @@
+step,step_name,description,rows,status,acceptance_status,acceptance_reason,iv_rank_available,iv_history_days,iv_surface_source,iv_surface_age_days,notes
+step01,snapshot_enriched,Raw snapshot + IV surface + earnings enrichment,1,PRESENT,,,,,historical_latest,1,
+step02,ivhv_filtered,IVHV gap filter applied,1,PRESENT,,,,,historical_latest,1,
+step03,chart_signals,Technical analysis,1,PRESENT,,,,,historical_latest,1,
+step04,data_validated,Data quality validation,1,PRESENT,,,,,historical_latest,1,

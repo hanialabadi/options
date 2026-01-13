@@ -1,0 +1,2 @@
+Ticker,Strategy_Name,acceptance_status,acceptance_reason,IV_Rank_Source,Regime,Signal_Type,Contract_Status,Validation_Status
+AMZN,Cash-Secured Put,READY_NOW,NORMAL range in MID_RANGE - ideal for income strategies (Low history depth - capping confidence) (IV data immature; execution allowed but volatility context limited),LOCAL,Unknown,Bullish,OK,DATA_NOT_MATURE

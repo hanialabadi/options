@@ -1,0 +1,23 @@
+{
+  "step9b": {
+    "total_contracts": 597,
+    "valid": 236,
+    "failed": 361
+  },
+  "step12": {
+    "total_evaluated": 597,
+    "ready_now": 78,
+    "wait": 140,
+    "avoid": 18,
+    "incomplete": 361
+  },
+  "step8": {
+    "final_trades": 0
+  },
+  "quality": {
+    "step9b_success_rate": 39.53098827470687,
+    "step12_acceptance_rate": 13.06532663316583,
+    "step8_conversion_rate": 0.0,
+    "end_to_end_rate": 0.0
+  }
+}

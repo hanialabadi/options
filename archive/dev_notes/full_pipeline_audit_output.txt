@@ -1,0 +1,92 @@
+WARNING:root:pandas_ta not available - ADX/RSI will be unavailable
+WARNING:core.scan_engine.step2_load_snapshot:⚠️ Snapshot is 3011.7 hours old (threshold: 48h). Data may be stale.
+================================================================================
+FULL PIPELINE AUDIT - Dashboard Flow Verification
+================================================================================
+Testing: Step 2 → 3 → 5 → 6 → 7 → 9B → 10 → 11 → 8
+================================================================================
+
+================================================================================
+STAGE 2: Load IV/HV Snapshot (Murphy + Sinclair)
+================================================================================
+Rows: 175
+  Ticker: {'BKNG': np.int64(1), 'BX': np.int64(1), 'MS': np.int64(1)}
+  Trend_State: {'Bullish': np.int64(94), 'Neutral': np.int64(42), 'Bearish': np.int64(39)}
+  Volatility_Regime: {'High Vol': np.int64(70), 'Compression': np.int64(59), 'Low Vol': np.int64(39)}
+  RSI: mean=53.71, min=16.56, max=93.26
+  ADX: mean=34.30, min=8.19, max=94.92
+Columns: 130
+Sample columns: ['Ticker', 'timestamp', 'IV_7_D_Call', 'IV_7_D_CallChg', 'IV_7_D_Put', 'IV_7_D_PutChg', 'IV_7_D_Call_1W', 'IV_7_D_Put_1W', 'IV_7_D_Call_1M', 'IV_7_D_Put_1M']
+
+📊 Murphy Technical Analysis Fields:
+  ✅ Trend_State: 175/175 populated
+  ✅ Price_vs_SMA20: 175/175 populated
+  ✅ Price_vs_SMA50: 175/175 populated
+  ✅ Volume_Trend: 175/175 populated
+  ✅ RSI: 175/175 populated
+  ✅ ADX: 175/175 populated
+
+📊 Sinclair Volatility Fields:
+  ✅ Volatility_Regime: 175/175 populated
+  ✅ IV_Term_Structure: 175/175 populated
+  ✅ Recent_Vol_Spike: 175/175 populated
+
+================================================================================
+STAGE 3: Filter by IVHV Gap (≥2.0)
+================================================================================
+Rows: 127
+  IVHV_gap_30D: mean=-5.06, min=-64.82, max=28.36
+  Volatility_Regime: {'High Vol': np.int64(55), 'Compression': np.int64(44), 'Low Vol': np.int64(23)}
+Columns: 165
+Sample columns: ['Ticker', 'timestamp', 'IV_7_D_Call', 'IV_7_D_CallChg', 'IV_7_D_Put', 'IV_7_D_PutChg', 'IV_7_D_Call_1W', 'IV_7_D_Put_1W', 'IV_7_D_Call_1M', 'IV_7_D_Put_1M']
+
+================================================================================
+STAGE 5: Compute Chart Signals
+================================================================================
+Rows: 127
+  Trend_State: {'Bullish': np.int64(69), 'Bearish': np.int64(29), 'Neutral': np.int64(29)}
+Columns: 176
+Sample columns: ['Ticker', 'timestamp', 'IV_7_D_Call', 'IV_7_D_CallChg', 'IV_7_D_Put', 'IV_7_D_PutChg', 'IV_7_D_Call_1W', 'IV_7_D_Put_1W', 'IV_7_D_Call_1M', 'IV_7_D_Put_1M']
+
+================================================================================
+STAGE 6: Data Quality (GEM Filter)
+================================================================================
+Rows: 127
+  Volatility_Regime: {'High Vol': np.int64(55), 'Compression': np.int64(44), 'Low Vol': np.int64(23)}
+Columns: 180
+Sample columns: ['Ticker', 'timestamp', 'IV_7_D_Call', 'IV_7_D_CallChg', 'IV_7_D_Put', 'IV_7_D_PutChg', 'IV_7_D_Call_1W', 'IV_7_D_Put_1W', 'IV_7_D_Call_1M', 'IV_7_D_Put_1M']
+
+================================================================================
+STAGE 7: Strategy Recommendations
+================================================================================
+Rows: 350
+  Ticker: {'MS': np.int64(4), 'PLTR': np.int64(4), 'BA': np.int64(4)}
+Columns: 21
+Sample columns: ['Strategy_Name', 'Timeframe_Category', 'DTE_Min', 'DTE_Max', 'DTE_Preferred', 'Risk_Reward_Ratio', 'Success_Probability', 'Capital_Requirement_Est', 'Percent_Of_Account', 'Risk_Profile']
+
+================================================================================
+STAGE 9B: Fetch Option Contracts (MOCK)
+================================================================================
+⚠️ Using mock contract data (real Tradier fetch requires API key)
+Mock contracts created: 350
+Traceback (most recent call last):
+  File "/Users/haniabadi/Documents/Github/options/venv/lib/python3.13/site-packages/pandas/core/indexes/base.py", line 3812, in get_loc
+    return self._engine.get_loc(casted_key)
+           ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+  File "pandas/_libs/index.pyx", line 167, in pandas._libs.index.IndexEngine.get_loc
+  File "pandas/_libs/index.pyx", line 196, in pandas._libs.index.IndexEngine.get_loc
+  File "pandas/_libs/hashtable_class_helper.pxi", line 7088, in pandas._libs.hashtable.PyObjectHashTable.get_item
+  File "pandas/_libs/hashtable_class_helper.pxi", line 7096, in pandas._libs.hashtable.PyObjectHashTable.get_item
+KeyError: 'Delta'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/haniabadi/Documents/Github/options/test_full_pipeline_audit.py", line 200, in <module>
+    print(f"All contracts have Greeks: {df_contracts['Delta'].notna().all()}")
+                                        ~~~~~~~~~~~~^^^^^^^^^
+  File "/Users/haniabadi/Documents/Github/options/venv/lib/python3.13/site-packages/pandas/core/frame.py", line 4107, in __getitem__
+    indexer = self.columns.get_loc(key)
+  File "/Users/haniabadi/Documents/Github/options/venv/lib/python3.13/site-packages/pandas/core/indexes/base.py", line 3819, in get_loc
+    raise KeyError(key) from err
+KeyError: 'Delta'

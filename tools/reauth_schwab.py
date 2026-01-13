@@ -19,6 +19,10 @@ import webbrowser
 from urllib.parse import urlparse, parse_qs
 import requests
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Load environment variables from .env if present
+load_dotenv()
 
 SCHWAB_CLIENT_ID = os.getenv("SCHWAB_APP_KEY")
 SCHWAB_CLIENT_SECRET = os.getenv("SCHWAB_APP_SECRET")
