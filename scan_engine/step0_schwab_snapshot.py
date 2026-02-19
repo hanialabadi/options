@@ -861,15 +861,13 @@ def fetch_iv_proxy(
                 return np.nan
             return np.nan if v <= 0 else v
 
-        def _extract_iv_for_expiry(date_str: str) -> float:
-            """Average ATM call + put IV for a single expiration, falling back to whichever leg is valid."""
+        def _extract_iv_for_expiry(date_str: str) -> Tuple[float, float]:
+            """Return (call_iv, put_iv) at ATM for a single expiration."""
             call_opts = _lookup_strike(call_map.get(date_str, {}))
             put_opts  = _lookup_strike(put_map.get(date_str, {}))
             c_iv = _parse_volatility(call_opts[0].get('volatility') if call_opts else None)
             p_iv = _parse_volatility(put_opts[0].get('volatility') if put_opts else None)
-            if not np.isnan(c_iv) and not np.isnan(p_iv):
-                return (c_iv + p_iv) / 2
-            return c_iv if not np.isnan(c_iv) else p_iv
+            return c_iv, p_iv
 
         # For each IV timeframe, find the nearest available expiry within tolerance
         result = _empty_iv_dict()
@@ -880,10 +878,21 @@ def fetch_iv_proxy(
             tolerance = max(tf_days * 0.5, 14)
             if abs(actual_dte - tf_days) > tolerance:
                 continue
-            iv_val = _extract_iv_for_expiry(best_expiry)
-            if not np.isnan(iv_val):
-                result[f'iv_{tf_days}d'] = iv_val
-                logger.debug(f"  {ticker} iv_{tf_days}d={iv_val:.2f}% (DTE={actual_dte})")
+            c_iv, p_iv = _extract_iv_for_expiry(best_expiry)
+            if not np.isnan(c_iv):
+                result[f'iv_{tf_days}d_call'] = c_iv
+            if not np.isnan(p_iv):
+                result[f'iv_{tf_days}d_put'] = p_iv
+            # Average for the primary iv_{tf}d key
+            if not np.isnan(c_iv) and not np.isnan(p_iv):
+                result[f'iv_{tf_days}d'] = (c_iv + p_iv) / 2
+            elif not np.isnan(c_iv):
+                result[f'iv_{tf_days}d'] = c_iv
+            elif not np.isnan(p_iv):
+                result[f'iv_{tf_days}d'] = p_iv
+            else:
+                continue
+            logger.debug(f"  {ticker} iv_{tf_days}d (DTE={actual_dte}): call={c_iv:.2f} put={p_iv:.2f}")
 
         iv_30d = result.get('iv_30d', np.nan)
         if not np.isnan(iv_30d):
@@ -899,8 +908,14 @@ def fetch_iv_proxy(
 
 
 def _empty_iv_dict() -> Dict[str, float]:
-    """Return empty IV dict with all timeframes as NaN."""
-    return {f'iv_{tf}d': np.nan for tf in [7, 14, 21, 30, 60, 90, 120, 150, 180, 270, 360, 720, 1080]}
+    """Return empty IV dict with all timeframes as NaN (average, call leg, put leg)."""
+    tfs = [7, 14, 21, 30, 60, 90, 120, 150, 180, 270, 360, 720, 1080]
+    d: Dict[str, float] = {}
+    for tf in tfs:
+        d[f'iv_{tf}d']      = np.nan  # call+put average
+        d[f'iv_{tf}d_call'] = np.nan  # call leg only
+        d[f'iv_{tf}d_put']  = np.nan  # put leg only
+    return d
 
 
 # ============================================================
@@ -1132,35 +1147,35 @@ def generate_live_snapshot(
             # IV proxy (primary)
             'iv_30d': iv.get('iv_30d', np.nan),
             
-            # Multi-timeframe IV (calls)
-            'IV_7_D_Call': iv.get('iv_7d', np.nan),
-            'IV_14_D_Call': iv.get('iv_14d', np.nan),
-            'IV_21_D_Call': iv.get('iv_21d', np.nan),
-            'IV_30_D_Call': iv.get('iv_30d', np.nan),  # Duplicate for compatibility
-            'IV_60_D_Call': iv.get('iv_60d', np.nan),
-            'IV_90_D_Call': iv.get('iv_90d', np.nan),
-            'IV_120_D_Call': iv.get('iv_120d', np.nan),
-            'IV_150_D_Call': iv.get('iv_150d', np.nan),
-            'IV_180_D_Call': iv.get('iv_180d', np.nan),
-            'IV_270_D_Call': iv.get('iv_270d', np.nan),
-            'IV_360_D_Call': iv.get('iv_360d', np.nan),
-            'IV_720_D_Call': iv.get('iv_720d', np.nan),
-            'IV_1080_D_Call': iv.get('iv_1080d', np.nan),
-            
-            # Multi-timeframe IV (puts) - Not fetched yet, set to NaN
-            'IV_7_D_Put': np.nan,
-            'IV_14_D_Put': np.nan,
-            'IV_21_D_Put': np.nan,
-            'IV_30_D_Put': np.nan,
-            'IV_60_D_Put': np.nan,
-            'IV_90_D_Put': np.nan,
-            'IV_120_D_Put': np.nan,
-            'IV_150_D_Put': np.nan,
-            'IV_180_D_Put': np.nan,
-            'IV_270_D_Put': np.nan,
-            'IV_360_D_Put': np.nan,
-            'IV_720_D_Put': np.nan,
-            'IV_1080_D_Put': np.nan,
+            # Multi-timeframe IV (call leg)
+            'IV_7_D_Call': iv.get('iv_7d_call', np.nan),
+            'IV_14_D_Call': iv.get('iv_14d_call', np.nan),
+            'IV_21_D_Call': iv.get('iv_21d_call', np.nan),
+            'IV_30_D_Call': iv.get('iv_30d_call', np.nan),
+            'IV_60_D_Call': iv.get('iv_60d_call', np.nan),
+            'IV_90_D_Call': iv.get('iv_90d_call', np.nan),
+            'IV_120_D_Call': iv.get('iv_120d_call', np.nan),
+            'IV_150_D_Call': iv.get('iv_150d_call', np.nan),
+            'IV_180_D_Call': iv.get('iv_180d_call', np.nan),
+            'IV_270_D_Call': iv.get('iv_270d_call', np.nan),
+            'IV_360_D_Call': iv.get('iv_360d_call', np.nan),
+            'IV_720_D_Call': iv.get('iv_720d_call', np.nan),
+            'IV_1080_D_Call': iv.get('iv_1080d_call', np.nan),
+
+            # Multi-timeframe IV (put leg)
+            'IV_7_D_Put': iv.get('iv_7d_put', np.nan),
+            'IV_14_D_Put': iv.get('iv_14d_put', np.nan),
+            'IV_21_D_Put': iv.get('iv_21d_put', np.nan),
+            'IV_30_D_Put': iv.get('iv_30d_put', np.nan),
+            'IV_60_D_Put': iv.get('iv_60d_put', np.nan),
+            'IV_90_D_Put': iv.get('iv_90d_put', np.nan),
+            'IV_120_D_Put': iv.get('iv_120d_put', np.nan),
+            'IV_150_D_Put': iv.get('iv_150d_put', np.nan),
+            'IV_180_D_Put': iv.get('iv_180d_put', np.nan),
+            'IV_270_D_Put': iv.get('iv_270d_put', np.nan),
+            'IV_360_D_Put': iv.get('iv_360d_put', np.nan),
+            'IV_720_D_Put': iv.get('iv_720d_put', np.nan),
+            'IV_1080_D_Put': iv.get('iv_1080d_put', np.nan),
             
             # Multi-timeframe HV (computed)
             'hv_10': hv.get(10, np.nan),
