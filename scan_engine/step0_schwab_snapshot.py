@@ -1423,26 +1423,26 @@ def run_snapshot(
         con = duckdb.connect(str(db_path))
         initialize_iv_term_history_table(con)
 
-        # Extract required IV columns from the snapshot DataFrame
-        df_iv_insert = df[[
-            'Ticker', 'snapshot_ts',
-            'IV_7_D_Call', 'IV_14_D_Call', 'IV_30_D_Call', 'IV_60_D_Call',
-            'IV_90_D_Call', 'IV_120_D_Call', 'IV_180_D_Call', 'IV_360_D_Call'
-        ]].copy()
+        # Build averaged IV columns from call+put legs for each DB timeframe.
+        # IV_*_D_Call and IV_*_D_Put are the individual legs; the DB stores the
+        # call+put average, falling back to whichever single leg is valid.
+        db_timeframes = [7, 14, 30, 60, 90, 120, 180, 360]
 
-        # Rename columns to match DB schema
+        df_iv_insert = df[['Ticker', 'snapshot_ts']].copy()
         df_iv_insert = df_iv_insert.rename(columns={
             'Ticker': 'ticker',
-            'snapshot_ts': 'date', # Will be overwritten by trade_date in append_daily_iv_data
-            'IV_7_D_Call': 'iv_7d',
-            'IV_14_D_Call': 'iv_14d',
-            'IV_30_D_Call': 'iv_30d',
-            'IV_60_D_Call': 'iv_60d',
-            'IV_90_D_Call': 'iv_90d',
-            'IV_120_D_Call': 'iv_120d',
-            'IV_180_D_Call': 'iv_180d',
-            'IV_360_D_Call': 'iv_360d'
+            'snapshot_ts': 'date',  # overwritten by trade_date in append_daily_iv_data
         })
+
+        for tf in db_timeframes:
+            call_col = f'IV_{tf}_D_Call'
+            put_col  = f'IV_{tf}_D_Put'
+            c = df[call_col].to_numpy(dtype=float, na_value=np.nan)
+            p = df[put_col].to_numpy(dtype=float, na_value=np.nan)
+            both_valid = ~np.isnan(c) & ~np.isnan(p)
+            avg = np.where(both_valid, (c + p) / 2,
+                  np.where(~np.isnan(c), c, p))
+            df_iv_insert[f'iv_{tf}d'] = avg
 
         # Add source column
         df_iv_insert['source'] = "Schwab_Step0"
