@@ -20,7 +20,7 @@ import numpy as np
 sys.path.insert(0, '/Users/haniabadi/Documents/Github/options')
 
 from utils.pattern_detection import detect_bulkowski_patterns, detect_nison_candlestick
-from core.scan_engine.step11_independent_evaluation import (
+from scan_engine.step11_independent_evaluation import (
     _evaluate_directional_strategy,
     _evaluate_volatility_strategy,
     _evaluate_income_strategy

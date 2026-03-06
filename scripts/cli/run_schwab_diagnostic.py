@@ -1,7 +1,7 @@
 import argparse
 import json
 import logging
-from core.scan_engine.step0_schwab_market_data import fetch_schwab_quotes, fetch_schwab_price_history
+from scan_engine.step0_schwab_market_data import fetch_schwab_quotes, fetch_schwab_price_history
 
 # Configure logging for the diagnostic script
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

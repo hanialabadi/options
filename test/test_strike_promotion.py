@@ -7,7 +7,7 @@ but the engine must promote exactly one strike per strategy to execution."
 
 import pandas as pd
 import numpy as np
-from core.scan_engine.step9b_fetch_contracts import _promote_best_strike
+from scan_engine.step9b_fetch_contracts import _promote_best_strike
 
 def test_credit_spread_promotion():
     """Test credit spread promotes SHORT strike (sells premium)."""

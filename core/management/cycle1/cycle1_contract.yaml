@@ -1,0 +1,84 @@
+# Cycle 1 Contract: Ground Truth Ledger
+# Version: 1.0.0
+# Status: FROZEN
+# Description: This contract defines the immutable boundary for Cycle 1 (Ingestion & Identity).
+# No Cycle 2+ (Enrichment, Doctrine, Analytics) logic may exist here.
+
+contract_metadata:
+  cycle: 1
+  name: "Ground Truth Ledger"
+  owner: "Forensic Systems Architect"
+  freeze_date: "2026-01-19"
+
+ingestion_rules:
+  allowed_modes:
+    - manual_upload: "User provides Fidelity CSV via UI"
+    - cli_ingest: "User provides explicit --path to Fidelity CSV"
+  prohibitions:
+    - no_auto_runs: "System must never ingest without explicit user trigger"
+    - no_auto_latest: "System must never guess the latest file; path must be explicit"
+    - no_hidden_imports: "Cycle 1 must not import from core/management/cycle2 or cycle3"
+
+input_truth:
+  primary_broker: "Fidelity"
+  header_handling:
+    normalization: "strip_whitespace, collapse_multiple_spaces"
+    skip_rows: 2 # FIDELITY_HEADER_ROWS
+  symbol_rules:
+    format: "OCC-style"
+    spacing: "Preserve internal spacing for regex parsing"
+    max_length: 50
+  non_inferable_fields:
+    - Underlying_Ticker: "Must be extracted from Symbol or used as-is for Stocks"
+    - AssetType: "Must be classified as STOCK or OPTION based on OCC pattern"
+
+schema_contract:
+  required_columns:
+    Symbol: { type: "string", nullable: false, description: "Identity Anchor" }
+    Account: { type: "string", nullable: false, description: "Identity Anchor" }
+    Quantity: { type: "float", nullable: false, description: "Economic Anchor" }
+    Basis: { type: "float", nullable: true, description: "Economic Anchor" }
+    Strike: { type: "float", nullable: true, description: "Economic Anchor" }
+    Expiration: { type: "datetime", nullable: true, description: "Economic Anchor" }
+    "Call/Put": { type: "string", nullable: true, description: "Economic Anchor" }
+    Type: { type: "string", nullable: true, description: "Cash/Margin" }
+    "UL Last": { type: "float", nullable: true, description: "Sensitivity Anchor (Price)" }
+    Last: { type: "float", nullable: true, description: "Sensitivity Anchor (Price)" }
+    Delta: { type: "float", nullable: true, description: "Sensitivity Anchor" }
+    Gamma: { type: "float", nullable: true, description: "Sensitivity Anchor" }
+    Vega: { type: "float", nullable: true, description: "Sensitivity Anchor" }
+    Theta: { type: "float", nullable: true, description: "Sensitivity Anchor" }
+    Rho: { type: "float", nullable: true, description: "Sensitivity Anchor" }
+    "Time Val": { type: "float", nullable: true, description: "Required for Premium derivation" }
+  persisted_derivations:
+    Snapshot_TS: { type: "datetime", nullable: false, source: "As of Date/Time or System Now" }
+    AssetType: { type: "string", nullable: false, values: ["STOCK", "OPTION", "UNKNOWN"] }
+    Underlying_Ticker: { type: "string", nullable: false }
+    Premium: { type: "float", nullable: true, formula: "Time Val * sign(Quantity)" }
+
+transformation_rules:
+  allowed:
+    - numeric_coercion: "Convert strings to floats/ints"
+    - money_cleaning: "Remove $, commas; handle () as negative"
+    - percentage_normalization: "Convert '12.3%' to 0.123"
+    - asset_classification: "STOCK vs OPTION via OCC regex"
+    - temporal_anchoring: "Prefer broker 'As of' time over system time"
+  forbidden:
+    - no_enrichment: "No joining with external IV, Greeks, or Fundamental data"
+    - no_inference: "No guessing missing strikes or expirations"
+    - no_recomputation: "No recalculating Greeks; use broker-provided values only"
+
+persistence_rules:
+  storage_format: "CSV"
+  naming_convention: "phase1_positions_%Y-%m-%d_%H-%M-%S.csv"
+  audit_trail:
+    - "Log SHA256 hash of raw input file"
+    - "Log raw row count vs filtered row count"
+  guarantees:
+    - append_only: "Never overwrite existing snapshots"
+    - immutable_history: "Once written, a snapshot is ground truth"
+
+directionality_guard:
+  rule: "Cycle 1 → Cycle 2 → Cycle 3"
+  enforcement: "FATAL"
+  description: "Cycle 1 modules are forbidden from importing any module from Cycle 2 or Cycle 3. Violation indicates a boundary leak."

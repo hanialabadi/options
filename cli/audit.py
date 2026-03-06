@@ -8,7 +8,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from core.scan_engine.pipeline import run_full_scan_pipeline
+from scan_engine.pipeline import run_full_scan_pipeline
 from core.governance.contracts import ContractViolation
 
 # Configure logging to be quiet during audit unless error

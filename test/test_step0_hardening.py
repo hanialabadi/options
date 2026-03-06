@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.scan_engine.step0_schwab_snapshot import main as step0_main
+from scan_engine.step0_schwab_snapshot import run_snapshot as step0_main
 
 def test_hardened_step0():
     """

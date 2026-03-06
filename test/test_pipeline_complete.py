@@ -5,7 +5,7 @@ Test with 1 ticker and inspect output at each step
 
 import pandas as pd
 import logging
-from core.scan_engine.pipeline import run_full_scan_pipeline
+from scan_engine.pipeline import run_full_scan_pipeline
 
 # Set up detailed logging
 logging.basicConfig(

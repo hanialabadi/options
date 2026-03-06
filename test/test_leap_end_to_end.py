@@ -13,9 +13,9 @@ import pandas as pd
 import sys
 sys.path.insert(0, '/Users/haniabadi/Documents/Github/options')
 
-from core.scan_engine.step7_strategy_recommendation import recommend_strategies
-from core.scan_engine.step9a_determine_timeframe import determine_option_timeframe
-from core.scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
+from scan_engine.step7_strategy_recommendation import recommend_strategies
+from scan_engine.step9a_determine_timeframe import determine_option_timeframe
+from scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
 
 
 def test_leap_end_to_end():

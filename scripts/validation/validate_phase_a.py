@@ -17,7 +17,7 @@ print()
 # Test 1: ChainCache import and basic operations
 print("1️⃣ Testing ChainCache...")
 try:
-    from core.scan_engine.chain_cache import ChainCache
+    from scan_engine.chain_cache import ChainCache
     
     with tempfile.TemporaryDirectory() as tmpdir:
         cache = ChainCache(cache_dir=tmpdir, max_memory_size=5)
@@ -37,7 +37,7 @@ except Exception as e:
 # Test 2: ThrottledExecutor import and basic operations
 print("2️⃣ Testing ThrottledExecutor...")
 try:
-    from core.scan_engine.throttled_executor import ThrottledExecutor
+    from scan_engine.throttled_executor import ThrottledExecutor
     
     def test_fn(x):
         return x * 2
@@ -58,7 +58,7 @@ except Exception as e:
 # Test 3: ExpirationCache
 print("3️⃣ Testing ExpirationCache...")
 try:
-    from core.scan_engine.chain_cache import ExpirationCache
+    from scan_engine.chain_cache import ExpirationCache
     
     with tempfile.TemporaryDirectory() as tmpdir:
         exp_cache = ExpirationCache(cache_dir=tmpdir)
@@ -76,7 +76,7 @@ except Exception as e:
 # Test 4: BatchProcessor
 print("4️⃣ Testing BatchProcessor...")
 try:
-    from core.scan_engine.throttled_executor import BatchProcessor, ThrottledExecutor
+    from scan_engine.throttled_executor import BatchProcessor, ThrottledExecutor
     
     with tempfile.TemporaryDirectory() as tmpdir:
         executor = ThrottledExecutor(max_workers=2, requests_per_second=50)

@@ -10,7 +10,7 @@ Verifies that Step 8 produces complete WHY explanations for every trade:
 """
 
 import pandas as pd
-from core.scan_engine import step8_position_sizing
+from scan_engine import step8_position_sizing
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')

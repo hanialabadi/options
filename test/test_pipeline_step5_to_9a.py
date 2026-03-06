@@ -40,7 +40,7 @@ import logging
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.scan_engine import run_full_scan_pipeline
+from scan_engine import run_full_scan_pipeline
 
 # Setup logging
 logging.basicConfig(

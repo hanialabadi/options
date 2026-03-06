@@ -14,7 +14,7 @@ import sys
 sys.path.insert(0, '/Users/haniabadi/Documents/Github/options')
 
 from utils.pcs_scoring_v2 import calculate_pcs_score_v2
-from core.scan_engine.step11_strategy_pairing import _calculate_goal_alignment
+from scan_engine.step11_strategy_pairing import _calculate_goal_alignment
 
 print("="*70)
 print("STRATEGY BIAS FIX VERIFICATION")

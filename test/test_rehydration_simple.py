@@ -24,7 +24,7 @@ print(f"  IV_60_D_Call: {df_raw['IV_60_D_Call'].iloc[0]}")
 
 # Step 2: Load with rehydration
 print("\n[2] Loading with IV surface rehydration...")
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot
 
 df_rehydrated = load_ivhv_snapshot('data/snapshots/ivhv_snapshot_live_20260102_124337.csv')
 df_rehydrated = df_rehydrated[df_rehydrated['Ticker'] == 'AAPL']

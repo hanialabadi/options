@@ -6,7 +6,7 @@ import sys
 import pandas as pd
 sys.path.insert(0, '.')
 
-from core.scan_engine.step9b_fetch_contracts_schwab import fetch_and_select_contracts_schwab
+from scan_engine.step9b_fetch_contracts_schwab import fetch_and_select_contracts_schwab
 
 print('='*70)
 print('MANUAL STEP 9B RUN FOR PHASE 2 VALIDATION')

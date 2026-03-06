@@ -65,8 +65,8 @@ def enrich_with_ohlcv(df: pd.DataFrame, client=None) -> pd.DataFrame:
     """
     # Import scan engine modules (production code reuse)
     try:
-        from core.scan_engine.step0_schwab_snapshot import fetch_price_history_with_retry
-        from core.scan_engine.schwab_api_client import SchwabClient
+        from scan_engine.step0_schwab_snapshot import fetch_price_history_with_retry
+        from scan_engine.schwab_api_client import SchwabClient
     except ImportError as e:
         logger.error(f"Failed to import scan engine modules: {e}")
         logger.warning("⚠️  Skipping OHLCV enrichment (scan engine not available)")

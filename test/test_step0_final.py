@@ -3,8 +3,8 @@ Step 0 Final Validation Test
 Tests hv_slope, volatility_regime, and data_source fields
 """
 
-from core.scan_engine.step0_schwab_snapshot import *
-from core.scan_engine.schwab_api_client import SchwabClient
+from scan_engine.step0_schwab_snapshot import *
+from scan_engine.schwab_api_client import SchwabClient
 import os
 import time
 
@@ -82,7 +82,7 @@ def main():
     
     # Verify Step 2 compatibility
     print(f'\n🔗 STEP 2 INTEGRATION TEST:')
-    from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot
+    from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot
     df_step2 = load_ivhv_snapshot(str(path))
     print(f'   ✅ Step 2 loaded successfully')
     print(f'   Rows: {len(df_step2)}')

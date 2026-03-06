@@ -42,7 +42,7 @@ def patched_phase7_freeze_and_archive(
     # === 🧊 Freeze Map
     freeze_map = [
         ("Delta", "Delta_Entry"), ("Gamma", "Gamma_Entry"), ("Vega", "Vega_Entry"), ("Theta", "Theta_Entry"),
-        ("IV Mid", "IV_Entry"), ("Skew", "Skew_Entry"), ("Kurtosis", "Kurtosis_Entry"), ("IVHV_Gap", "IVHV_Gap_Entry"),
+        ("IV_Now", "IV_Entry"), ("Skew", "Skew_Entry"), ("Kurtosis", "Kurtosis_Entry"), ("IVHV_Gap", "IVHV_Gap_Entry"),
         ("PCS", "PCS_Entry"), ("Confidence", "Confidence_Entry"),
         ("Basis", "Premium_Entry"), ("Basis", "CostBasis_Entry"),
         ("Last", "Entry_Price")

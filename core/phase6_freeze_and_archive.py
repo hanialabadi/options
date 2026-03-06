@@ -1,4 +1,4 @@
-from core.data_contracts import save_active_master
+from core.shared.data_contracts import save_active_master
 from core.phase6_freeze.freezer_modules.freeze_merge_master import merge_master
 from core.phase6_freeze.evaluate_leg_status import evaluate_leg_status
 from core.phase6_freeze.freezer_modules.freeze_entry_greeks import freeze_entry_greeks

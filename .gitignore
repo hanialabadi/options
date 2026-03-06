@@ -58,6 +58,9 @@ audit_trace/*_trace.csv
 .envrc
 .python-version
 
+# ---- Management engine outputs (regenerated each run) ----
+core/management/outputs/
+
 # ---- Claude session memory ----
 memory/
 

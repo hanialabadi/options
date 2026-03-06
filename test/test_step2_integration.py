@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot, load_latest_live_snapshot
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot, load_latest_live_snapshot
 
 def test_live_snapshot_loader():
     """Test 1: Load latest live snapshot"""

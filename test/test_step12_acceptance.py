@@ -8,7 +8,7 @@ import sys
 import pandas as pd
 sys.path.insert(0, '.')
 
-from core.scan_engine.step12_acceptance import apply_acceptance_logic, filter_ready_contracts, sort_by_confidence
+from scan_engine.step12_acceptance import apply_acceptance_logic, filter_ready_contracts, sort_by_confidence
 
 print('='*80)
 print('PHASE 3: ACCEPTANCE LOGIC TEST')

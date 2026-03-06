@@ -11,7 +11,7 @@ Validates:
 
 import pandas as pd
 import time
-from core.scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
+from scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
 
 def test_phase_b():
     """Test Phase B with synthetic test data."""

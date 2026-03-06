@@ -12,8 +12,8 @@ Expected Behavior:
 
 import pandas as pd
 import logging
-from core.scan_engine.step9a_determine_timeframe import determine_option_timeframe
-from core.scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
+from scan_engine.step9a_determine_timeframe import determine_option_timeframe
+from scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
 
 # Configure logging
 logging.basicConfig(

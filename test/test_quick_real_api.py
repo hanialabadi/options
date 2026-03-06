@@ -60,7 +60,7 @@ print('\n' + '=' * 80)
 print('STEP 7: Generate Strategies')
 print('=' * 80)
 
-from core.scan_engine.step7_strategy_recommendation import recommend_strategies
+from scan_engine.step7_strategy_recommendation import recommend_strategies
 
 df_strategies = recommend_strategies(df_test)
 print(f'✅ Generated: {len(df_strategies)} strategies from {len(df_test)} tickers')
@@ -83,7 +83,7 @@ print('\n' + '=' * 80)
 print('STEP 9B: Fetch Real Option Contracts (TRADIER API)')
 print('=' * 80)
 
-from core.scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
+from scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
 
 print(f'🔄 Fetching contracts for {len(df_strategies)} strategies...')
 print(f'   Tickers: {df_strategies["Ticker"].unique().tolist()}')
@@ -152,7 +152,7 @@ print('\n' + '=' * 80)
 print('STEP 11: Theory Validation (Author Guardrails)')
 print('=' * 80)
 
-from core.scan_engine.step11_independent_evaluation import evaluate_strategies_independently
+from scan_engine.step11_independent_evaluation import evaluate_strategies_independently
 
 df_evaluated = evaluate_strategies_independently(df_greeks)
 print(f'✅ Evaluation complete: {len(df_evaluated)} strategies scored')

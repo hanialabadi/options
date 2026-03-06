@@ -26,9 +26,9 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.scan_engine.step0_schwab_snapshot import main as step0_main
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot, load_latest_live_snapshot
-from core.scan_engine.step3_filter_ivhv import filter_ivhv_gap, STEP3_VERSION, STEP3_LOGIC_HASH
+from scan_engine.step0_schwab_snapshot import run_snapshot as step0_main
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot, load_latest_live_snapshot
+from scan_engine.step3_filter_ivhv import filter_ivhv_gap, STEP3_VERSION, STEP3_LOGIC_HASH
 
 def run_step0(fetch_iv: bool = False) -> str:
     """Execute Step 0: Generate live snapshot"""
@@ -95,7 +95,8 @@ def run_step2(snapshot_path: str) -> pd.DataFrame:
         print(f"   ✅ {col}")
     
     # Save artifact
-    output_dir = Path("output")
+    from core.shared.data_contracts.config import SCAN_OUTPUT_DIR
+    output_dir = SCAN_OUTPUT_DIR
     output_dir.mkdir(exist_ok=True)
     step2_path = output_dir / "step2_enriched.csv"
     df.to_csv(step2_path, index=False)
@@ -139,7 +140,8 @@ def run_step3(df_step2: pd.DataFrame, min_gap: float = 2.0) -> pd.DataFrame:
                 print(f"   Solution: IVHV gap cannot be computed without IV")
     
     # Save artifact
-    output_dir = Path("output")
+    from core.shared.data_contracts.config import SCAN_OUTPUT_DIR
+    output_dir = SCAN_OUTPUT_DIR
     step3_path = output_dir / "step3_filtered.csv"
     df_filtered.to_csv(step3_path, index=False)
     print(f"\n💾 Saved: {step3_path}")
@@ -216,7 +218,8 @@ def generate_validation_report(
     report_lines.append("")
     
     # Save report
-    output_dir = Path("output")
+    from core.shared.data_contracts.config import SCAN_OUTPUT_DIR
+    output_dir = SCAN_OUTPUT_DIR
     report_path = output_dir / "cli_validation_report.txt"
     with open(report_path, 'w') as f:
         f.write('\n'.join(report_lines))

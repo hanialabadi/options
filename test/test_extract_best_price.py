@@ -14,7 +14,7 @@ from pathlib import Path
 # Add core module to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.scan_engine.step0_schwab_snapshot import extract_best_price
+from scan_engine.step0_schwab_snapshot import extract_best_price
 
 
 def test_market_open_lastprice_available():

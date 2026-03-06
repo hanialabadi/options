@@ -5,7 +5,7 @@ import pandas as pd
 import sys
 sys.path.insert(0, '.')
 from datetime import datetime
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot
 
 print('='*70)
 print('TESTING IV SURFACE REHYDRATION')

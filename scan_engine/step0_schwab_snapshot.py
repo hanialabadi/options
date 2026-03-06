@@ -62,13 +62,7 @@ if str(project_root) not in sys.path:
 
 from scan_engine.loaders.schwab_api_client import SchwabClient
 from core.shared.data_contracts.config import TICKER_UNIVERSE_PATH, SCAN_SNAPSHOT_DIR, PRICE_CACHE_DIR, PROJECT_ROOT
-# NEW IMPORTS for DuckDB persistence
-from core.shared.data_layer.iv_term_history import (
-    get_iv_history_db_path,
-    initialize_iv_term_history_table,
-    append_daily_iv_data
-)
-import duckdb
+from scan_engine.iv_collector.rest_collector import IVRestCollector, collect_iv_surface, iv_collected_today
 
 logger = logging.getLogger(__name__)
 
@@ -100,10 +94,11 @@ HV_COMPRESSION_THRESHOLD = 5.0  # |hv_10 - hv_30| < 5 = Compression
 HV_EXPANSION_THRESHOLD = 10.0  # |hv_10 - hv_30| > 10 = Expansion
 
 # Reliability & Scale Configuration
-CHUNK_SIZE = 25  # Process tickers in chunks of 25
-CHUNK_SLEEP = 0.5  # Sleep 0.5s between chunks
-RETRY_MAX_ATTEMPTS = 3  # Max retries for price history
-RETRY_BACKOFF = [0.5, 1.0, 2.0]  # Exponential backoff in seconds
+CHUNK_SIZE = 25         # Process tickers in chunks of 25
+CHUNK_SLEEP = 0.5       # Sleep 0.5s between chunks
+RETRY_MAX_ATTEMPTS = 2  # Max retries for price history (was 3 — 3×30s = 94s worst case per ticker)
+RETRY_BACKOFF = [0.5, 1.0]  # Exponential backoff (matches RETRY_MAX_ATTEMPTS)
+CHUNK_WALL_CLOCK_LIMIT = 90  # seconds — abandon chunk if it takes longer than this
 
 # IV Timeframes (in calendar days)
 IV_TIMEFRAMES = [7, 14, 21, 30, 60, 90, 120, 150, 180, 270, 360, 720, 1080]
@@ -222,6 +217,47 @@ def calculate_hv(prices: pd.Series, window: int) -> float:
     hv_annualized = std_dev * np.sqrt(252)  # 252 trading days/year
     
     return hv_annualized * 100  # Convert to percentage
+
+
+def calculate_hv_ewma(prices: pd.Series, lam: float = 0.94) -> float:
+    """
+    Calculate EWMA (Exponentially Weighted Moving Average) volatility.
+
+    RiskMetrics λ=0.94: recent days weighted more heavily than rolling window.
+    Reacts to vol spikes within 2-3 days vs 10-20 day lag of simple rolling HV.
+    Sinclair 2020 Ch.3: EWMA is the pragmatic upgrade from rolling HV — not overfitting,
+    computationally trivial, interpretable. Preferred over GARCH(1,1) for positional traders.
+
+    Formula:
+        σ²_t = λ·σ²_{t-1} + (1-λ)·r²_t
+    Annualized: σ_annual = sqrt(σ²_t) * sqrt(252) * 100 (percent)
+
+    Args:
+        prices: Close price series (requires ≥ 30 days for stable initialization)
+        lam: Decay factor (default 0.94, RiskMetrics standard)
+
+    Returns:
+        Current EWMA annualized volatility as percentage (e.g., 28.4 for 28.4%)
+        Returns NaN if insufficient data (< 10 prices).
+    """
+    if len(prices) < 10:
+        return np.nan
+
+    log_returns = np.log(prices / prices.shift(1)).dropna().values
+
+    if len(log_returns) < 5:
+        return np.nan
+
+    # Initialize with variance of first 5 returns
+    variance = float(np.var(log_returns[:5]))
+    if variance <= 0:
+        variance = 1e-8
+
+    # Roll EWMA forward
+    for r in log_returns[5:]:
+        variance = lam * variance + (1 - lam) * r * r
+
+    return float(np.sqrt(variance * 252) * 100)
 
 
 def calculate_hv_slope(hv_10: float, hv_30: float) -> float:
@@ -645,7 +681,9 @@ def fetch_price_history_with_retry(
                 f"{SCHWAB_API_BASE}/marketdata/v1/pricehistory",
                 headers=headers,
                 params=params,
-                timeout=30
+                timeout=(5, 20)  # (connect_timeout, read_timeout) — was flat 30s
+                # connect: 5s to establish TCP; read: 20s for body.
+                # A stalled mid-stream response is caught by read_timeout, not connect_timeout.
             )
             response.raise_for_status()
             
@@ -927,25 +965,32 @@ def generate_live_snapshot(
     tickers: List[str],
     use_cache: bool = True,
     fetch_iv: bool = True,
-    discovery_mode: bool = False
+    discovery_mode: bool = False,
+    skip_iv_if_collected_today: bool = True,
 ) -> pd.DataFrame:
     """
     Generate live IV/HV snapshot for all tickers.
-    
+
     Pipeline:
     1. Token pre-flight validation (abort early if expired)
     2. Fetch batch quotes (last_price, volume)
     3. Fetch price history per ticker (chunked, retry + backoff)
     4. Compute HV locally (10D, 20D, 30D, 60D, 90D)
-    5. Fetch IV proxy from ATM options (30-45 DTE)
+    5. Fetch IV proxy from ATM options (30-45 DTE) — skipped if already
+       collected today and skip_iv_if_collected_today=True
     6. Assemble into DataFrame with diagnostic columns
-    
+
     Args:
         client: SchwabClient instance
         tickers: List of ticker symbols
         use_cache: Whether to use cached price history
         fetch_iv: Whether to fetch IV (slow, can be disabled for testing)
-    
+        discovery_mode: If True, prunes IV fetching to high-interest tickers
+        skip_iv_if_collected_today: If True (default), skip REST IV collection
+            when iv_term_history already has rows for today. Saves ~200-400s
+            on second/subsequent same-day pipeline runs. Set False to force
+            re-collection (e.g. after market-hours correction).
+
     Returns:
         DataFrame with Step 2-compatible schema + diagnostic columns
     """
@@ -981,26 +1026,45 @@ def generate_live_snapshot(
     
     for chunk_idx, chunk in enumerate(chunks, 1):
         logger.info(f"  Chunk {chunk_idx}/{total_chunks}: Processing {len(chunk)} tickers...")
-        
+        chunk_start = time.time()
+
         chunk_failures = []
         for ticker in chunk:
+            # Per-chunk wall-clock guard: if this chunk has already burned its budget,
+            # skip remaining tickers and mark them as SKIPPED.  Prevents one stuck
+            # ticker from blocking all subsequent chunks.
+            if time.time() - chunk_start > CHUNK_WALL_CLOCK_LIMIT:
+                logger.warning(
+                    f"  ⏱️  Chunk {chunk_idx} wall-clock limit ({CHUNK_WALL_CLOCK_LIMIT}s) reached — "
+                    f"skipping {ticker} and remaining chunk tickers"
+                )
+                hv_data[ticker] = {window: np.nan for window in HV_WINDOWS}
+                history_status[ticker] = "SKIPPED_TIMEOUT"
+                chunk_failures.append(f"{ticker}:SKIPPED_TIMEOUT")
+                continue
+
             price_df, status = fetch_price_history_with_retry(client, ticker, use_cache=use_cache)
             history_status[ticker] = status
-            
+
             if price_df is None or len(price_df) < 90:
                 hv_data[ticker] = {window: np.nan for window in HV_WINDOWS}
+                hv_data[ticker]['ewma'] = np.nan
                 if status == "OK":
                     history_status[ticker] = "INSUFFICIENT_DATA"
                 chunk_failures.append(f"{ticker}:{status}")
             else:
-                # Compute HV for all windows
+                # Compute HV for all windows + EWMA
                 hv_data[ticker] = calculate_all_hv(price_df['close'])
-        
+                hv_data[ticker]['ewma'] = calculate_hv_ewma(price_df['close'])
+
+        elapsed = time.time() - chunk_start
+        logger.info(f"  Chunk {chunk_idx} done in {elapsed:.1f}s")
+
         # Log chunk failures
         if chunk_failures:
-            logger.debug(f"    Chunk {chunk_idx} failures: {', '.join(chunk_failures[:5])}" + 
+            logger.debug(f"    Chunk {chunk_idx} failures: {', '.join(chunk_failures[:5])}" +
                         (f" (+{len(chunk_failures)-5} more)" if len(chunk_failures) > 5 else ""))
-        
+
         # Sleep between chunks (rate limit mitigation)
         if chunk_idx < total_chunks:
             time.sleep(CHUNK_SLEEP)
@@ -1019,7 +1083,18 @@ def generate_live_snapshot(
     
     # Step 3: Fetch IV proxy (slow, throttled)
     iv_data = {ticker: _empty_iv_dict() for ticker in tickers}
-    if fetch_iv:
+
+    # Layer 1B: Auto-skip IV collection if already persisted today
+    _iv_already_collected = False
+    if fetch_iv and skip_iv_if_collected_today and iv_collected_today():
+        _iv_already_collected = True
+        logger.info(
+            "[IV_SKIP] IV already collected today — skipping REST collection. "
+            "Step 2 will read from iv_term_history as usual. "
+            "Use skip_iv_if_collected_today=False to force re-collection."
+        )
+
+    if fetch_iv and not _iv_already_collected:
         # Discovery Mode: Prune tickers to high-interest only
         iv_tickers = tickers
         if discovery_mode:
@@ -1028,33 +1103,46 @@ def generate_live_snapshot(
                 hv_30 = hv_data.get(t, {}).get(30, 0)
                 net_pct = quotes.get(t, {}).get('netPercentChange', 0)
                 if pd.isna(net_pct): net_pct = 0
-                
+
                 # High interest = High Vol (HV30 > 25%) OR High Momentum (|change| > 1.5%)
                 if hv_30 > 25.0 or abs(net_pct) > 1.5:
                     iv_tickers.append(t)
-            
+
             logger.info(f"🔭 Discovery Mode: Pruned IV fetch from {len(tickers)} to {len(iv_tickers)} high-interest tickers")
 
-        logger.info(f"🔍 Step 3/4: Fetching IV proxies for {len(iv_tickers)} tickers (throttled at 1 req/sec)...")
-        failed_iv = []
+        logger.info(f"🔍 Step 3/4: Fetching IV surface for {len(iv_tickers)} tickers via IVRestCollector...")
 
-        for i, ticker in enumerate(iv_tickers, 1):
-            if i % 25 == 0:
-                logger.info(f"  Progress: {i}/{len(iv_tickers)} tickers")
+        # Build spot_map from quotes
+        spot_map = {
+            t: quotes[t]['last_price']
+            for t in iv_tickers
+            if quotes.get(t, {}).get('last_price') is not None
+        }
 
-            last_price = quotes[ticker]['last_price']
+        collector = IVRestCollector(client, write_to_db=True)
+        iv_result = collector.collect(
+            iv_tickers,
+            spot_map,
+            force_run=True,   # step0 already gates on market hours upstream
+        )
 
-            if last_price is None or (isinstance(last_price, float) and np.isnan(last_price)):
-                logger.warning(f"Cannot fetch IV for {ticker} (missing last_price)")
-                failed_iv.append(ticker)
-                continue
+        # Merge surface results back into iv_data dict (keyed by ticker)
+        if not iv_result.df.empty:
+            for _, row in iv_result.df.iterrows():
+                t = row['ticker']
+                entry = _empty_iv_dict()
+                for b in [7, 14, 30, 60, 90, 120, 180, 360]:
+                    val = row.get(f'iv_{b}d')
+                    if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                        # Surface uses call-side only — fill both call and average cols
+                        entry[f'iv_{b}d']      = val
+                        entry[f'iv_{b}d_call'] = val
+                iv_data[t] = entry
 
-            iv_data[ticker] = fetch_iv_proxy(client, ticker, last_price)
-
-            # Throttle to avoid rate limits
-            time.sleep(CHAIN_THROTTLE_SECONDS)
-
-        logger.info(f"✅ IV fetched for {len(iv_tickers) - len(failed_iv)}/{len(iv_tickers)} tickers")
+        logger.info(
+            f"✅ IV surface complete: {iv_result.success_count} succeeded, "
+            f"{len(iv_result.failed)} failed, {len(iv_result.skipped)} skipped"
+        )
     else:
         logger.info("⏭️  Step 3/4: Skipping IV fetch (fetch_iv=False)")
     
@@ -1195,6 +1283,9 @@ def generate_live_snapshot(
             # Derived volatility intelligence (Step 0 responsibility)
             'hv_slope': hv_slope,
             'volatility_regime': volatility_regime,
+            # EWMA volatility (Sinclair 2020 Ch.3: pragmatic upgrade from rolling HV)
+            # λ=0.94 RiskMetrics: reacts to vol spikes in 2-3 days vs 10-20 day lag
+            'HV_EWMA': hv.get('ewma', np.nan),
             
             # ENTRY QUALITY FIELDS (NEW - for scan-time analysis)
             # Intraday range & compression (from quotes)
@@ -1247,8 +1338,65 @@ def generate_live_snapshot(
     else:
         logger.info(f"✅ All {len(df)} tickers have valid prices!")
     
+    # GAP 1 FIX: Fetch VVIX (and VIX for SPY stress context) as broadcast values.
+    # Natenberg Ch.19 + Sinclair Step 11: VVIX > 130 = vol spike imminent.
+    # These are index-level values (not per-ticker) — broadcast to all rows.
+    # Schwab supports $VIX.X / $VIX / ^VIX syntax; fallback gracefully if unavailable.
+    _vvix_value = np.nan
+    _vix_value = np.nan
+    _spy_change_pct = np.nan
+    try:
+        _index_quotes = fetch_batch_quotes(client, ['$VIX.X', '$VVIX.X'], is_market_open)
+        for _sym in ('$VIX.X', 'VIX', '^VIX'):
+            _q = _index_quotes.get(_sym, {})
+            if _q.get('last_price'):
+                _vix_value = float(_q['last_price'])
+                break
+        for _sym in ('$VVIX.X', 'VVIX', '^VVIX'):
+            _q = _index_quotes.get(_sym, {})
+            if _q.get('last_price'):
+                _vvix_value = float(_q['last_price'])
+                break
+    except Exception as _idx_err:
+        logger.debug(f"[GAP1] Schwab index quote fetch failed: {_idx_err}")
+
+    # Fallback: yfinance for VVIX/VIX when Schwab can't serve CBOE indices
+    if np.isnan(_vvix_value) or np.isnan(_vix_value):
+        try:
+            import yfinance as _yf
+            if np.isnan(_vvix_value):
+                _vvix_hist = _yf.Ticker('^VVIX').history(period='1d')
+                if not _vvix_hist.empty:
+                    _vvix_value = float(_vvix_hist['Close'].iloc[-1])
+                    logger.info(f"[GAP1] VVIX={_vvix_value:.1f} (via yfinance)")
+            if np.isnan(_vix_value):
+                _vix_hist = _yf.Ticker('^VIX').history(period='1d')
+                if not _vix_hist.empty:
+                    _vix_value = float(_vix_hist['Close'].iloc[-1])
+                    logger.info(f"[GAP1] VIX={_vix_value:.1f} (via yfinance)")
+        except Exception as _yf_err:
+            logger.debug(f"[GAP1] yfinance fallback failed: {_yf_err}")
+
+    # SPY net change for market stress context
+    try:
+        _spy_quotes = fetch_batch_quotes(client, ['SPY'], is_market_open)
+        _spy_q = _spy_quotes.get('SPY', {})
+        if _spy_q.get('last_price') and _spy_q.get('netPercentChange') is not None:
+            _spy_change_pct = float(_spy_q.get('netPercentChange', 0))
+    except Exception as _spy_err:
+        logger.debug(f"[GAP1] SPY change fetch failed: {_spy_err}")
+
+    # Broadcast index values to all rows
+    df['VVIX'] = _vvix_value
+    df['VIX'] = _vix_value
+    df['SPY_Change_Pct'] = _spy_change_pct
+    if not np.isnan(_vvix_value):
+        logger.info(f"[GAP1] VVIX={_vvix_value:.1f}, VIX={_vix_value:.1f}, SPY_Change={_spy_change_pct:.2f}%")
+    else:
+        logger.info("[GAP1] VVIX/VIX not available — columns set to NaN (Step 2 will handle gracefully)")
+
     elapsed = time.time() - start_time
-    
+
     # Final Summary with Coverage Metrics
     logger.info("\n" + "="*80)
     logger.info("📊 STEP 0 COMPLETE - SUMMARY")
@@ -1277,7 +1425,7 @@ def generate_live_snapshot(
     
     # Failure Breakdown
     logger.info(f"\n   Fetch Status Breakdown:")
-    for status in ['OK', 'INSUFFICIENT_DATA', 'TIMEOUT', 'RATE_LIMIT', 'AUTH_ERROR', 'UNKNOWN']:
+    for status in ['OK', 'INSUFFICIENT_DATA', 'TIMEOUT', 'SKIPPED_TIMEOUT', 'RATE_LIMIT', 'AUTH_ERROR', 'UNKNOWN']:
         count = (df['price_history_status'] == status).sum()
         if count > 0:
             logger.info(f"     {status}: {count}")
@@ -1356,7 +1504,8 @@ def run_snapshot(
     test_ticker: str = "AAPL",
     use_cache: bool = True,
     fetch_iv: bool = True,
-    discovery_mode: bool = False
+    discovery_mode: bool = False,
+    skip_iv_if_collected_today: bool = True,
 ):
     """
     Core execution function for Step 0 snapshot generation.
@@ -1369,6 +1518,8 @@ def run_snapshot(
         use_cache: Whether to use cached price history
         fetch_iv: Whether to fetch IV (can disable for faster testing)
         discovery_mode: If True, prunes IV fetching to high-interest tickers only
+        skip_iv_if_collected_today: If True (default), skip REST IV collection when
+            iv_term_history already has today's rows. Saves ~200-400s on repeat runs.
 
     Returns:
         DataFrame: Generated snapshot with IV/HV data
@@ -1408,7 +1559,8 @@ def run_snapshot(
         tickers,
         use_cache=use_cache,
         fetch_iv=fetch_iv,
-        discovery_mode=discovery_mode
+        discovery_mode=discovery_mode,
+        skip_iv_if_collected_today=skip_iv_if_collected_today,
     )
     
     # Save to CSV
@@ -1417,44 +1569,8 @@ def run_snapshot(
     # Promote to archive (Daily Promotion Rule)
     # promote_snapshot_to_archive(output_path) # REMOVED: Canonical CSV layer eliminated
 
-    # Add persistence logic to DuckDB
-    try:
-        db_path = get_iv_history_db_path()
-        con = duckdb.connect(str(db_path))
-        initialize_iv_term_history_table(con)
-
-        # Build averaged IV columns from call+put legs for each DB timeframe.
-        # IV_*_D_Call and IV_*_D_Put are the individual legs; the DB stores the
-        # call+put average, falling back to whichever single leg is valid.
-        db_timeframes = [7, 14, 30, 60, 90, 120, 180, 360]
-
-        df_iv_insert = df[['Ticker', 'snapshot_ts']].copy()
-        df_iv_insert = df_iv_insert.rename(columns={
-            'Ticker': 'ticker',
-            'snapshot_ts': 'date',  # overwritten by trade_date in append_daily_iv_data
-        })
-
-        for tf in db_timeframes:
-            call_col = f'IV_{tf}_D_Call'
-            put_col  = f'IV_{tf}_D_Put'
-            c = df[call_col].to_numpy(dtype=float, na_value=np.nan)
-            p = df[put_col].to_numpy(dtype=float, na_value=np.nan)
-            both_valid = ~np.isnan(c) & ~np.isnan(p)
-            avg = np.where(both_valid, (c + p) / 2,
-                  np.where(~np.isnan(c), c, p))
-            df_iv_insert[f'iv_{tf}d'] = avg
-
-        # Add source column
-        df_iv_insert['source'] = "Schwab_Step0"
-
-        # Derive trade_date from snapshot_ts
-        trade_date = df['snapshot_ts'].iloc[0].date()
-
-        append_daily_iv_data(con, df_iv_insert, trade_date)
-        logger.info(f"Persisted {len(df_iv_insert)} IV rows to iv_term_history for {trade_date}")
-    except Exception as e:
-        logger.error(f"❌ Failed to persist IV data to DuckDB: {e}", exc_info=True)
-        # Do not re-raise, fail gracefully as per requirement
+    # IV persistence is now handled inside IVRestCollector (called from generate_live_snapshot).
+    # No additional DuckDB writes needed here.
 
     # Display summary
     logger.info("\n" + "=" * 60)

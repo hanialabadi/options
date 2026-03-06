@@ -10,8 +10,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot
-from core.scan_engine.step3_filter_ivhv import filter_ivhv_gap, STEP3_VERSION, STEP3_LOGIC_HASH
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot
+from scan_engine.step3_filter_ivhv import filter_ivhv_gap, STEP3_VERSION, STEP3_LOGIC_HASH
 
 def main():
     print("\n" + "="*80)
@@ -55,8 +55,9 @@ def main():
             print(f"   {regime}: {count}")
     
     # Save Step 2 artifact
-    output_dir = Path("output")
-    output_dir.mkdir(exist_ok=True)
+    from core.shared.data_contracts.config import SCAN_OUTPUT_DIR
+    output_dir = SCAN_OUTPUT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
     step2_path = output_dir / "step2_enriched_cli.csv"
     df_step2.to_csv(step2_path, index=False)
     print(f"\n💾 Saved: {step2_path}")

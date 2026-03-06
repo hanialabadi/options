@@ -35,7 +35,7 @@ print('\n' + '=' * 80)
 print('STEP 2: Load IV/HV Snapshot')
 print('=' * 80)
 
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot
 
 df_snapshot = load_ivhv_snapshot(skip_pattern_detection=True)
 print(f'✅ Loaded: {len(df_snapshot)} tickers')
@@ -50,7 +50,7 @@ print('\n' + '=' * 80)
 print('STEP 3: Calculate IV/HV Divergence')
 print('=' * 80)
 
-from core.scan_engine.step3_filter_ivhv import filter_ivhv_gap
+from scan_engine.step3_filter_ivhv import filter_ivhv_gap
 
 df_filtered = filter_ivhv_gap(df_snapshot)
 print(f'✅ Filtered: {len(df_filtered)} tickers with IV/HV divergence')
@@ -65,7 +65,7 @@ print('\n' + '=' * 80)
 print('STEP 7: Generate Strategies (Testing 5 tickers)')
 print('=' * 80)
 
-from core.scan_engine.step7_strategy_recommendation import recommend_strategies
+from scan_engine.step7_strategy_recommendation import recommend_strategies
 
 # Filter for lower-priced stocks (better liquidity)
 test_df = df_filtered[df_filtered['Price'] < 200].head(5) if 'Price' in df_filtered.columns else df_filtered.head(5)
@@ -92,7 +92,7 @@ print('\n' + '=' * 80)
 print('STEP 9B: Fetch Real Option Contracts (TRADIER API)')
 print('=' * 80)
 
-from core.scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
+from scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
 
 print(f'🔄 Fetching contracts for {len(df_strategies)} strategies...')
 print(f'   (This may take 1-2 minutes)')
@@ -144,7 +144,7 @@ print('\n' + '=' * 80)
 print('STEP 11: Theory Validation (Author Guardrails)')
 print('=' * 80)
 
-from core.scan_engine.step11_independent_evaluation import evaluate_strategies_independently
+from scan_engine.step11_independent_evaluation import evaluate_strategies_independently
 
 df_evaluated = evaluate_strategies_independently(df_greeks)
 print(f'✅ Evaluation complete: {len(df_evaluated)} strategies scored')

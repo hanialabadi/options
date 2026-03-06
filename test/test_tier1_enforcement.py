@@ -15,7 +15,7 @@ sys.path.insert(0, str(project_root))
 def test_step7_parameters():
     """Test Step 7 function signature and defaults"""
     print("Testing Step 7 parameters...")
-    from core.scan_engine.step7_strategy_recommendation import recommend_strategies
+    from scan_engine.step7_strategy_recommendation import recommend_strategies
     import inspect
     
     sig = inspect.signature(recommend_strategies)
@@ -40,7 +40,7 @@ def test_step7_parameters():
 def test_step7b_parameters():
     """Test Step 7B function signature and defaults"""
     print("\nTesting Step 7B parameters...")
-    from core.scan_engine.step7b_multi_strategy_ranker import generate_multi_strategy_suggestions
+    from scan_engine.step7b_multi_strategy_ranker import generate_multi_strategy_suggestions
     import inspect
     
     sig = inspect.signature(generate_multi_strategy_suggestions)
@@ -65,7 +65,7 @@ def test_step7b_parameters():
 def test_step9b_validation_rejection():
     """Test Step 9B validation gate rejects non-Tier-1 data"""
     print("\nTesting Step 9B validation gate (rejection test)...")
-    from core.scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
+    from scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
     
     # Create Tier-2 test data (broker-blocked strategy)
     df_tier2 = pd.DataFrame({
@@ -107,7 +107,7 @@ def test_step9b_validation_rejection():
 def test_step9b_validation_acceptance():
     """Test Step 9B validation gate accepts Tier-1 data"""
     print("\nTesting Step 9B validation gate (acceptance test)...")
-    from core.scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
+    from scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
     
     # Create Tier-1 test data (executable strategy)
     df_tier1 = pd.DataFrame({

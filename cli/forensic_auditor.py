@@ -13,13 +13,13 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.data_contracts.config import (
+from core.shared.data_contracts.config import (
     MANAGEMENT_SAFE_MODE,
     ACTIVE_MASTER_PATH,
     SNAPSHOT_DIR,
     DATA_DIR
 )
-from core.phase1_clean import OCC_OPTION_PATTERN
+from core.cycle1_laptop_repo.ingest.clean import OCC_OPTION_PATTERN
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -104,7 +104,7 @@ class ForensicAuditor:
 
     def audit_phase1_identity_parsing(self):
         self.log_section("Phase 1: Identity & Parsing Audit")
-        from core.phase1_clean import phase1_load_and_clean_positions
+        from core.cycle1_laptop_repo.ingest.clean import phase1_load_and_clean_positions
         
         df, _ = phase1_load_and_clean_positions(
             input_path=self.input_path,
@@ -151,7 +151,7 @@ class ForensicAuditor:
         df = self.stats.get('phase1_df')
         if df is None: return
 
-        from core.phase2_parse import phase2_run_all
+        from core.cycle1_laptop_repo.identity.parse import phase2_run_all
         try:
             df_p2 = phase2_run_all(df)
             self.log_info(f"Strategy coverage: {(df_p2['Strategy'] != 'UNKNOWN').mean()*100:.1f}%")
@@ -280,20 +280,37 @@ class ForensicAuditor:
                 tables = con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").df()
                 self.log_info(f"DuckDB tables: {tables['table_name'].tolist()}")
                 
-                if 'clean_legs' in tables['table_name'].values:
-                    count = con.execute("SELECT count(*) FROM clean_legs").fetchone()[0]
-                    self.log_info(f"clean_legs row count: {count}")
+                # Check for clean_legs or clean_legs_v2
+                target_table = None
+                if 'clean_legs_v2' in tables['table_name'].values:
+                    target_table = 'clean_legs_v2'
+                elif 'clean_legs' in tables['table_name'].values:
+                    target_table = 'clean_legs'
+                
+                if target_table:
+                    count = con.execute(f"SELECT count(*) FROM {target_table}").fetchone()[0]
+                    self.log_info(f"{target_table} row count: {count}")
                     
+                    # RAG: Identity Hygiene Audit
+                    # Check for canonical anchors
+                    views = con.execute("SELECT table_name FROM information_schema.views WHERE table_schema = 'main'").df()
+                    if 'canonical_anchors' in views['table_name'].values:
+                        anchor_count = con.execute("SELECT count(*) FROM canonical_anchors").fetchone()[0]
+                        self.log_info(f"Canonical anchors detected: {anchor_count}")
+                    else:
+                        self.log_warning("Canonical anchor view missing")
+
                     # Check for monotonicity of Snapshot_TS
-                    drift = con.execute("""
+                    drift = con.execute(f"""
                         SELECT TradeID, count(*) as snapshots 
-                        FROM clean_legs 
+                        FROM {target_table} 
+                        WHERE LegID IS NOT NULL
                         GROUP BY TradeID 
                         HAVING snapshots > 1
                     """).df()
-                    self.log_info(f"Trades with >1 snapshot: {len(drift)}")
+                    self.log_info(f"Valid trades (with LegID) with >1 snapshot: {len(drift)}")
                 else:
-                    self.log_critical("Table 'clean_legs' missing from DuckDB")
+                    self.log_critical("Table 'clean_legs' or 'clean_legs_v2' missing from DuckDB")
         except Exception as e:
             self.log_critical(f"DuckDB audit failed: {e}")
 
@@ -364,9 +381,9 @@ class ForensicAuditor:
         # but the core implementation might have changed its signature.
         try:
             import inspect
-            import core.phase1_clean as p1c
-            from core.phase1_clean import phase1_load_and_clean_positions
-            self.log_info(f"core.phase1_clean source: {p1c.__file__}")
+            import core.cycle1_laptop_repo.ingest.clean as p1c
+            from core.cycle1_laptop_repo.ingest.clean import phase1_load_and_clean_positions
+            self.log_info(f"core.cycle1_laptop_repo.ingest.clean source: {p1c.__file__}")
             sig = inspect.signature(phase1_load_and_clean_positions)
             self.log_info(f"phase1_load_and_clean_positions signature: {sig}")
             

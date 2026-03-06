@@ -15,14 +15,18 @@ import numpy as np
 from pathlib import Path
 
 # Add project root to path
-project_root = Path(__file__).parent
-sys.path.insert(0, str(project_root))
+# This must be done BEFORE any imports from the project itself
+project_root = Path(__file__).parent.parent.parent # Assuming scripts/cli is 3 levels deep from project root
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
+# Now import project modules
 import pandas as pd
 from datetime import datetime
-from core.scan_engine.pipeline import run_full_scan_pipeline
-from core.scan_engine.step0_resolve_snapshot import resolve_snapshot_path
-from core.scan_engine.market_regime_classifier import classify_market_regime
+from core.shared.data_contracts.config import PROJECT_ROOT, SCAN_OUTPUT_DIR # Re-import PROJECT_ROOT and SCAN_OUTPUT_DIR
+from scan_engine.pipeline import run_full_scan_pipeline
+from scan_engine.step0_resolve_snapshot import resolve_snapshot_path
+from scan_engine.market_regime_classifier import classify_market_regime
 
 # ============================================================
 # ARGUMENT PARSING
@@ -112,7 +116,7 @@ else:
 # ============================================================
 audit_mode = None
 if args.audit:
-    from core.audit.pipeline_audit_mode import create_audit_mode
+    from core._support.audit.pipeline_audit_mode import create_audit_mode
     
     ticker_list = [t.strip().upper() for t in args.tickers.split(',')]
     audit_mode = create_audit_mode(ticker_list, snapshot_path)
@@ -128,9 +132,10 @@ print("\n🔍 Running scan pipeline...")
 print("-"*80)
 
 try:
+    from core.shared.data_contracts.config import SCAN_OUTPUT_DIR
     results = run_full_scan_pipeline(
         snapshot_path=snapshot_path,
-        output_dir="data/scan_outputs",
+        output_dir=SCAN_OUTPUT_DIR,
         account_balance=100000.0,
         max_portfolio_risk=0.20,
         audit_mode=audit_mode  # Pass audit mode to pipeline
@@ -153,12 +158,12 @@ try:
             print(f"\nExplanation: {regime_info['explanation']}")
             
             # P1 Guardrail: Market Stress Mode Banner
-            from core.data_layer.market_stress_detector import check_market_stress, get_market_stress_summary
+            from core.shared.data_layer.market_stress_detector import check_market_stress, get_market_stress_summary
             stress_level, median_iv, stress_basis = check_market_stress()
             
             if stress_level != 'GREEN':
                 print("\n" + "-"*80)
-                print(get_market_stress_summary(stress_level, median_iv))
+                print(get_market_stress_summary(stress_level, median_iv, stress_basis))
                 print("-"*80)
                 
                 if stress_level == 'RED':

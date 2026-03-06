@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import streamlit as st
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot
 
 def main():
     st.set_page_config(page_title="Step 0 Integration Test", layout="wide")

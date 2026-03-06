@@ -86,7 +86,7 @@ print(f"Focus ticker: {FOCUS_TICKER}")
 # ============================================================
 print("\n\n🔵 STEP 0: Loading raw snapshot...")
 
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot
 
 df_step0 = load_ivhv_snapshot('data/snapshots/ivhv_snapshot_live_20260102_124337.csv')
 
@@ -108,7 +108,7 @@ debug_snapshot(df_step0, "STEP 2: Post-Enrichment (Same as Step 0, includes earn
 # ============================================================
 print("\n\n🔵 STEP 3: IVHV Filter...")
 
-from core.scan_engine.step3_filter_ivhv import filter_ivhv_gap
+from scan_engine.step3_filter_ivhv import filter_ivhv_gap
 
 df_before_step3 = df_step0.copy()
 df_step3 = filter_ivhv_gap(df_step0)
@@ -121,7 +121,7 @@ diff_columns(df_before_step3, df_step3, "Step 3")
 # ============================================================
 print("\n\n🔵 STEP 5: Chart Signals...")
 
-from core.scan_engine.step5_chart_signals import compute_chart_signals_batch
+from scan_engine.step5_chart_signals import compute_chart_signals_batch
 
 df_before_step5 = df_step3.copy()
 df_step5 = compute_chart_signals_batch(df_step3, use_cache=True)
@@ -134,7 +134,7 @@ diff_columns(df_before_step5, df_step5, "Step 5")
 # ============================================================
 print("\n\n🔵 STEP 6: Pattern Validation...")
 
-from core.scan_engine.step6_validate_patterns import validate_patterns
+from scan_engine.step6_validate_patterns import validate_patterns
 
 df_before_step6 = df_step5.copy()
 df_step6 = validate_patterns(df_step5)
@@ -147,7 +147,7 @@ diff_columns(df_before_step6, df_step6, "Step 6")
 # ============================================================
 print("\n\n🔵 STEP 7: Strategy Recommendation...")
 
-from core.scan_engine.step7_recommend_strategy import recommend_strategies
+from scan_engine.step7_recommend_strategy import recommend_strategies
 
 df_before_step7 = df_step6.copy()
 df_step7 = recommend_strategies(df_step6)
@@ -160,7 +160,7 @@ diff_columns(df_before_step7, df_step7, "Step 7")
 # ============================================================
 print("\n\n🔵 STEP 9A: Timeframe Selection...")
 
-from core.scan_engine.step9a_select_timeframes import select_option_timeframes
+from scan_engine.step9a_select_timeframes import select_option_timeframes
 
 df_before_step9a = df_step7.copy()
 df_step9a = select_option_timeframes(df_step7)
@@ -178,7 +178,7 @@ else:
 print("\n\n🔵 STEP 9B: Contract Fetch (Schwab API)...")
 
 if len(df_step9a) > 0 and len(df_step7) > 0:
-    from core.scan_engine.step9b_fetch_contracts_schwab import fetch_and_select_contracts_schwab
+    from scan_engine.step9b_fetch_contracts_schwab import fetch_and_select_contracts_schwab
     
     df_before_step9b = df_step9a.copy()
     
@@ -207,7 +207,7 @@ else:
 print("\n\n🔵 STEP 11: Evaluation...")
 
 if len(df_step9b) > 0:
-    from core.scan_engine.step11_evaluate import evaluate_strategies
+    from scan_engine.step11_evaluate import evaluate_strategies
     
     df_before_step11 = df_step9b.copy()
     df_step11 = evaluate_strategies(df_step9b)
@@ -228,7 +228,7 @@ else:
 print("\n\n🔵 STEP 12: Acceptance...")
 
 if len(df_step11) > 0:
-    from core.scan_engine.step12_acceptance import acceptance_logic
+    from scan_engine.step12_acceptance import acceptance_logic
     
     df_before_step12 = df_step11.copy()
     df_step12 = acceptance_logic(df_step11)

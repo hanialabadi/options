@@ -1,6 +1,6 @@
 import pandas as pd
 import pytest
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot
 import os
 
 # Define the path to the dummy snapshot CSV

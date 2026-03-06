@@ -31,8 +31,8 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from core.scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
-from core.scan_engine.step9a_determine_timeframe import determine_option_timeframe
+from scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
+from scan_engine.step9a_determine_timeframe import determine_option_timeframe
 
 def main():
     print("=" * 80)

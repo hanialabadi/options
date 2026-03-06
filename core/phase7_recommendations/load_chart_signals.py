@@ -10,7 +10,7 @@ import numpy as np
 import logging
 from pathlib import Path
 from typing import Optional
-from core.data_contracts.config import MANAGEMENT_SAFE_MODE
+from core.shared.data_contracts.config import MANAGEMENT_SAFE_MODE
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +71,16 @@ def _load_from_scan_engine(
 ) -> pd.DataFrame:
     """Load chart signals from scan_engine output."""
     try:
-        scan_output_dir = Path("data/scan_outputs")
+        from core.shared.data_contracts.config import SCAN_OUTPUT_DIR
+        scan_output_dir = SCAN_OUTPUT_DIR
 
         if not scan_output_dir.exists():
             if not MANAGEMENT_SAFE_MODE:
                 logger.warning(f"Scan output directory not found: {scan_output_dir}")
             return _empty_chart_signals(symbols)
 
-        scan_files = list(scan_output_dir.glob("candidates_*.csv"))
+        # Standardize on Step11_Evaluated for chart signal context
+        scan_files = list(scan_output_dir.glob("Step11_Evaluated_*.csv"))
         if not scan_files:
             if not MANAGEMENT_SAFE_MODE:
                 logger.warning("No scan output files found")
@@ -129,8 +131,8 @@ def _load_from_cache(
 ) -> pd.DataFrame:
     """Load cached chart signals."""
     try:
-        project_root = Path(__file__).parent.parent.parent.parent
-        cache_dir = project_root / "data" / "cache"
+        from core.shared.data_contracts.config import PROJECT_ROOT
+        cache_dir = PROJECT_ROOT / "data" / "cache"
         cache_file = cache_dir / "chart_signals.csv"
         
         if not cache_file.exists():

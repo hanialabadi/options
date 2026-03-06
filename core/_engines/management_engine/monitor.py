@@ -3,7 +3,7 @@ import os
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from core.data_contracts import get_active_trade_ids, load_snapshot_timeseries
+from core.shared.data_contracts import get_active_trade_ids, load_snapshot_timeseries
 
 
 def load_drift_timeseries(drift_dir: str) -> pd.DataFrame:

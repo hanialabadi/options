@@ -1,7 +1,7 @@
 import os
 import sys
 import math
-from core.scan_engine.schwab_api_client import SchwabClient
+from scan_engine.schwab_api_client import SchwabClient
 
 def main():
     client_id = os.getenv("SCHWAB_APP_KEY")

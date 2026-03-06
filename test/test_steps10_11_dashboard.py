@@ -49,7 +49,7 @@ if run_full:
     else:
         try:
             with st.spinner("🚀 Running full prescriptive pipeline..."):
-                from core.scan_engine import run_full_scan_pipeline
+                from scan_engine import run_full_scan_pipeline
                 
                 # Get snapshot path from Step 2
                 snapshot_path = st.session_state.get('snapshot_path', None)

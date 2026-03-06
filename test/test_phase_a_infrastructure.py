@@ -14,8 +14,8 @@ import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta
 
-from core.scan_engine.chain_cache import ChainCache, ExpirationCache
-from core.scan_engine.throttled_executor import ThrottledExecutor, BatchProcessor
+from scan_engine.chain_cache import ChainCache, ExpirationCache
+from scan_engine.throttled_executor import ThrottledExecutor, BatchProcessor
 
 
 # ============================================================================

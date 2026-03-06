@@ -5,37 +5,37 @@ print('='*70)
 
 # Step 2: Load (with enrichment built-in)
 print('\n📊 Step 2: Load Latest Snapshot')
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot
 df = load_ivhv_snapshot('data/ivhv_archive/ivhv_snapshot_2025-12-26.csv')
 print(f'   Loaded: {len(df)} tickers from 2025-12-26 (TODAY)')
 
 # Step 3: Filter
 print('\n🔍 Step 3: Filter by IV/HV Gap')
-from core.scan_engine.step3_filter_ivhv import filter_ivhv_gap
+from scan_engine.step3_filter_ivhv import filter_ivhv_gap
 df_filtered = filter_ivhv_gap(df, min_gap=2.0)
 print(f'   Filtered: {len(df_filtered)} tickers')
 
 # Step 5: Chart (15 tickers for better sample)
 print('\n📈 Step 5: Chart Signals (15 tickers)')
-from core.scan_engine import compute_chart_signals
+from scan_engine import compute_chart_signals
 df_charted = compute_chart_signals(df_filtered.head(15))
 print(f'   Charted: {len(df_charted)} tickers')
 
 # Step 6: GEM
 print('\n💎 Step 6: GEM Filter')
-from core.scan_engine import validate_data_quality
+from scan_engine import validate_data_quality
 df_gem = validate_data_quality(df_charted)
 print(f'   GEM: {len(df_gem)} tickers')
 
 # Step 7: Context
 print('\n📋 Step 7: Market Context')
-from core.scan_engine.step7_strategy_recommendation import recommend_strategies
+from scan_engine.step7_strategy_recommendation import recommend_strategies
 df_context = recommend_strategies(df_gem)
 print(f'   Context: {len(df_context)} tickers')
 
 # Step 7B: Multi-Strategy
 print('\n🔀 Step 7B: Generate Personalized Strategies')
-from core.scan_engine.step7b_multi_strategy_ranker import generate_multi_strategy_suggestions
+from scan_engine.step7b_multi_strategy_ranker import generate_multi_strategy_suggestions
 df_all = generate_multi_strategy_suggestions(
     df_context,
     max_strategies_per_ticker=6,

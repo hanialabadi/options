@@ -4,7 +4,7 @@ Test Step 3 Strategy-Neutral Refactoring
 Verifies that column renames work and logic is preserved
 """
 
-from core.scan_engine import filter_ivhv_gap
+from scan_engine import filter_ivhv_gap
 import pandas as pd
 
 # Create test data with known IVHV gaps

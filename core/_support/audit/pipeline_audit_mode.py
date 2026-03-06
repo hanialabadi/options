@@ -26,8 +26,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Audit directories
-AUDIT_STEPS_DIR = Path("audit_steps")
-AUDIT_TRACE_DIR = Path("audit_trace")
+from core.shared.data_contracts.config import PROJECT_ROOT
+AUDIT_STEPS_DIR = PROJECT_ROOT / "audit_steps"
+AUDIT_TRACE_DIR = PROJECT_ROOT / "audit_trace"
 
 # Mandatory IV columns to track (never drop these)
 MANDATORY_IV_COLUMNS = [
@@ -262,7 +263,8 @@ class PipelineAuditMode:
         logger.info(f"{'='*80}\n")
         
         # Create navigation guide
-        nav_path = Path("AUDIT_NAVIGATION.md")
+        from core.shared.data_contracts.config import PROJECT_ROOT
+        nav_path = PROJECT_ROOT / "AUDIT_NAVIGATION.md"
         with open(nav_path, 'w') as f:
             f.write(f"""# Forensic Audit Navigation Guide
 

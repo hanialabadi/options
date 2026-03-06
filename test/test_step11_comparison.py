@@ -27,7 +27,7 @@ import logging
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from core.scan_engine.step11_strategy_pairing import compare_and_rank_strategies
+from scan_engine.step11_strategy_pairing import compare_and_rank_strategies
 
 # Setup logging
 logging.basicConfig(

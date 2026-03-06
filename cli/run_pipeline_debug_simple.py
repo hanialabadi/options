@@ -60,7 +60,7 @@ def main():
     
     print(f"\n🎯 TRACING: {ticker}\n")
     print("To implement full tracing:")
-    print("  1. Check core/scan_engine/ for actual function names")
+    print("  1. Check scan_engine/ for actual function names")
     print("  2. Update cli/run_pipeline_debug.py imports")
     print("  3. Match function signatures (df, params, etc.)")
     print("  4. Add tier checking at Step 7B")

@@ -17,7 +17,7 @@ from pathlib import Path
 # Enable caching for this test
 os.environ['DEBUG_CACHE_CHAINS'] = '1'
 
-from core.scan_engine.step9b_fetch_contracts import ChainCache, _fetch_chain_with_greeks, TRADIER_TOKEN
+from scan_engine.step9b_fetch_contracts import ChainCache, _fetch_chain_with_greeks, TRADIER_TOKEN
 
 
 def test_cache_infrastructure():

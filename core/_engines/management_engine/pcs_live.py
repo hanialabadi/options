@@ -1,6 +1,6 @@
 import pandas as pd
-from core.data_contracts import load_active_master, save_active_master
-from core.data_contracts.config import MANAGEMENT_SAFE_MODE
+from core.shared.data_contracts import load_active_master, save_active_master
+from core.shared.data_contracts.config import MANAGEMENT_SAFE_MODE
 
 
 def pcs_engine_v3_2_strategy_aware(df):

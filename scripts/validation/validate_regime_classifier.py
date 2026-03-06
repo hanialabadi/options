@@ -45,8 +45,8 @@ import argparse
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-from core.scan_engine.pipeline import run_full_scan_pipeline
-from core.scan_engine.market_regime_classifier import classify_market_regime
+from scan_engine.pipeline import run_full_scan_pipeline
+from scan_engine.market_regime_classifier import classify_market_regime
 
 
 def extract_date_from_snapshot(snapshot_path: str) -> str:

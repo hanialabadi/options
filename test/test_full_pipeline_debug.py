@@ -78,7 +78,7 @@ def test_full_pipeline():
     print("🔷"*40)
     
     try:
-        from core.scan_engine.step2_liquidity import filter_by_liquidity
+        from scan_engine.step2_liquidity import filter_by_liquidity
         df_step2 = filter_by_liquidity(df_step1)
         print_step_summary("STEP 2 OUTPUT", df_step2, 
                           ['Ticker', 'Volume', 'Liquidity_Score'])
@@ -96,7 +96,7 @@ def test_full_pipeline():
     print("🔷"*40)
     
     try:
-        from core.scan_engine.step3_ivhv_context import calculate_ivhv_context
+        from scan_engine.step3_ivhv_context import calculate_ivhv_context
         df_step3 = calculate_ivhv_context(df_step2)
         print_step_summary("STEP 3 OUTPUT", df_step3,
                           ['Ticker', 'IV_Rank', 'HV_20', 'IVHV_gap_30D', 'IV_Context'])
@@ -114,7 +114,7 @@ def test_full_pipeline():
     print("🔷"*40)
     
     try:
-        from core.scan_engine.step4_signal_generator import generate_signals
+        from scan_engine.step4_signal_generator import generate_signals
         df_step4 = generate_signals(df_step3)
         print_step_summary("STEP 4 OUTPUT", df_step4,
                           ['Ticker', 'Signal_Type', 'Signal_Strength', 'Trade_Bias'])
@@ -132,7 +132,7 @@ def test_full_pipeline():
     print("🔷"*40)
     
     try:
-        from core.scan_engine.step5_market_regime import classify_market_regime
+        from scan_engine.step5_market_regime import classify_market_regime
         df_step5 = classify_market_regime(df_step4)
         print_step_summary("STEP 5 OUTPUT", df_step5,
                           ['Ticker', 'Regime', 'Volatility_Regime', 'Trend_Strength'])
@@ -150,7 +150,7 @@ def test_full_pipeline():
     print("🔷"*40)
     
     try:
-        from core.scan_engine.step6_scoring import calculate_quality_scores
+        from scan_engine.step6_scoring import calculate_quality_scores
         df_step6 = calculate_quality_scores(df_step5)
         print_step_summary("STEP 6 OUTPUT", df_step6,
                           ['Ticker', 'Quality_Tier', 'PCS_Final', 'Confidence'])
@@ -168,7 +168,7 @@ def test_full_pipeline():
     print("🔷"*40)
     
     try:
-        from core.scan_engine.step7_strategy_recommendation import recommend_strategies
+        from scan_engine.step7_strategy_recommendation import recommend_strategies
         df_step7 = recommend_strategies(df_step6)
         print_step_summary("STEP 7 OUTPUT", df_step7,
                           ['Ticker', 'Primary_Strategy', 'Trade_Bias', 'Strategy_Tier'])
@@ -191,7 +191,7 @@ def test_full_pipeline():
     print("🔷"*40)
     
     try:
-        from core.scan_engine.step9a_determine_timeframe import determine_option_timeframe
+        from scan_engine.step9a_determine_timeframe import determine_option_timeframe
         df_step9a = determine_option_timeframe(df_step7)
         print_step_summary("STEP 9A OUTPUT", df_step9a,
                           ['Ticker', 'Primary_Strategy', 'Min_DTE', 'Max_DTE', 'Preferred_DTE'])
@@ -215,7 +215,7 @@ def test_full_pipeline():
     print("⚠️  This may take 30-60 seconds...")
     
     try:
-        from core.scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
+        from scan_engine.step9b_fetch_contracts import fetch_and_select_contracts
         df_step9b = fetch_and_select_contracts(df_step9a)
         print_step_summary("STEP 9B OUTPUT", df_step9b,
                           ['Ticker', 'Primary_Strategy', 'Selected_Expiration', 'Actual_DTE',
@@ -244,7 +244,7 @@ def test_full_pipeline():
     print("🔷"*40)
     
     try:
-        from core.scan_engine.step10_pcs_recalibration import recalibrate_and_filter
+        from scan_engine.step10_pcs_recalibration import recalibrate_and_filter
         df_step10 = recalibrate_and_filter(df_step9b)
         print_step_summary("STEP 10 OUTPUT", df_step10,
                           ['Ticker', 'Primary_Strategy', 'Liquidity_Score', 
@@ -271,7 +271,7 @@ def test_full_pipeline():
     print("🔷"*40)
     
     try:
-        from core.scan_engine.step11_strategy_pairing import compare_and_rank_strategies
+        from scan_engine.step11_strategy_pairing import compare_and_rank_strategies
         df_step11 = compare_and_rank_strategies(
             df_step10,
             user_goal='income',
@@ -302,7 +302,7 @@ def test_full_pipeline():
     print("🔷"*40)
     
     try:
-        from core.scan_engine.step8_position_sizing import finalize_and_size_positions
+        from scan_engine.step8_position_sizing import finalize_and_size_positions
         df_step8 = finalize_and_size_positions(
             df_step11,
             account_balance=100000,

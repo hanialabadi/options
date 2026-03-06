@@ -12,7 +12,7 @@ sys.path.insert(0, '/Users/haniabadi/Documents/Github/options')
 
 import pandas as pd
 import json
-from core.scan_engine.step10_pcs_recalibration import recalibrate_and_filter
+from scan_engine.step10_pcs_recalibration import recalibrate_and_filter
 
 
 def test_step10_with_greeks():

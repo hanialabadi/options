@@ -34,8 +34,12 @@ VOLATILITY_STRATEGIES = [
 
 INCOME_STRATEGIES = [
     'Covered Call', 'Cash-Secured Put', 'Covered Strangle',
-    'Short Iron Condor', 'Short Butterfly'
+    'Short Iron Condor', 'Short Butterfly',
+    'Buy-Write',  # Stock purchase + short call package (Cohen Ch.7)
 ]
+
+# Buy-Write is income but capital-intensive — tracked separately for capital checks
+BUY_WRITE_STRATEGIES = ['Buy-Write']
 
 
 def calculate_pcs_score_v2(df: pd.DataFrame) -> pd.DataFrame:
@@ -95,9 +99,14 @@ def calculate_pcs_score_v2(df: pd.DataFrame) -> pd.DataFrame:
         history_penalty, history_reasons = _calculate_history_penalties(row)
         base_score -= history_penalty
         penalties.extend(history_reasons)
-        
-        # Floor at 0
-        final_score = max(0.0, base_score)
+
+        # 6. Premium Pricing penalties (NEW - 2026-02-03)
+        pricing_penalty, pricing_reasons = _calculate_premium_pricing_penalties(row)
+        base_score -= pricing_penalty
+        penalties.extend(pricing_reasons)
+
+        # Clamp to [0, 100]
+        final_score = max(0.0, min(100.0, base_score))
         
         # Assign to DataFrame
         df.at[idx, 'PCS_Score_V2'] = final_score
@@ -132,7 +141,7 @@ def _calculate_greek_penalties(row: pd.Series) -> Tuple[float, List[str]]:
         (total_penalty, list_of_reasons)
     """
     
-    strategy = row.get('Strategy', '')
+    strategy = row.get('Strategy', '') or row.get('Strategy_Name', '')
     delta = row.get('Delta')
     vega = row.get('Vega')
     theta = row.get('Theta')
@@ -215,159 +224,417 @@ def _calculate_greek_penalties(row: pd.Series) -> Tuple[float, List[str]]:
     
     # Income strategies
     elif strategy in INCOME_STRATEGIES:
-        # Theta should dominate (decay collection)
+        # Theta should dominate (decay collection) — RAG: Cohen, "theta must dominate for income to work"
+        # Graduated by theta/vega ratio: deeper deficit = heavier penalty
         if not pd.isna(theta):
             abs_theta = abs(theta)
             if abs_theta <= vega:
-                penalty = 10.0
+                ratio = abs_theta / vega if vega > 0 else 0.0
+                # ratio=1.0 → barely failing (light), ratio=0.0 → theta ≈ 0 (severe)
+                if ratio >= 0.75:
+                    penalty = 10.0   # Borderline: theta almost covers vega
+                elif ratio >= 0.50:
+                    penalty = 17.0   # Moderate deficit
+                else:
+                    penalty = 25.0   # Severe deficit: vega dominates by 2x+
                 total_penalty += penalty
-                penalties.append(f'Weak Theta ({abs_theta:.2f} ≤ Vega, -{penalty:.0f} pts)')
+                penalties.append(f'Weak Theta (θ/v={ratio:.2f}, θ={abs_theta:.2f} ≤ v={vega:.2f}, -{penalty:.0f} pts)')
     
     return total_penalty, penalties
 
 
 def _calculate_liquidity_penalties(row: pd.Series) -> Tuple[float, List[str]]:
     """
-    Calculate gradient liquidity penalties.
-    
-    Spread: >8% starts penalty, >15% is severe
-    OI: <50 starts penalty, <20 is severe
-    
+    Calculate gradient liquidity penalties (STRATEGY-AWARE).
+
+    DIRECTIONAL (single-leg): Stricter spreads (10%), higher OI requirement (100)
+    INCOME (multi-leg): Baseline spreads (12%), highest OI requirement (100) for rolling
+    VOLATILITY (OTM strikes): Wider spreads (15%), lower OI requirement (50)
+
+    Rationale:
+    - Directional: Simple execution, tight spreads critical
+    - Income: Frequent adjustments/rolling need excellent liquidity
+    - Volatility: OTM strikes naturally have wider spreads
+
+    Updated: 2026-02-03 (Strategy Quality Audit)
+
     Returns:
         (total_penalty, list_of_reasons)
     """
-    
+
+    strategy = row.get('Strategy', '')
     spread_pct = row.get('Bid_Ask_Spread_Pct')
     oi = row.get('Open_Interest')
-    
+
     penalties = []
     total_penalty = 0.0
-    
+
     # Convert to float/int safely
     try:
         spread_pct = float(spread_pct) if pd.notna(spread_pct) else None
     except (ValueError, TypeError):
         spread_pct = None
-    
+
     try:
         oi = int(oi) if pd.notna(oi) else None
     except (ValueError, TypeError):
         oi = None
-    
-    # Spread penalty (gradient)
-    if spread_pct is not None and spread_pct > 8.0:
-        penalty = (spread_pct - 8.0) * 2.0  # -2 pts per % over 8%
+
+    # Get strategy-specific thresholds
+    if strategy in DIRECTIONAL_STRATEGIES:
+        spread_threshold = 10.0  # Tighter spreads (single-leg)
+        oi_threshold = 100       # Higher OI (quality execution)
+    elif strategy in INCOME_STRATEGIES:
+        spread_threshold = 12.0  # Multi-leg tolerates wider spreads
+        oi_threshold = 75        # Sufficient for weekly CSPs/CCs (RAG: 75 covers weekly cycles)
+    elif strategy in VOLATILITY_STRATEGIES:
+        spread_threshold = 15.0  # OTM strikes naturally wider
+        oi_threshold = 50        # Lower OI acceptable for OTM
+    else:
+        spread_threshold = 12.0  # Conservative default
+        oi_threshold = 75        # Moderate default
+
+    # GAP 7 FIX: Gamma-adjusted spread threshold.
+    # Harris (Trading and Exchanges Ch.5) + Natenberg Ch.7:
+    # Market maker's hedge cost scales with Gamma × realized vol. A 5% spread at high Gamma
+    # (≥0.08) costs ~2× more in effective slippage than the same spread at low Gamma (<0.05).
+    # Tighten spread threshold ×0.75 when Gamma is high. Only when Gamma is known.
+    try:
+        _gamma_raw = row.get('Gamma')
+        _gamma_val = abs(float(_gamma_raw)) if _gamma_raw is not None and pd.notna(_gamma_raw) else 0.0
+    except (TypeError, ValueError):
+        _gamma_val = 0.0
+    _gamma_adj_factor = 0.75 if _gamma_val >= 0.08 else 1.0
+    _effective_spread_threshold = spread_threshold * _gamma_adj_factor
+
+    # Spread penalty (gradient, strategy-aware, gamma-adjusted)
+    if spread_pct is not None and spread_pct > _effective_spread_threshold:
+        penalty = (spread_pct - _effective_spread_threshold) * 2.0  # -2 pts per % over threshold
         total_penalty += penalty
-        penalties.append(f'Wide Spread ({spread_pct:.1f}%, -{penalty:.0f} pts)')
-    
-    # OI penalty (gradient)
-    if oi is not None and oi < 50:
-        penalty = (50 - oi) * 0.2  # -0.2 pts per contract below 50
+        _gamma_note = f', Gamma={_gamma_val:.3f}≥0.08→thr×0.75' if _gamma_adj_factor < 1.0 else ''
+        penalties.append(f'Wide Spread ({spread_pct:.1f}% > {_effective_spread_threshold:.1f}%{_gamma_note}, -{penalty:.0f} pts)')
+
+    # OI penalty (gradient, strategy-aware)
+    if oi is not None and oi < oi_threshold:
+        penalty = (oi_threshold - oi) * 0.2  # -0.2 pts per contract below threshold
         total_penalty += penalty
-        penalties.append(f'Low OI ({oi:.0f}, -{penalty:.0f} pts)')
-    
+        penalties.append(f'Low OI ({oi:.0f} < {oi_threshold}, -{penalty:.0f} pts)')
+
     return total_penalty, penalties
 
 
 def _calculate_dte_penalties(row: pd.Series) -> Tuple[float, List[str]]:
     """
-    Calculate DTE penalties.
-    
-    DTE < 7: High penalty (execution risk)
-    DTE < 14: Moderate penalty
-    
+    Calculate DTE penalties (STRATEGY-AWARE).
+
+    DIRECTIONAL: Min 14 days (avoid extreme Gamma risk, need time for thesis)
+    INCOME: Min 5 days (weekly theta decay acceptable)
+    VOLATILITY: Min 21 days (Vega needs time for IV changes)
+
+    Rationale:
+    - Directional: <7 DTE = Gamma explosion risk (Natenberg)
+    - Income: Weekly CSP/CC strategies acceptable (Cohen)
+    - Volatility: IV changes need time to materialize (Sinclair)
+
+    Updated: 2026-02-03 (Strategy Quality Audit)
+
     Returns:
         (total_penalty, list_of_reasons)
     """
-    
+
+    strategy = row.get('Strategy', '')
     dte = row.get('Actual_DTE')
-    
+
     penalties = []
     total_penalty = 0.0
-    
+
     # Convert to int safely
     try:
         dte = int(dte) if pd.notna(dte) else None
     except (ValueError, TypeError):
         dte = None
-    
-    if dte is not None:
-        if dte < 7:
-            penalty = (7 - dte) * 3.0  # -3 pts per day below 7
-            total_penalty += penalty
-            penalties.append(f'Very Short DTE ({dte:.0f}d, -{penalty:.0f} pts)')
-        elif dte < 14:
-            penalty = (14 - dte) * 1.0  # -1 pt per day below 14
-            total_penalty += penalty
-            penalties.append(f'Short DTE ({dte:.0f}d, -{penalty:.0f} pts)')
-    
+
+    if dte is None:
+        return total_penalty, penalties
+
+    # Get strategy-specific DTE thresholds
+    if strategy in DIRECTIONAL_STRATEGIES:
+        min_dte_critical = 14  # Avoid Gamma risk
+        min_dte_moderate = 21  # Ideal for thesis development
+    elif strategy in INCOME_STRATEGIES:
+        min_dte_critical = 5   # Weekly theta decay OK
+        min_dte_moderate = 14  # Standard monthly cycle
+    elif strategy in VOLATILITY_STRATEGIES:
+        min_dte_critical = 21  # Vega needs time
+        min_dte_moderate = 30  # Ideal for IV changes
+    else:
+        min_dte_critical = 7   # Conservative default
+        min_dte_moderate = 14
+
+    # Apply gradient penalties
+    if dte < min_dte_critical:
+        penalty = (min_dte_critical - dte) * 3.0  # -3 pts per day below critical
+        total_penalty += penalty
+        penalties.append(f'Very Short DTE ({dte:.0f}d < {min_dte_critical}d, -{penalty:.0f} pts)')
+    elif dte < min_dte_moderate:
+        penalty = (min_dte_moderate - dte) * 1.0  # -1 pt per day below moderate
+        total_penalty += penalty
+        penalties.append(f'Short DTE ({dte:.0f}d < {min_dte_moderate}d, -{penalty:.0f} pts)')
+
     return total_penalty, penalties
 
 
 def _calculate_risk_penalties(row: pd.Series) -> Tuple[float, List[str]]:
     """
     Calculate risk penalties.
-    
+
     Risk > $5k: Moderate penalty (portfolio concentration)
     Risk > $10k: High penalty
-    
+
+    Buy-Write: Additional capital concentration check — stock purchase = large capital lock-up.
+    A $500/share stock = $50k per contract. Penalize if capital_req > $20k (concentration risk).
+
     Returns:
         (total_penalty, list_of_reasons)
     """
-    
+
+    strategy = row.get('Strategy', '') or row.get('Strategy_Name', '')
     risk = row.get('Risk_Model') or row.get('Actual_Risk_Per_Contract')
-    
+
     penalties = []
     total_penalty = 0.0
-    
+
     # Convert to float safely (Risk_Model might be string, Actual_Risk_Per_Contract should be numeric)
     try:
         risk = float(risk) if pd.notna(risk) and str(risk).replace('.', '').replace('-', '').isdigit() else None
     except (ValueError, TypeError):
         risk = None
-    
+
     if risk is not None and risk > 5000:
         penalty = (risk - 5000) / 100 * 0.5  # -0.5 pts per $100 over $5k
         total_penalty += penalty
         penalties.append(f'High Risk (${risk:,.0f}, -{penalty:.0f} pts)')
-    
+
+    # Buy-Write: capital concentration penalty (100 shares purchased = large single-name exposure)
+    # Cohen: only worth doing if you can absorb the full stock downside
+    if strategy in BUY_WRITE_STRATEGIES:
+        capital_req = row.get('Capital_Requirement')
+        try:
+            capital_req = float(capital_req) if pd.notna(capital_req) else None
+        except (ValueError, TypeError):
+            capital_req = None
+
+        if capital_req is not None:
+            if capital_req > 50_000:
+                penalty = 20.0  # Very high-priced stock (e.g. BKNG $5k/share)
+                total_penalty += penalty
+                penalties.append(f'Buy-Write capital concentration (${capital_req:,.0f}/contract, -{penalty:.0f} pts)')
+            elif capital_req > 20_000:
+                penalty = 10.0  # High-priced stock (e.g. NVDA $130/share is fine; $200+ gets here)
+                total_penalty += penalty
+                penalties.append(f'Buy-Write elevated capital (${capital_req:,.0f}/contract, -{penalty:.0f} pts)')
+
     return total_penalty, penalties
 
 
 def _calculate_history_penalties(row: pd.Series) -> Tuple[float, List[str]]:
     """
     Calculate penalties based on IV History quality (Volatility Identity Card).
-    
-    Rules:
-    - iv_data_stale: -15 pts (unreliable recent trend)
-    - regime_confidence < 0.5: -10 pts (fragmented history)
-    - history_depth_ok is False: -10 pts (insufficient lookback)
-    
+
+    Uses IV_Maturity_Level (1-5) from IVEngine for graduated penalties:
+    - Level 1 (<20d): -15 pts (minimal history)
+    - Level 2 (20-60d): -10 pts (early history)
+    - Level 3 (60-120d): -5 pts (developing history)
+    - Level 4-5 (120d+): no penalty (mature)
+
+    Also penalizes stale IV data and low regime confidence.
+
     Returns:
         (total_penalty, list_of_reasons)
     """
-    iv_data_stale = row.get('iv_data_stale', True)
-    regime_confidence = row.get('regime_confidence', 0.0)
-    history_depth_ok = row.get('history_depth_ok', False)
-    
+    iv_data_stale = row.get('iv_data_stale', False)
+    regime_confidence = row.get('regime_confidence', 1.0)
+    maturity_level = row.get('IV_Maturity_Level')
+
     penalties = []
     total_penalty = 0.0
-    
+
     if iv_data_stale:
         penalty = 15.0
         total_penalty += penalty
         penalties.append(f'Stale IV History (-{penalty:.0f} pts)')
-        
+
     if regime_confidence < 0.5:
         penalty = 10.0
         total_penalty += penalty
         penalties.append(f'Low Regime Confidence ({regime_confidence:.2f}, -{penalty:.0f} pts)')
-        
-    if not history_depth_ok:
-        penalty = 10.0
+
+    # Graduated maturity penalty from IVEngine
+    if pd.notna(maturity_level):
+        maturity_level = int(maturity_level)
+        if maturity_level == 1:
+            penalty = 15.0
+            total_penalty += penalty
+            penalties.append(f'Minimal IV History (Maturity Level 1, -{penalty:.0f} pts)')
+        elif maturity_level == 2:
+            penalty = 10.0
+            total_penalty += penalty
+            penalties.append(f'Early IV History (Maturity Level 2, -{penalty:.0f} pts)')
+        elif maturity_level == 3:
+            penalty = 5.0
+            total_penalty += penalty
+            penalties.append(f'Developing IV History (Maturity Level 3, -{penalty:.0f} pts)')
+        # Level 4-5: no penalty
+    else:
+        # No maturity data at all
+        penalty = 15.0
         total_penalty += penalty
-        penalties.append(f'Insufficient History Depth (-{penalty:.0f} pts)')
-        
+        penalties.append(f'Missing IV History (-{penalty:.0f} pts)')
+
+    return total_penalty, penalties
+
+
+def _calculate_premium_pricing_penalties(row: pd.Series) -> Tuple[float, List[str]]:
+    """
+    Calculate premium pricing penalties (NEW - 2026-02-03).
+
+    STRATEGY-AWARE: Buy cheap, sell expensive
+    - Directional (buy premium): Penalize if overpaying (premium vs FV >5%)
+    - Income (sell premium): Penalize if underselling (premium vs FV <-5%)
+    - Volatility: Penalize buying high IV Rank (>70) or selling low IV Rank (<30)
+
+    Returns:
+        (total_penalty, list_of_reasons)
+    """
+
+    strategy = row.get('Strategy', '') or row.get('Strategy_Name', '')
+    premium_vs_fv = row.get('Premium_vs_FairValue_Pct', 0)
+    iv_rank = row.get('IV_Rank_30D') or row.get('IV_Rank', 50)
+    theta = row.get('Theta', 0)
+    mid_price = row.get('Mid', 0)
+
+    penalties = []
+    total_penalty = 0.0
+
+    # 0. Buy-Write: net premium yield check
+    # Cohen: the short call must collect enough premium to justify capital lock-up.
+    # Minimum acceptable yield: 1% of stock price per contract (annualised would be ~12%).
+    # If mid_price (call premium) < 1% of stock price → income not worth the risk.
+    if strategy in BUY_WRITE_STRATEGIES:
+        capital_req = row.get('Capital_Requirement')
+        try:
+            capital_req = float(capital_req) if pd.notna(capital_req) else None
+            mid_f = float(mid_price) if pd.notna(mid_price) else None
+        except (ValueError, TypeError):
+            capital_req = None
+            mid_f = None
+
+        if capital_req is not None and capital_req > 0 and mid_f is not None and mid_f > 0:
+            # Use Approx_Stock_Price directly (set by Step 6) — avoids fragile reverse math.
+            # Fallback: capital_req / 100 only for legacy rows that predate the column.
+            _asp = row.get('Approx_Stock_Price')
+            try:
+                _stock_price_bw = float(_asp) if (_asp is not None and float(_asp) > 0) else capital_req / 100.0
+            except (TypeError, ValueError):
+                _stock_price_bw = capital_req / 100.0  # noqa: F841 (kept for future use in yield msg)
+            premium_total = mid_f * 100            # option mid × 100 shares
+            premium_yield_pct = premium_total / capital_req * 100  # as % of total capital
+
+            if premium_yield_pct < 0.5:
+                penalty = 20.0  # < 0.5% yield — negligible income for capital risked
+                total_penalty += penalty
+                penalties.append(f'Buy-Write yield too low ({premium_yield_pct:.2f}% of capital, need >1%, -{penalty:.0f} pts)')
+            elif premium_yield_pct < 1.0:
+                penalty = 10.0  # 0.5–1.0% yield — marginal
+                total_penalty += penalty
+                penalties.append(f'Buy-Write low yield ({premium_yield_pct:.2f}% of capital, ideal >1%, -{penalty:.0f} pts)')
+            # >= 1% yield: no penalty — worthwhile income for capital deployed
+
+    # 1. Premium vs Fair Value validation
+    if strategy in DIRECTIONAL_STRATEGIES:
+        # Buying premium - want discount (<0%), penalize premium (>5%)
+        if premium_vs_fv > 5:
+            penalty = (premium_vs_fv - 5) * 3.0  # -3 pts per % overpaying
+            total_penalty += penalty
+            penalties.append(f'Overpaying ({premium_vs_fv:+.1f}% vs fair value, -{penalty:.0f} pts)')
+        elif premium_vs_fv < -5:
+            # Getting discount - bonus
+            bonus = min(abs(premium_vs_fv) - 5, 10) * 0.5  # Up to +5 pts bonus (subtract from penalty)
+            total_penalty -= bonus  # Negative penalty = bonus
+            penalties.append(f'Discount pricing ({premium_vs_fv:+.1f}% vs fair value, +{bonus:.0f} pts)')
+
+    elif strategy in INCOME_STRATEGIES:
+        # Selling premium - want premium (>5%), penalize discount (<-5%)
+        if premium_vs_fv < -5:
+            penalty = (abs(premium_vs_fv) - 5) * 3.0  # -3 pts per % underselling
+            total_penalty += penalty
+            penalties.append(f'Underselling ({premium_vs_fv:+.1f}% vs fair value, -{penalty:.0f} pts)')
+        elif premium_vs_fv > 5:
+            # Selling at premium - bonus
+            bonus = min(premium_vs_fv - 5, 10) * 0.5  # Up to +5 pts bonus
+            total_penalty -= bonus
+            penalties.append(f'Premium pricing ({premium_vs_fv:+.1f}% vs fair value, +{bonus:.0f} pts)')
+
+    # 2. IV Rank alignment (don't buy high IV, don't sell low IV)
+    # RAG: Buying at IV Rank >80 = 2-sigma spike (Natenberg). Selling at <15 = cardinal sin (Cohen).
+    # Steepened from 0.5x to nonlinear: penalty accelerates in the danger zone.
+    if pd.notna(iv_rank):
+        if strategy in DIRECTIONAL_STRATEGIES:  # Buying premium — penalize buying expensive IV
+            if iv_rank > 70:
+                excess = iv_rank - 70
+                # Nonlinear: first 10 pts of excess = 0.5x, next 20 pts = 1.0x
+                penalty = min(excess, 10) * 0.5 + max(excess - 10, 0) * 1.0  # Up to -25 pts at rank=100
+                total_penalty += penalty
+                penalties.append(f'Buying high IV (IV Rank {iv_rank:.0f} > 70, -{penalty:.0f} pts)')
+
+        elif strategy in INCOME_STRATEGIES:  # Selling premium — penalize selling cheap IV
+            if iv_rank < 30:
+                deficit = 30 - iv_rank
+                # Nonlinear: first 15 pts of deficit = 0.5x, next 15 pts = 1.0x
+                penalty = min(deficit, 15) * 0.5 + max(deficit - 15, 0) * 1.0  # Up to -22.5 pts at rank=0
+                total_penalty += penalty
+                penalties.append(f'Selling low IV (IV Rank {iv_rank:.0f} < 30, -{penalty:.0f} pts)')
+
+    # 3. Theta burn check (for premium buyers)
+    if strategy in DIRECTIONAL_STRATEGIES:
+        if abs(theta) > 0 and mid_price > 0:
+            theta_pct = (abs(theta) / mid_price) * 100
+            if theta_pct > 5:  # Losing >5% per day
+                penalty = (theta_pct - 5) * 4.0  # -4 pts per % over 5%
+                total_penalty += penalty
+                penalties.append(f'High theta burn ({theta_pct:.1f}%/day, -{penalty:.0f} pts)')
+
+    # 4. Surface Shape awareness (term structure signal)
+    surface_shape = row.get('Surface_Shape')
+    if pd.notna(surface_shape):
+        if strategy in DIRECTIONAL_STRATEGIES and surface_shape == 'INVERTED':
+            # Buying when short-term IV is elevated vs long-term — paying up for near-term fear
+            penalty = 8.0
+            total_penalty += penalty
+            penalties.append(f'Inverted surface (short-term IV elevated, -{penalty:.0f} pts)')
+        elif strategy in INCOME_STRATEGIES and surface_shape == 'CONTANGO':
+            # Normal term structure favors credit selling
+            bonus = 5.0
+            total_penalty -= bonus
+            penalties.append(f'Favorable contango for income (+{bonus:.0f} pts)')
+        elif strategy in INCOME_STRATEGIES and surface_shape == 'INVERTED':
+            # RAG: inverted = short-term fear spike = early buyback at loss risk for sellers
+            penalty = 8.0
+            total_penalty += penalty
+            penalties.append(f'Inverted surface (short-term IV spike, buyback risk, -{penalty:.0f} pts)')
+
+    # 5. IV Regime awareness
+    iv_regime = row.get('IV_Regime')
+    if pd.notna(iv_regime):
+        if strategy in DIRECTIONAL_STRATEGIES and iv_regime == 'HIGH_VOL':
+            penalty = 10.0
+            total_penalty += penalty
+            penalties.append(f'Buying in HIGH_VOL regime (-{penalty:.0f} pts)')
+        elif strategy in INCOME_STRATEGIES and iv_regime == 'LOW_VOL':
+            penalty = 10.0
+            total_penalty += penalty
+            penalties.append(f'Selling in LOW_VOL regime (-{penalty:.0f} pts)')
+
     return total_penalty, penalties
 
 

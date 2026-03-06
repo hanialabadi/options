@@ -32,13 +32,13 @@ project_root = Path(__file__).parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot
-from core.scan_engine.step3_filter_ivhv import filter_ivhv_gap
-from core.scan_engine.step5_chart_signals import compute_chart_signals
-from core.scan_engine.step6_gem_filter import validate_data_quality
-from core.scan_engine.step7_strategy_recommendation import recommend_strategies
-from core.scan_engine.step9a_determine_timeframe import determine_timeframe
-from core.scan_engine.step11_independent_evaluation import evaluate_strategies_independently
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot
+from scan_engine.step3_filter_ivhv import filter_ivhv_gap
+from scan_engine.step5_chart_signals import compute_chart_signals
+from scan_engine.step6_gem_filter import validate_data_quality
+from scan_engine.step7_strategy_recommendation import recommend_strategies
+from scan_engine.step9a_determine_timeframe import determine_timeframe
+from scan_engine.step11_independent_evaluation import evaluate_strategies_independently
 
 # Configure logging
 logging.basicConfig(
@@ -50,7 +50,8 @@ logger = logging.getLogger(__name__)
 
 def save_step_output(df: pd.DataFrame, step_name: str) -> Path:
     """Save step output to CSV with timestamp."""
-    output_dir = Path("output")
+    from core.shared.data_contracts.config import SCAN_OUTPUT_DIR
+    output_dir = SCAN_OUTPUT_DIR
     output_dir.mkdir(exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -276,7 +277,8 @@ def main():
         # Save results summary
         results['duration_seconds'] = duration
         results['timestamp'] = datetime.now().isoformat()
-        results_path = Path("output") / f"pipeline_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        from core.shared.data_contracts.config import SCAN_OUTPUT_DIR
+        results_path = SCAN_OUTPUT_DIR / f"pipeline_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=2)
         logger.info(f"\n📊 Results summary saved: {results_path}")

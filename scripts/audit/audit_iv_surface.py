@@ -15,14 +15,14 @@ from pathlib import Path
 
 sys.path.insert(0, '.')
 
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot
-from core.scan_engine.step3_filter_ivhv import filter_ivhv_gap
-from core.scan_engine.step5_chart_signals import compute_chart_signals
-from core.scan_engine.step6_gem_filter import validate_data_quality
-from core.scan_engine.step7_strategy_recommendation import recommend_strategies
-from core.scan_engine.step9a_select_timeframes import select_timeframes
-from core.scan_engine.step11_evaluation import evaluate_strategies
-from core.scan_engine.step12_acceptance import compute_acceptance
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot
+from scan_engine.step3_filter_ivhv import filter_ivhv_gap
+from scan_engine.step5_chart_signals import compute_chart_signals
+from scan_engine.step6_gem_filter import validate_data_quality
+from scan_engine.step7_strategy_recommendation import recommend_strategies
+from scan_engine.step9a_select_timeframes import select_timeframes
+from scan_engine.step11_evaluation import evaluate_strategies
+from scan_engine.step12_acceptance import compute_acceptance
 
 # ============================================================================
 # STEP 0: LOCK A SMALL, CONTROLLED UNIVERSE

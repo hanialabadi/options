@@ -11,7 +11,7 @@ import pandas as pd
 import sys
 sys.path.insert(0, '/Users/haniabadi/Documents/Github/options')
 
-from core.scan_engine.step9b_fetch_contracts import _get_price_aware_liquidity_thresholds
+from scan_engine.step9b_fetch_contracts import _get_price_aware_liquidity_thresholds
 
 
 def test_leap_liquidity_thresholds():

@@ -22,7 +22,7 @@ from pathlib import Path
 # Add core module to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.scan_engine.step0_schwab_snapshot import (
+from scan_engine.step0_schwab_snapshot import (
     generate_live_snapshot,
     save_snapshot,
     load_ticker_universe,

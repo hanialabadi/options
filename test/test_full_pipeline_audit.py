@@ -43,7 +43,7 @@ print("="*80)
 # ============================================================
 # STEP 2: Load IV/HV Snapshot (with Murphy + Sinclair data)
 # ============================================================
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot
 
 df_snapshot = load_ivhv_snapshot()
 print_stage_summary(
@@ -77,7 +77,7 @@ if len(df_snapshot) == 0:
 # ============================================================
 # STEP 3: Filter by IVHV Gap
 # ============================================================
-from core.scan_engine.step3_filter_ivhv import filter_ivhv_gap
+from scan_engine.step3_filter_ivhv import filter_ivhv_gap
 
 df_filtered = filter_ivhv_gap(df_snapshot, min_gap=2.0)
 print_stage_summary(
@@ -93,7 +93,7 @@ if len(df_filtered) == 0:
 # ============================================================
 # STEP 5: Compute Chart Signals
 # ============================================================
-from core.scan_engine.step5_chart_signals import compute_chart_signals
+from scan_engine.step5_chart_signals import compute_chart_signals
 
 df_charted = compute_chart_signals(df_filtered)
 print_stage_summary(
@@ -105,7 +105,7 @@ print_stage_summary(
 # ============================================================
 # STEP 6: Data Quality Validation (GEM Filter)
 # ============================================================
-from core.scan_engine.step6_gem_filter import validate_data_quality
+from scan_engine.step6_gem_filter import validate_data_quality
 
 df_gem = validate_data_quality(df_charted)
 print_stage_summary(
@@ -121,7 +121,7 @@ if len(df_gem) == 0:
 # ============================================================
 # STEP 7: Strategy Recommendation
 # ============================================================
-from core.scan_engine.step7b_multi_strategy_ranker import generate_multi_strategy_suggestions
+from scan_engine.step7b_multi_strategy_ranker import generate_multi_strategy_suggestions
 
 df_strategies = generate_multi_strategy_suggestions(
     df_gem,
@@ -253,7 +253,7 @@ print(f"Rows: {len(df_pcs_filtered)}")
 # ============================================================
 # STEP 11: Independent Strategy Evaluation (CRITICAL)
 # ============================================================
-from core.scan_engine.step11_independent_evaluation import evaluate_strategies_independently
+from scan_engine.step11_independent_evaluation import evaluate_strategies_independently
 
 df_evaluated = evaluate_strategies_independently(
     df_pcs_filtered,
@@ -298,7 +298,7 @@ if 'Validation_Status' in df_evaluated.columns:
 # ============================================================
 # STEP 8: Portfolio Capital Allocation (EXECUTION-ONLY)
 # ============================================================
-from core.scan_engine.step8_position_sizing import allocate_portfolio_capital
+from scan_engine.step8_position_sizing import allocate_portfolio_capital
 
 print(f"\n{'='*80}")
 print(f"STAGE 8: Portfolio Capital Allocation (Execution-Only)")

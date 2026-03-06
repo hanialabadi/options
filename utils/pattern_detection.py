@@ -13,15 +13,15 @@ import pandas as pd
 import numpy as np
 import logging
 from typing import Tuple, Optional
-from core.data_layer.price_history_loader import load_price_history
+from core.shared.data_layer.price_history_loader import load_price_history
 
 logger = logging.getLogger(__name__)
 
 
-def detect_bulkowski_patterns(ticker: str, df_price: pd.DataFrame = None) -> Tuple[Optional[str], float]:
+def detect_bulkowski_patterns(ticker: str, df_price: pd.DataFrame = None, skip_db_fetch: bool = False) -> Tuple[Optional[str], float]:
     """
     Detect high-probability chart patterns per Bulkowski's statistical analysis.
-    
+
     Bulkowski patterns with >60% success rate (Encyclopedia of Chart Patterns):
     - Bull Flag: 70% success, uptrend continuation
     - Ascending Triangle: 63% success, bullish breakout
@@ -29,19 +29,20 @@ def detect_bulkowski_patterns(ticker: str, df_price: pd.DataFrame = None) -> Tup
     - Double Bottom: 70% success, bullish reversal
     - Bear Flag: 70% success, downtrend continuation
     - Descending Triangle: 64% success, bearish breakout
-    
+
     Args:
         ticker: Stock symbol
         df_price: Price dataframe with OHLC data (optional, will fetch if None)
-    
+        skip_db_fetch: If True, skip DB metadata updates to avoid connection conflicts
+
     Returns:
         (pattern_name, confidence): Pattern name and Bulkowski's success rate (0-100)
         Returns (None, 0.0) if no pattern detected
-    
+
     Theory (Bulkowski):
         "Chart patterns are not magic - they're statistical edges from
         recurring market structure. Success rate >60% = tradeable edge."
-    
+
     Example:
         >>> pattern, confidence = detect_bulkowski_patterns('AAPL')
         >>> if pattern == 'Bull Flag' and confidence > 70:
@@ -49,17 +50,39 @@ def detect_bulkowski_patterns(ticker: str, df_price: pd.DataFrame = None) -> Tup
     """
     try:
         # Fetch price data if not provided
+        # SAFETY: Use skip_db_fetch=True when DB may be locked by pipeline
         if df_price is None or df_price.empty:
-            df_price, source = load_price_history(ticker, days=90)
-        
-        if df_price.empty or len(df_price) < 20:
-            return (None, 0.0)
-        
+            if skip_db_fetch:
+                # Skip DB access entirely - use cache only, fail gracefully
+                # Only check cache, do not fetch from API or update metadata
+                try:
+                    from core.shared.data_layer.price_history_loader import PRICE_HISTORY_CACHE, is_diskcache_valid
+                    if is_diskcache_valid(ticker):
+                        df_price = PRICE_HISTORY_CACHE.get(ticker)
+                        if df_price is not None and not df_price.empty:
+                            df_price = df_price.tail(90)
+                        else:
+                            logger.debug(f"{ticker}: No cached price data for pattern detection")
+                            return ('NOT_EVALUATED', 0.0)
+                    else:
+                        logger.debug(f"{ticker}: Cache invalid for pattern detection")
+                        return ('NOT_EVALUATED', 0.0)
+                except Exception as e:
+                    logger.debug(f"{ticker}: Cache access failed for pattern detection: {e}")
+                    return ('NOT_EVALUATED', 0.0)
+            else:
+                # DEMAND-DRIVEN: Use cached OHLC only, do NOT auto-fetch from YF during pipeline
+                df_price, source = load_price_history(ticker, days=90, skip_auto_fetch=True)
+
+        if df_price is None or df_price.empty or len(df_price) < 20:
+            logger.debug(f"{ticker}: Insufficient OHLC data for pattern detection (need 20+ days, have {len(df_price) if df_price is not None else 0})")
+            return ('NOT_EVALUATED', 0.0)
+
         # Ensure we have required columns
         required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
         if not all(col in df_price.columns for col in required_cols):
             logger.debug(f"{ticker}: Missing OHLC columns for pattern detection (have: {df_price.columns.tolist()})")
-            return (None, 0.0)
+            return ('NOT_EVALUATED', 0.0)
         
         # Calculate indicators for pattern detection
         df = df_price.copy()
@@ -71,7 +94,8 @@ def detect_bulkowski_patterns(ticker: str, df_price: pd.DataFrame = None) -> Tup
         # Get recent data (last 20 days for pattern analysis)
         recent = df.tail(20)
         if len(recent) < 20:
-            return (None, 0.0)
+            logger.debug(f"{ticker}: Insufficient recent OHLC data for pattern detection (need 20 days, have {len(recent)})")
+            return ('NOT_EVALUATED', 0.0)
         
         close_prices = recent['Close'].values
         high_prices = recent['High'].values
@@ -173,43 +197,44 @@ def detect_bulkowski_patterns(ticker: str, df_price: pd.DataFrame = None) -> Tup
                         if close_prices[-1] < support_line:  # Breakdown
                             return ('Descending Triangle', 64.0)
         
-        # No pattern detected
+        # No pattern detected (data is sufficient, but no pattern found)
         return (None, 0.0)
-    
+
     except Exception as e:
-        logger.debug(f"{ticker}: Pattern detection failed: {e}")
-        return (None, 0.0)
+        logger.warning(f"{ticker}: Pattern detection failed unexpectedly: {e}")
+        return ('NOT_EVALUATED', 0.0)
 
 
-def detect_nison_candlestick(ticker: str, df_price: pd.DataFrame = None) -> Tuple[Optional[str], str]:
+def detect_nison_candlestick(ticker: str, df_price: pd.DataFrame = None, skip_db_fetch: bool = False) -> Tuple[Optional[str], str]:
     """
     Detect Nison candlestick reversal patterns for entry timing.
-    
+
     Nison high-reliability patterns (Japanese Candlestick Charting):
     Bullish:
     - Hammer (at support): Strong reversal signal
     - Bullish Engulfing: Momentum shift
     - Morning Star: Three-candle reversal
     - Piercing Line: Strong buying pressure
-    
+
     Bearish:
     - Shooting Star (at resistance): Reversal warning
     - Bearish Engulfing: Momentum shift
     - Evening Star: Three-candle reversal
     - Dark Cloud Cover: Selling pressure
-    
+
     Args:
         ticker: Stock symbol
         df_price: Price dataframe with OHLC (optional, will fetch if None)
-    
+        skip_db_fetch: If True, skip DB metadata updates to avoid connection conflicts
+
     Returns:
         (pattern_name, entry_timing_quality): Pattern name and timing quality
         entry_timing_quality: "Strong", "Moderate", "Weak", or None
-    
+
     Theory (Nison):
         "Candlestick patterns reveal the psychology of market participants.
         Reversal patterns at key levels = high-probability entry timing."
-    
+
     Example:
         >>> pattern, timing = detect_nison_candlestick('AAPL')
         >>> if pattern == 'Bullish Engulfing' and timing == 'Strong':
@@ -217,23 +242,46 @@ def detect_nison_candlestick(ticker: str, df_price: pd.DataFrame = None) -> Tupl
     """
     try:
         # Fetch price data if not provided
+        # SAFETY: Use skip_db_fetch=True when DB may be locked by pipeline
         if df_price is None or df_price.empty:
-            df_price, source = load_price_history(ticker, days=30)
-        
-        if df_price.empty or len(df_price) < 5:
-            return (None, None)
-        
+            if skip_db_fetch:
+                # Skip DB access entirely - use cache only, fail gracefully
+                # Only check cache, do not fetch from API or update metadata
+                try:
+                    from core.shared.data_layer.price_history_loader import PRICE_HISTORY_CACHE, is_diskcache_valid
+                    if is_diskcache_valid(ticker):
+                        df_price = PRICE_HISTORY_CACHE.get(ticker)
+                        if df_price is not None and not df_price.empty:
+                            df_price = df_price.tail(30)
+                        else:
+                            logger.debug(f"{ticker}: No cached price data for candlestick detection")
+                            return ('NOT_EVALUATED', 'LOW')
+                    else:
+                        logger.debug(f"{ticker}: Cache invalid for candlestick detection")
+                        return ('NOT_EVALUATED', 'LOW')
+                except Exception as e:
+                    logger.debug(f"{ticker}: Cache access failed for candlestick detection: {e}")
+                    return ('NOT_EVALUATED', 'LOW')
+            else:
+                # DEMAND-DRIVEN: Use cached OHLC only, do NOT auto-fetch from YF during pipeline
+                df_price, source = load_price_history(ticker, days=30, skip_auto_fetch=True)
+
+        if df_price is None or df_price.empty or len(df_price) < 5:
+            logger.debug(f"{ticker}: Insufficient OHLC data for candlestick detection (need 5+ days, have {len(df_price) if df_price is not None else 0})")
+            return ('NOT_EVALUATED', 'LOW')
+
         # Ensure we have OHLC
         required_cols = ['Open', 'High', 'Low', 'Close']
         if not all(col in df_price.columns for col in required_cols):
             logger.debug(f"{ticker}: Missing OHLC columns for candlestick (have: {df_price.columns.tolist()})")
-            return (None, None)
+            return ('NOT_EVALUATED', 'LOW')
         
         df = df_price.copy()
         
         # Get last 5 candles for pattern detection
         if len(df) < 5:
-            return (None, None)
+            logger.debug(f"{ticker}: Insufficient OHLC data for candlestick patterns (need 5+ candles, have {len(df)})")
+            return ('NOT_EVALUATED', 'LOW')
         
         recent = df.tail(5)
         
@@ -334,12 +382,12 @@ def detect_nison_candlestick(ticker: str, df_price: pd.DataFrame = None) -> Tupl
                 if candle_2['Close'] < midpoint and candle_2['Open'] > candle_1['Close']:
                     return ('Dark Cloud Cover', 'Moderate')
         
-        # No pattern detected
+        # No pattern detected (data is sufficient, but no pattern found)
         return (None, None)
-    
+
     except Exception as e:
-        logger.debug(f"{ticker}: Candlestick detection failed: {e}")
-        return (None, None)
+        logger.warning(f"{ticker}: Candlestick detection failed unexpectedly: {e}")
+        return ('NOT_EVALUATED', 'LOW')
 
 
 def get_reversal_confirmation(pattern_name: str, entry_timing: str) -> bool:

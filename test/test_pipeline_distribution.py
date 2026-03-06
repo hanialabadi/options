@@ -9,7 +9,7 @@ print('Full Pipeline Test: Step 2 -> Step 11 -> Step 8')
 print('=' * 80)
 
 # Step 2: Load snapshot
-from core.scan_engine.step2_load_snapshot import load_ivhv_snapshot
+from scan_engine.step2_load_and_enrich_snapshot import load_ivhv_snapshot
 df_snapshot = load_ivhv_snapshot()
 print(f'\nStep 2: Loaded {len(df_snapshot)} tickers with Murphy+Sinclair data')
 
@@ -120,7 +120,7 @@ for strat in ['Long Call', 'Long Straddle', 'Cash-Secured Put']:
         print(f'  IV_Term_Structure: {sample.get("IV_Term_Structure")}')
 
 # Step 11: Evaluate independently
-from core.scan_engine.step11_independent_evaluation import evaluate_strategies_independently
+from scan_engine.step11_independent_evaluation import evaluate_strategies_independently
 df_evaluated = evaluate_strategies_independently(df_strategies)
 
 print(f'\nStep 11: Evaluated {len(df_evaluated)} strategies')

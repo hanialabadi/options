@@ -11,7 +11,7 @@ from loguru import logger
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from core.scan_engine.schwab_api_client import SchwabClient
+from scan_engine.schwab_api_client import SchwabClient
 
 # --- Configuration Constants ---
 # Read credentials only from environment variables

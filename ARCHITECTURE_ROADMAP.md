@@ -1,173 +1,126 @@
-# Options Management Engine — Architecture Roadmap
+# Options Intelligence Platform: Architecture Roadmap
 
-Status: Active
-Last Locked: 2026-01-14
-Authority: RAG-validated (McMillan, Hull, Passarelli, Natenberg)
+## 🏗️ System Definitions
 
-## 1. System Purpose
+### 1. Scan Engine (Discovery)
+The **Scan Engine** is the discovery layer of the platform. Its purpose is to scan the broad market universe to find **new trade opportunities**.
+*   **Input:** Raw market data snapshots (IV/HV).
+*   **Process:** Filters for volatility edges, validates technical chart signals, selects specific option contracts, and applies "READY_NOW" acceptance logic.
+*   **Output:** A list of new trade candidates with specific sizing and scaling roadmaps.
+*   **Execution Semantics:** See [EXECUTION_SEMANTICS.md](docs/EXECUTION_SEMANTICS.md) for formal definitions of "valid execution" vs "escalation eligibility".
 
-The Options Management Engine is designed to manage existing option positions through objective, data-driven analysis, separating observation, measurement, and decision into strictly isolated cycles.
+### 2. Management Engine (Cycles 1-3)
+The **Management Engine** is the monitoring and decision layer for **existing open positions**. It operates in three distinct cycles:
+*   **Cycle 1 (Perception):** Ingests current positions from the broker and establishes "Ground Truth." It freezes "Anchors" (entry price, Greeks, technical regime) to provide a baseline for measurement.
+*   **Cycle 2 (Measurement):** Measures **Drift**—the migration of the current state away from the entry anchors. It performs P&L attribution to explain *why* a position is winning or losing (Delta, Theta, Vega, etc.).
+*   **Cycle 3 (Decision):** Applies doctrinal rules (McMillan, Passarelli, Hull, Natenberg) to the measured drift to generate authoritative actions (e.g., HOLD, EXIT, TRIM).
 
-The system explicitly does not:
-- Predict markets
-- Infer intent
-- Optimize entries
-- Reconstruct missing historical data
+---
 
-Its core objective is to provide audit-grade, emotion-free explanations and recommendations based on frozen historical truth and measured drift.
+## 🔍 Holistic Audit Summary
 
-## 2. Cycle Architecture Overview
+### 1. The "Computation Leak" (Critical)
+The dashboard previously violated its "Read-Only" mandate by calculating drift signals (Direction, Persistence, Magnitude) on the fly in `manage_view.py`.
+*   **Status:** Fixed. Signals moved to `core/management/cycle2/drift/drift_engine.py`.
 
-The engine operates as a three-cycle pipeline:
-- Cycle 1 — Perception (Ledger of Truth)
-- Cycle 2 — Drift (Time-Series Measurement)
-- Cycle 3 — Decision (Action & Recommendation)
+### 2. Data Storage Inconsistency
+Cycle 1 used DuckDB, while Cycle 2/3 and Scan results relied on CSV artifacts. This created a "split-brain" architecture.
+*   **Status:** Fixed. DuckDB persistence added to `run_all.py` and `scan_engine/pipeline.py`.
 
-Each cycle:
-- Owns its data
-- May not mutate prior cycles
-- May not infer missing historical state
+### 3. Orchestration Blind Spots
+Running pipelines via the UI used blocking `subprocess.run` calls without log streaming, leading to a "frozen" UI and hidden failures.
+*   **Status:** Fixed. Unified `core.runner` implemented with `st.status` log streaming.
 
-## 3. Cycle 1 — Perception (LOCKED)
+---
 
-### 3.1 Purpose
-Cycle 1 records the irreducible ground-zero state of broker-observed positions:
-- What exists
-- What it cost
-- How it is mechanically sensitive to the market
+## 🗺️ Implementation Roadmap
 
-It is a descriptive ledger, not an analytical engine.
+### Phase 1: Hardening the "Truth Layer" (Persistence)
+- [x] **Signal Migration:** Move all drift and risk signal calculations from `streamlit_app/` to `core/management/cycle2/`.
+- [x] **Unified Persistence (Management):** Persist Cycle 3 recommendations to DuckDB `management_recommendations` table.
+- [x] **Unified Persistence (Scan):** Persist Step 12 READY_NOW results to DuckDB `scan_results` table.
+- [x] **UI Migration:** Updated `manage_view.py` and `scan_view.py` to prefer DuckDB views (`v_latest_recommendations`, `v_latest_scan_results`) over CSV files.
+- [x] **Schema Enforcement:** Implemented strict data contracts in `core/shared/data_contracts/schema.py` where the UI only consumes pre-calculated "Evidence Packets."
 
-### 3.2 Allowed Data (Frozen)
+### Phase 2: Orchestration & Parity
+- [x] **Unified Orchestrator:** Created `core.runner` module that handles environment-agnostic execution for both CLI and UI.
+- [x] **Live Feedback:** Upgraded Scan, Management, and Snapshot trigger buttons to stream live logs using `st.status`.
+- [ ] **CLI/UI Parity:** Ensure the "Trust Audit" in the UI uses the exact same agent logic as the `cli/forensic_auditor.py`.
 
-**A. Identity Anchors (Frozen Once — “Birth Certificate”)**
-- Symbol (OCC string, canonical primary key)
-- Account
-- Quantity
-- Basis
-- Strike
-- Expiration
-- CallPut
-- Type (Cash / Margin)
+### Phase 3: Situational Awareness (The "Cockpit")
+- [x] **Cross-Cycle Simulation:** Added a "What-If" simulation cockpit to the Manage View using a new `SimulationEngine`.
+- [x] **Regime-Aware UI:** Integrated Market Stress Banners and Regime Stability metrics into the Risk View.
+- [ ] **Interactive Drift:** Replace static drift tables with interactive Plotly charts showing Greek decay vs. Price movement.
 
-*RAG Authority: McMillan (contract identity)*
+---
 
-**B. Sensitivity Anchors (Frozen Per Snapshot — “Vital Signs”)**
-- UL_Last
-- Last
-- Delta
-- Gamma
-- Vega
-- Theta
-- Rho
-- AsOf_Timestamp
+## 🎯 Trust Framework Definition
 
-*RAG Authority: Passarelli / Natenberg (P&L attribution)*
+### What "Trust" Is NOT in This System
 
-### 3.3 Explicitly Forbidden Data (Never Persisted)
-- Strategy labels
-- IV / IV Rank / Skew
-- DTE
-- Earnings proximity
-- Broker-calculated P&L ($G/L, %G/L)
-- Risk judgments
-- Liquidity metrics
-- Chart signals
-- Recommendations
-- Rationale
+Options trading is not a classification problem. It is a **distribution + sizing + path dependency problem**.
 
-**Rationale:**
-Any field that:
-- Compares timestamps
-- Requires inference
-- Introduces narrative
-belongs to a later cycle.
+Framing trust as a hit rate, scan accuracy %, or % profitable trades is structurally misleading:
+- Elite institutional systems with full feedback loops achieve only 60–65% directional accuracy and ~55% win rate
+- Stable Sharpe > 2 is rare even with those systems
+- Regime shifts break calibration; winners and losers cluster; tail risk dominates
 
-### 3.4 Freezing Semantics
-- Identity + Basis: Frozen once per TradeID
-- Market Sensitivities: Frozen per snapshot
-- No overwrites: Rehydration only
-- No inference: Missing data remains NULL
+### What "Trust" MEANS in This System
 
-### 3.5 Enforcement Mechanisms
-- Ingest whitelist (hard-fail on unknown columns)
-- Snapshot schema hash (detects phase creep)
-- Immutable DuckDB append-only ledger
-- Dashboard is strictly read-only
+This system is evolving from a **signal detector** → **doctrine enforcement engine**.
 
-### 3.6 Status
-🚫 **Cycle 1 is permanently LOCKED**
-Any modification requires:
-- Architecture audit
-- Version bump
-- Explicit roadmap update
+Trust = *the probability the engine prevents structural mistakes*, not *the probability a trade wins*.
 
-## 4. Cycle 2 — Drift (DESIGN PENDING)
+### The Three Trust Layers
 
-### 4.1 Purpose
-Cycle 2 measures how positions change over time relative to their frozen Cycle 1 anchors.
+| Layer | Definition | Target |
+|-------|-----------|--------|
+| **Layer 1 — Structural Validity** | How often does the scan admit only structurally coherent setups? (convexity gate, DTE correction, directional logic, pullback anchor, discrete contract awareness) | **90–95% (current focus)** |
+| **Layer 2 — EV Stability** | How stable is expected value across regimes? | Moderate — not a point metric |
+| **Layer 3 — Realized Win Rate** | Directional accuracy, regime-dependent | ~50–65% (regime-dependent) |
 
-It answers:
-- What changed?
-- Why did P&L change?
+The architecture is currently **correctly optimizing Layer 1**.
 
-It does not recommend actions.
+### What 90% Can Defensibly Mean
 
-### 4.2 Inputs (Read-Only)
-- All frozen Cycle 1 fields
+> "90% probability that the scan does not admit structurally invalid trades"
 
-### 4.3 Allowed Outputs (Mutable, Time-Series)
-- Price drift
-- Greek drift
-- Attribution deltas (Δ, Γ, Θ, V)
-- Time-indexed metrics
+This is a **quality gate metric**, not a performance metric. With the following completed fixes, the system is approaching this:
+- Convexity gate (Gamma_ROC_3D + Gamma threshold)
+- Single-contract roll path (trim-via-roll)
+- DTE correction (45 → 21 days)
+- Directional logic fixes (put intrinsic, Gate 2.5 direction)
+- Pullback anchor (EMA9 / SMA20 / Lower BB)
+- Forward expectancy gate (EV_Feasibility_Ratio)
+- Conviction decay timer (Delta_Deterioration_Streak)
+- IV-implied entry target (Price_Target_Entry freeze)
 
-### 4.4 Explicit Non-Goals
-- No freezing of Cycle 2 data
-- No strategy interpretation
-- No risk scoring
-- No recommendations
+### Why More Filters Are NOT the Answer
 
-### 4.5 Status
-🟡 **Architecture Definition In Progress**
-❌ Implementation forbidden until locked
+> More filters → overfit signal stack
+> Feedback loop → calibration + learning
 
-## 5. Cycle 3 — Decision (FUTURE)
+The closed-trade feedback loop is the **next correct build** — not more scan filters.
 
-### 5.1 Purpose
-Cycle 3 converts measured drift into actionable, rule-based recommendations.
+---
 
-Examples:
-- Hold
-- Trim
-- Exit
-- Hedge
-- Roll
+### Phase 4: Closed-Trade Feedback Loop (Next Build)
 
-### 5.2 Constraints
-- Must consume Cycle 2 outputs only
-- Must never mutate historical data
-- Must be explainable and rule-driven
+**Goal:** Enable Layer 2 (EV stability) and Layer 3 (win rate calibration) measurement.
 
-## 6. Global Architecture Laws
-- No cycle may mutate data owned by a prior cycle
-- No inferred historical data may be persisted
-- Observation ≠ Measurement ≠ Decision
-- All freezes must be explicit
-- All phase creep must hard-fail
+**What existed:** `core/_support/ml_training/collect_trades.py` detects closed trades. `feedback_engine.py` was already writing `closed_trades` (40 rows) and `doctrine_feedback` — but the feedback was not reaching the scan engine.
 
-## 7. RAG Canon (Non-Negotiable)
-- McMillan — Contract identity & mechanics
-- Hull — Economics & valuation neutrality
-- Passarelli / Natenberg — Greeks & attribution
-- Lean Data Mandate — Persist only what cannot be recreated
+**What was built (Feb 2026):**
 
-## 8. Change Control
-All changes require:
-- Section reference
-- Rationale
-- Version update
+- [x] **Outcome Writer:** `feedback_engine.py` → `closed_trades` table (40 rows) + `doctrine_feedback` (condition buckets by strategy × momentum state). Runs after every management cycle.
+- [x] **Calibration Reader:** `scan_engine/feedback_calibration.py` — reads `doctrine_feedback`, returns DQS multiplier for `(strategy, momentum_state)` bucket. Injected into `step12_acceptance.py` R3.2 after timing penalty. Graceful: DB failure → neutral (×1.0). Guarded: only adjusts when N ≥ 15.
+- [x] **Calibrated Confidence:** TIGHTEN → cap HIGH→MEDIUM; REINFORCE → promote MEDIUM→HIGH. `Calibrated_Confidence`, `Feedback_Win_Rate`, `Feedback_Sample_N`, `Feedback_Action`, `Feedback_Note` columns in `acceptance_all`.
+- [x] **Dashboard Feedback Row:** `scan_view.py` renders TIGHTEN as warning, REINFORCE as success. Silent when neutral.
+- [ ] **Calibration Activation:** All buckets currently INSUFFICIENT_SAMPLE (N < 15 — correct, data accumulating). Self-activates as `closed_trades` reaches ~15 outcomes per bucket. No code change needed.
 
-Silent evolution is forbidden
+**Why this matters:**
+- Enables regime adaptation (if LONG_PUT win rate drops in uptrend regime, score is penalized)
+- Enables strategy ranking (LEAPS vs short-DTE vs spreads — which works in which regime?)
+- Does NOT produce a "90% win rate" — produces **calibrated structural confidence** aligned with Layer 1
 
-**End of Roadmap**
+**Design constraint:** The feedback loop MUST be read-only in the scan engine. Scan confidence adjusts based on historical outcomes, but the scan does not retrain or overfit in real-time. Regime-specific lookback window: rolling 90 days.

@@ -11,7 +11,7 @@ import os
 # Add project root to path
 sys.path.insert(0, '/Users/haniabadi/Documents/Github/options')
 
-from core.scan_engine.step9b_fetch_contracts import _get_price_aware_liquidity_thresholds
+from scan_engine.step9b_fetch_contracts import _get_price_aware_liquidity_thresholds
 
 print("=" * 80)
 print("PRICE-AWARE LIQUIDITY TEST: BKNG vs AAPL")

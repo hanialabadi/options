@@ -10,7 +10,7 @@ warnings.filterwarnings('ignore')
 
 import pandas as pd
 import json
-from core.scan_engine.step9b_fetch_contracts import _select_credit_spread_strikes, _promote_best_strike
+from scan_engine.step9b_fetch_contracts import _select_credit_spread_strikes, _promote_best_strike
 
 def test_strike_promotion_in_contract_selection():
     """Test that contract selection returns promoted_strike field."""

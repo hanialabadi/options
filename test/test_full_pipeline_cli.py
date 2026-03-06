@@ -56,7 +56,7 @@ print("🔍 STEPS 3-6: SCAN ENGINE (REGIME → HV/IV → CROSSOVERS → GEM)")
 print("-"*100)
 
 try:
-    from core.scan_engine import (
+    from scan_engine import (
         step3_regime_context,
         step4_compute_hv_and_iv,
         step5_detect_crossovers,
@@ -115,7 +115,7 @@ print("💡 STEP 7: STRATEGY RECOMMENDATIONS")
 print("-"*100)
 
 try:
-    from core.scan_engine import step7_strategy_recommendation
+    from scan_engine import step7_strategy_recommendation
     
     df_step7 = step7_strategy_recommendation.recommend_strategies(df_test)
     
@@ -156,7 +156,7 @@ print("📅 STEP 9A: DETERMINE DTE TIMEFRAME")
 print("-"*100)
 
 try:
-    from core.scan_engine import step9a_determine_timeframe
+    from scan_engine import step9a_determine_timeframe
     
     df_step9a = step9a_determine_timeframe.determine_option_timeframe(df_step7)
     
@@ -198,7 +198,7 @@ print("⚠️  This may take 1-2 minutes due to API calls...")
 print()
 
 try:
-    from core.scan_engine import step9b_fetch_contracts
+    from scan_engine import step9b_fetch_contracts
     
     df_step9b = step9b_fetch_contracts.fetch_and_select_contracts(df_step9a)
     
@@ -264,7 +264,7 @@ print("🔍 STEP 10: PCS RECALIBRATION & FILTERING")
 print("-"*100)
 
 try:
-    from core.scan_engine import step10_pcs_recalibration
+    from scan_engine import step10_pcs_recalibration
     
     df_step10 = step10_pcs_recalibration.recalibrate_and_filter(df_step9b)
     
@@ -298,7 +298,7 @@ print("🎯 STEP 11: STRATEGY PAIRING & RANKING")
 print("-"*100)
 
 try:
-    from core.scan_engine import step11_strategy_pairing
+    from scan_engine import step11_strategy_pairing
     
     df_step11 = step11_strategy_pairing.compare_and_rank_strategies(
         df_step10,
@@ -345,7 +345,7 @@ print("✅ STEP 8: FINAL SELECTION & POSITION SIZING (AUDITABLE DECISIONS)")
 print("-"*100)
 
 try:
-    from core.scan_engine import step8_position_sizing
+    from scan_engine import step8_position_sizing
     
     df_step8 = step8_position_sizing.finalize_and_size_positions(
         df_step11,

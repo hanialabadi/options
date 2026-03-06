@@ -15,7 +15,7 @@ def evaluate_leg_status(df: pd.DataFrame, legs_dir: str = None) -> pd.DataFrame:
     # Use data_contracts if available, otherwise fall back
     if legs_dir is None:
         try:
-            from core.data_contracts import SNAPSHOT_DIR
+            from core.shared.data_contracts import SNAPSHOT_DIR
             legs_dir = os.path.join(SNAPSHOT_DIR, "legs")
         except ImportError:
             # Fallback for legacy compatibility

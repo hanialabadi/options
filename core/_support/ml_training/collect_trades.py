@@ -11,19 +11,20 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Optional
 import duckdb
+from core.shared.data_contracts.config import POSITIONS_HISTORY_DB_PATH
 
 logger = logging.getLogger(__name__)
 
 
 def collect_completed_trades(
-    db_path: str,
+    db_path: Path = None,
     lookback_days: int = 90
 ) -> pd.DataFrame:
     """
     Collect completed trades from historical snapshots.
-    
+
     Args:
-        db_path: Path to positions_history.duckdb
+        db_path: Path to positions_history.duckdb (defaults to POSITIONS_HISTORY_DB_PATH from config)
         lookback_days: How far back to search for completed trades
         
     Returns:
@@ -34,8 +35,11 @@ def collect_completed_trades(
         - OR Quantity = 0 in latest snapshot
         - OR Exit_Date is populated
     """
+    if db_path is None:
+        db_path = POSITIONS_HISTORY_DB_PATH
+
     try:
-        con = duckdb.connect(db_path, read_only=True)
+        con = duckdb.connect(str(db_path), read_only=True)
         
         # Get latest snapshot date
         latest_date = con.execute("""
