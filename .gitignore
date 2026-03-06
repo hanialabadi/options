@@ -37,3 +37,27 @@ exports/
 # ---- Chrome / misc ----
 .chrome_fidauto/
 
+# ---- Pipeline outputs (regenerated each run) ----
+output/
+json/
+chunks/
+
+# ---- Archive (old scripts, debug artifacts) ----
+archive/
+
+# ---- Reference books (too large for git, ~410MB) ----
+core/_support/knowloadge/
+
+# ---- RAG chunks (regenerated from books) ----
+knowledge/chunks/
+
+# ---- Per-ticker audit traces ----
+audit_trace/*_trace.csv
+
+# ---- Local environment ----
+.envrc
+.python-version
+
+# ---- Claude session memory ----
+memory/
+
