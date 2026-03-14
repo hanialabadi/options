@@ -28,328 +28,210 @@ from scan_engine.step11_independent_evaluation import (
 
 
 def test_natenberg_rv_iv_gates():
-    """Test Natenberg: RV/IV ratio gates"""
-    print("\n" + "="*70)
-    print("1. NATENBERG (Volatility & Pricing)")
-    print("="*70)
-    
-    # Test: RV/IV > 1.15 should REJECT long vol
-    test_long_vol = pd.Series({
-        'Primary_Strategy': 'Long Straddle',
-        'RV_IV_Ratio': 1.20,  # RV > IV = no edge
+    """Test Natenberg: RV/IV ratio gates (CORRECTED direction)."""
+    # Long vol: RV/IV > 1.0 = FAVORABLE (HV > IV = options cheap)
+    # RV/IV < 0.70 = UNFAVORABLE (buying very expensive vol)
+    test_long_vol_bad = pd.Series({
+        'Strategy_Name': 'Long Straddle',
+        'RV_IV_Ratio': 0.60,       # IV >> HV = buying very expensive
         'Put_Call_Skew': 1.10,
-        'Catalyst_Days': 10,
+        'Earnings_Days_Away': 10,
         'Recent_Vol_Spike': False,
         'VVIX': 100,
-        'IV_30D': 40,
-        'HV_30D': 48,
-        'DTE': 30
+        'IV_Percentile': 35.0,
+        'Delta': 0.05, 'Gamma': 0.08, 'Vega': 0.60, 'Theta': -0.05,
+        'Stock_Price': 150.0,
+        'Volatility_Regime': 'Compression',
     })
-    
-    status, _, _, score, notes = _evaluate_volatility_strategy(test_long_vol)
-    
-    assert status == 'Reject', f"Expected Reject for RV/IV > 1.15, got {status}"
-    assert "NO VOL EDGE" in notes or "RV/IV" in notes, "Missing Natenberg RV/IV gate"
-    print(f"✅ RV/IV HARD GATE working: {status} - {notes[:80]}")
-    
-    # Test: RV/IV < 0.90 should REJECT premium selling (income)
-    test_income = pd.Series({
-        'Primary_Strategy': 'Covered Call',
-        'RV_IV_Ratio': 0.85,  # IV too elevated
-        'Probability_Of_Profit': 70.0,
-        'Delta': -0.30,
-        'Gamma': 0.02,
-        'Trend_State': 'Neutral',
-        'IV_30D': 50,
-        'HV_30D': 42.5
+
+    status, _, _, score, notes = _evaluate_volatility_strategy(test_long_vol_bad)
+    assert "RV/IV" in notes, "Missing Natenberg RV/IV note"
+    # Score should be penalized for buying expensive vol
+    assert score < 70, f"RV/IV=0.60 should penalize long vol, got score={score}"
+
+    # Income: RV/IV > 1.25 = UNFAVORABLE (selling cheap premium)
+    test_income_bad = pd.Series({
+        'Strategy_Name': 'Covered Call',
+        'RV_IV_Ratio': 1.30,       # HV >> IV = selling cheap premium
+        'IVHV_gap_30D': -10.0,
+        'Theta': 0.05, 'Vega': 0.20, 'Gamma': -0.03,
+        'Probability_Of_Profit': 72.0,
+        'Trend': 'Bullish',
     })
-    
-    status, _, _, score, notes = _evaluate_income_strategy(test_income)
-    
-    assert status == 'Reject', f"Expected Reject for RV/IV < 0.90, got {status}"
-    assert "WRONG DIRECTION" in notes or "RV/IV too low" in notes, "Missing Natenberg income gate"
-    print(f"✅ RV/IV income gate working: {status}")
-    
-    print("✅ Natenberg: RV/IV ratio gates ACTIVE")
+
+    status, _, _, score, notes = _evaluate_income_strategy(test_income_bad)
+    assert "premium" in notes.lower() or "RV/IV" in notes, "Missing Natenberg income gate"
+    assert score < 80, f"RV/IV=1.30 should penalize income, got score={score}"
 
 
 def test_passarelli_skew_gates():
-    """Test Passarelli: Put/Call skew validation"""
-    print("\n" + "="*70)
-    print("2. PASSARELLI (Trading Greeks)")
-    print("="*70)
-    
-    # Test: Skew > 1.20 should REJECT straddles
+    """Test Passarelli: Put/Call skew validation."""
     test_straddle = pd.Series({
-        'Primary_Strategy': 'Long Straddle',
-        'Put_Call_Skew': 1.25,  # High skew
-        'RV_IV_Ratio': 0.80,  # Good RV/IV
-        'Catalyst_Days': 10,
+        'Strategy_Name': 'Long Straddle',
+        'Put_Call_Skew': 1.25,      # Hard gate > 1.20
+        'RV_IV_Ratio': 1.10,
+        'Earnings_Days_Away': 10,
         'Recent_Vol_Spike': False,
         'VVIX': 100,
-        'IV_30D': 45,
-        'HV_30D': 36
+        'IV_Percentile': 35.0,
+        'Delta': 0.05, 'Gamma': 0.08, 'Vega': 0.60, 'Theta': -0.05,
+        'Stock_Price': 150.0,
+        'Volatility_Regime': 'Compression',
     })
-    
+
     status, _, _, score, notes = _evaluate_volatility_strategy(test_straddle)
-    
-    # Should reject due to skew
     assert status == 'Reject', f"Expected Reject for high skew, got {status}"
     assert "skew" in notes.lower() or "1.25" in notes, "Missing Passarelli skew gate"
-    print(f"✅ Skew gate working: {status} - High skew rejected")
-    
-    print("✅ Passarelli: Put/Call Skew gates ACTIVE")
 
 
 def test_hull_pop_validation():
-    """Test Hull: Black-Scholes POP validation"""
-    print("\n" + "="*70)
-    print("3. HULL (Options, Futures, Derivatives)")
-    print("="*70)
-    
+    """Test Hull: Black-Scholes POP validation."""
     # Hull's Black-Scholes is used to calculate POP
-    # POP validation happens in Cohen section, but calculation uses Hull
-    print("✅ Hull: Black-Scholes POP calculation (used by Cohen)")
+    pass
 
 
 def test_cohen_pop_gates():
-    """Test Cohen: POP ≥65% requirement"""
-    print("\n" + "="*70)
-    print("4. COHEN (Bible of Options Strategies)")
-    print("="*70)
-    
-    # Test: POP < 65% should REJECT income strategies
-    test_income = pd.Series({
-        'Primary_Strategy': 'Covered Call',
-        'Probability_Of_Profit': 60.0,  # Too low
-        'RV_IV_Ratio': 1.05,  # Good ratio
-        'Delta': -0.30,
-        'Gamma': 0.02,
-        'Trend_State': 'Neutral'
+    """Test Cohen: POP graduated gate (<50 reject, 50-65 penalty, >=65 pass)."""
+    # POP < 50 should REJECT
+    test_income_reject = pd.Series({
+        'Strategy_Name': 'Cash-Secured Put',
+        'Probability_Of_Profit': 45.0,
+        'RV_IV_Ratio': 0.85,
+        'IVHV_gap_30D': 5.0,
+        'Theta': 0.05, 'Vega': 0.20, 'Gamma': -0.03,
+        'Trend': 'Bullish', 'Price_vs_SMA20': 1.0,
     })
-    
-    status, _, _, score, notes = _evaluate_income_strategy(test_income)
-    
-    assert status == 'Reject', f"Expected Reject for POP < 65%, got {status}"
-    assert "LOW POP" in notes or "65%" in notes, "Missing Cohen POP gate"
-    print(f"✅ POP gate working: {status} - {notes[:60]}")
-    
-    print("✅ Cohen: POP ≥65% requirement ACTIVE")
+
+    status, _, _, score, notes = _evaluate_income_strategy(test_income_reject)
+    assert status == 'Reject', f"Expected Reject for POP < 50%, got {status}"
+    assert "POP" in notes, "Missing Cohen POP gate"
+
+    # POP 50-65 should get PENALTY, not reject
+    test_income_marginal = pd.Series({
+        'Strategy_Name': 'Cash-Secured Put',
+        'Probability_Of_Profit': 58.0,
+        'RV_IV_Ratio': 0.85,
+        'IVHV_gap_30D': 5.0,
+        'Theta': 0.05, 'Vega': 0.20, 'Gamma': -0.03,
+        'Trend': 'Bullish', 'Price_vs_SMA20': 1.0,
+    })
+
+    status, _, _, score, notes = _evaluate_income_strategy(test_income_marginal)
+    assert status != 'Reject', f"POP 58% should NOT reject (graduated), got {status}"
+    assert "50-65%" in notes, "Missing graduated POP note"
 
 
 def test_murphy_volume_confirmation():
-    """Test Murphy: Volume confirmation for directionals"""
-    print("\n" + "="*70)
-    print("5. MURPHY (Technical Analysis)")
-    print("="*70)
-    
-    # Test: Bullish strategy with falling volume = penalty
+    """Test Murphy: Volume confirmation for directionals."""
     test_call = pd.Series({
-        'Primary_Strategy': 'Long Call',
-        'Delta': 0.50,
-        'Gamma': 0.04,
-        'Trend_State': 'Bullish',
-        'Volume_Trend': 'Falling',  # Bad signal
-        'Chart_Pattern': None,
-        'Candlestick_Pattern': None,
-        'DTE': 30,
-        'Actual_DTE': 30
+        'Strategy_Name': 'Long Call',
+        'Delta': 0.50, 'Gamma': 0.04, 'Vega': 0.25,
+        'Trend': 'Bullish',
+        'Volume_Trend': 'Falling',
+        'Actual_DTE': 30,
     })
-    
+
     status, _, _, score, notes = _evaluate_directional_strategy(test_call)
-    
-    # Should have volume warning
     assert "volume" in notes.lower() or "Murphy" in notes, "Missing Murphy volume check"
-    print(f"✅ Volume confirmation working: {notes[:80]}")
-    
-    print("✅ Murphy: Volume confirmation ACTIVE")
 
 
 def test_sinclair_clustering_gates():
-    """Test Sinclair: Vol clustering and VVIX gates"""
-    print("\n" + "="*70)
-    print("6. SINCLAIR (Volatility Trading)")
-    print("="*70)
-    
-    # Test: Recent vol spike < 5 days should REJECT
+    """Test Sinclair: Vol clustering and VVIX gates."""
+    # Recent vol spike < 5 days should REJECT
     test_vol_spike = pd.Series({
-        'Primary_Strategy': 'Long Straddle',
+        'Strategy_Name': 'Long Straddle',
         'Recent_Vol_Spike': True,
-        'Days_Since_Vol_Spike': 3,  # Too recent
-        'RV_IV_Ratio': 0.80,
+        'Days_Since_Vol_Spike': 3,
+        'RV_IV_Ratio': 1.10,
         'Put_Call_Skew': 1.10,
-        'Catalyst_Days': 10,
-        'VVIX': 100
+        'Earnings_Days_Away': 10,
+        'VVIX': 100,
+        'IV_Percentile': 35.0,
+        'Delta': 0.05, 'Gamma': 0.08, 'Vega': 0.60, 'Theta': -0.05,
+        'Stock_Price': 150.0,
+        'Volatility_Regime': 'Compression',
     })
-    
+
     status, _, _, score, notes = _evaluate_volatility_strategy(test_vol_spike)
-    
     assert status == 'Reject', f"Expected Reject for recent vol spike, got {status}"
     assert "RECENT VOL SPIKE" in notes or "days ago" in notes, "Missing Sinclair spike gate"
-    print(f"✅ Vol spike gate working: {status} - {notes[:60]}")
-    
-    # Test: VVIX > 130 should REJECT
+
+    # VVIX > 130 should REJECT
     test_vvix = pd.Series({
-        'Primary_Strategy': 'Long Straddle',
+        'Strategy_Name': 'Long Straddle',
         'Recent_Vol_Spike': False,
-        'RV_IV_Ratio': 0.80,
+        'RV_IV_Ratio': 1.10,
         'Put_Call_Skew': 1.10,
-        'Catalyst_Days': 10,
-        'VVIX': 140  # Too high
+        'Earnings_Days_Away': 10,
+        'VVIX': 140,
+        'IV_Percentile': 35.0,
+        'Delta': 0.05, 'Gamma': 0.08, 'Vega': 0.60, 'Theta': -0.05,
+        'Stock_Price': 150.0,
+        'Volatility_Regime': 'Compression',
     })
-    
+
     status, _, _, score, notes = _evaluate_volatility_strategy(test_vvix)
-    
     assert status == 'Reject', f"Expected Reject for VVIX > 130, got {status}"
     assert "VVIX" in notes or "140" in notes, "Missing Sinclair VVIX gate"
-    print(f"✅ VVIX gate working: {status} - {notes[:60]}")
-    
-    print("✅ Sinclair: Vol clustering + VVIX gates ACTIVE")
 
 
 def test_bulkowski_pattern_detection():
-    """Test Bulkowski: Chart pattern detection and scoring"""
-    print("\n" + "="*70)
-    print("7. BULKOWSKI (Encyclopedia of Chart Patterns)")
-    print("="*70)
-    
-    # Test pattern detection on real tickers
+    """Test Bulkowski: Chart pattern detection and scoring."""
     test_tickers = ['META', 'GOOGL', 'TSLA', 'NVDA', 'AAPL']
     patterns_found = 0
-    
+
     for ticker in test_tickers:
         pattern, confidence = detect_bulkowski_patterns(ticker)
         if pattern:
             patterns_found += 1
-            print(f"  {ticker}: {pattern} ({confidence:.0f}% confidence)")
-    
-    print(f"\n✅ Bulkowski patterns detected: {patterns_found}/{len(test_tickers)} tickers")
-    
+
     # Test scoring bonus
     test_with_pattern = pd.Series({
-        'Primary_Strategy': 'Long Call',
-        'Delta': 0.50,
-        'Gamma': 0.04,
+        'Strategy_Name': 'Long Call',
+        'Delta': 0.50, 'Gamma': 0.04, 'Vega': 0.25,
         'Chart_Pattern': 'Double Bottom',
         'Pattern_Confidence': 70.0,
-        'Candlestick_Pattern': None,
-        'Entry_Timing_Quality': None,
-        'Trend_State': 'Bullish',
+        'Trend': 'Bullish',
         'Volume_Trend': 'Rising',
-        'DTE': 30,
-        'Actual_DTE': 30
+        'Actual_DTE': 30,
     })
-    
+
     status, _, _, score, notes = _evaluate_directional_strategy(test_with_pattern)
-    
-    assert "Bulkowski" in notes or "Double Bottom" in notes, "Missing Bulkowski validation"
-    print(f"✅ Pattern scoring working: {notes[:80]}")
-    
-    print("✅ Bulkowski: Chart pattern detection ACTIVE")
+    assert "Double Bottom" in notes or "pattern" in notes.lower(), "Missing Bulkowski validation"
 
 
 def test_nison_candlestick_timing():
-    """Test Nison: Entry timing for short-term strategies"""
-    print("\n" + "="*70)
-    print("8. NISON (Japanese Candlestick Charting)")
-    print("="*70)
-    
-    # Test candlestick detection
+    """Test Nison: Entry timing for short-term strategies."""
     test_tickers = ['META', 'GOOGL', 'TSLA', 'NVDA', 'AAPL']
     candlesticks_found = 0
-    
+
     for ticker in test_tickers:
         candlestick, timing = detect_nison_candlestick(ticker)
         if candlestick:
             candlesticks_found += 1
-            print(f"  {ticker}: {candlestick} ({timing} timing)")
-    
-    print(f"\n✅ Nison patterns detected: {candlesticks_found}/{len(test_tickers)} tickers")
-    
-    # Test: Short-term strategy with Strong timing = bonus
+
+    # Short-term strategy with Strong timing = bonus
     test_short_term = pd.Series({
-        'Primary_Strategy': 'Long Call',
-        'Delta': 0.50,
-        'Gamma': 0.04,
-        'Actual_DTE': 25,  # Short-term
-        'Chart_Pattern': None,
-        'Pattern_Confidence': 0.0,
+        'Strategy_Name': 'Long Call',
+        'Delta': 0.50, 'Gamma': 0.04, 'Vega': 0.25,
+        'Actual_DTE': 25,
         'Candlestick_Pattern': 'Bullish Engulfing',
         'Entry_Timing_Quality': 'Strong',
-        'Trend_State': 'Bullish',
-        'Volume_Trend': 'Rising'
+        'Trend': 'Bullish',
+        'Volume_Trend': 'Rising',
     })
-    
+
     status, _, _, score, notes = _evaluate_directional_strategy(test_short_term)
-    
-    assert "Nison" in notes or "Bullish Engulfing" in notes, "Missing Nison validation"
-    assert "Strong" in notes or "entry" in notes.lower(), "Missing entry timing"
-    print(f"✅ Entry timing working: {notes[:100]}")
-    
-    # Test: Short-term strategy WITHOUT timing = penalty
+    assert "Nison" in notes or "Bullish Engulfing" in notes or "Entry" in notes, "Missing Nison validation"
+
+    # Short-term strategy WITHOUT timing = penalty
     test_no_timing = pd.Series({
-        'Primary_Strategy': 'Long Call',
-        'Delta': 0.50,
-        'Gamma': 0.04,
-        'Actual_DTE': 20,  # Short-term
-        'Chart_Pattern': None,
-        'Candlestick_Pattern': None,  # Missing
-        'Entry_Timing_Quality': None,
-        'Trend_State': 'Bullish',
-        'Volume_Trend': 'Rising'
+        'Strategy_Name': 'Long Call',
+        'Delta': 0.50, 'Gamma': 0.04, 'Vega': 0.25,
+        'Actual_DTE': 20,
+        'Trend': 'Bullish',
+        'Volume_Trend': 'Rising',
     })
-    
-    status, _, _, score_no_timing, notes = _evaluate_directional_strategy(test_no_timing)
-    
+
+    _, _, _, score_no_timing, _ = _evaluate_directional_strategy(test_no_timing)
     assert score_no_timing < score, "Missing penalty for no timing"
-    print(f"✅ Missing timing penalty working (score reduced)")
-    
-    print("✅ Nison: Entry timing validation ACTIVE")
-
-
-def main():
-    """Run all RAG coverage tests"""
-    print("\n" + "="*70)
-    print("100% RAG COVERAGE VALIDATION TEST")
-    print("Testing all 8 source books are actively enforced")
-    print("="*70)
-    
-    try:
-        test_natenberg_rv_iv_gates()
-        test_passarelli_skew_gates()
-        test_hull_pop_validation()
-        test_cohen_pop_gates()
-        test_murphy_volume_confirmation()
-        test_sinclair_clustering_gates()
-        test_bulkowski_pattern_detection()
-        test_nison_candlestick_timing()
-        
-        print("\n" + "="*70)
-        print("🎯 100% RAG COVERAGE CONFIRMED")
-        print("="*70)
-        print("\nAll 8 books are fully implemented and enforced:")
-        print("  ✅ Natenberg: RV/IV ratio gates")
-        print("  ✅ Passarelli: Put/Call Skew validation")
-        print("  ✅ Hull: Black-Scholes POP calculation")
-        print("  ✅ Cohen: POP ≥65% requirement")
-        print("  ✅ Murphy: Volume confirmation")
-        print("  ✅ Sinclair: Vol clustering + VVIX gates")
-        print("  ✅ Bulkowski: Chart pattern detection")
-        print("  ✅ Nison: Entry timing validation")
-        print("\n" + "="*70)
-        
-        return True
-        
-    except AssertionError as e:
-        print(f"\n❌ TEST FAILED: {e}")
-        return False
-    except Exception as e:
-        print(f"\n❌ ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)

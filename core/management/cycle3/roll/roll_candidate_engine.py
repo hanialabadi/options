@@ -82,6 +82,139 @@ _ROLL_MODE_EMERGENCY       = "EMERGENCY"         # delta > 0.70
 _ROLL_MODE_WEEKLY          = "WEEKLY"            # fragile: BROKEN or WEAKENING + earnings ≤45d
 _ROLL_MODE_BROKEN_RECOVERY = "BROKEN_RECOVERY"   # BROKEN + gamma dominant + IV < HV
 _ROLL_MODE_INCOME_SAME     = "INCOME_SAME"       # SIDEWAYS_INCOME: prefer same-strike credit rolls
+_ROLL_MODE_BASIS_REDUCTION = "BASIS_REDUCTION"   # Approaching hard stop: roll DOWN to tighter strike
+_ROLL_MODE_RECOVERY_PREMIUM = "RECOVERY_PREMIUM"  # Doctrine_State=RECOVERY_PREMIUM: max premium cycling for basis reduction
+
+# ── Roll trigger classification ──────────────────────────────────────────────
+# WHY the engine is rolling — passed from doctrine via Winning_Gate column.
+# This gives the scorer explicit context for what matters most in candidate
+# selection. Without this, the scorer infers mode from delta/drift/equity
+# integrity, which misses doctrine-level intent.
+#
+# Each trigger adjusts the 5-component scoring weights:
+#   delta(25%), yield(25%), dte(20%), liquidity(20%), iv(10%)  ← defaults
+# and may apply trigger-specific bonuses/penalties.
+
+ROLL_TRIGGER_INCOME_GATE    = "INCOME_GATE"       # 21-DTE income capture
+ROLL_TRIGGER_PREMIUM_CAPTURE = "PREMIUM_CAPTURE"  # 50%+ premium earned → cycle
+ROLL_TRIGGER_ASSIGNMENT_DEFENSE = "ASSIGNMENT_DEFENSE"  # ITM/ATM delta → rescue
+ROLL_TRIGGER_HARD_STOP      = "HARD_STOP"         # approaching/breached hard stop
+ROLL_TRIGGER_EARNINGS        = "EARNINGS"          # earnings approaching → reduce risk
+ROLL_TRIGGER_GAMMA_DANGER    = "GAMMA_DANGER"      # gamma dominance
+ROLL_TRIGGER_DIVIDEND        = "DIVIDEND"          # dividend assignment risk
+ROLL_TRIGGER_RECOVERY        = "RECOVERY"          # moderate recovery roll-down
+ROLL_TRIGGER_STRUCTURAL      = "STRUCTURAL"        # structural fragility
+ROLL_TRIGGER_DISCRETIONARY   = "DISCRETIONARY"     # no special context — generic
+
+# Map doctrine Winning_Gate names → roll trigger categories
+_GATE_TO_TRIGGER = {
+    # Income cycle gates
+    "income_gate_21dte": ROLL_TRIGGER_INCOME_GATE,
+    "income_gate_dte": ROLL_TRIGGER_INCOME_GATE,
+    "cc_income_21_dte": ROLL_TRIGGER_INCOME_GATE,
+    "short_expiration": ROLL_TRIGGER_INCOME_GATE,
+    # Premium capture
+    "premium_capture_50": ROLL_TRIGGER_PREMIUM_CAPTURE,
+    "premium_capture": ROLL_TRIGGER_PREMIUM_CAPTURE,
+    "natural_cycle_roll": ROLL_TRIGGER_PREMIUM_CAPTURE,
+    # Assignment defense
+    "itm_late_lifecycle_roll": ROLL_TRIGGER_ASSIGNMENT_DEFENSE,
+    "atm_late_lifecycle_roll": ROLL_TRIGGER_ASSIGNMENT_DEFENSE,
+    "itm_assignment_defense": ROLL_TRIGGER_ASSIGNMENT_DEFENSE,
+    "deep_itm_rescue": ROLL_TRIGGER_ASSIGNMENT_DEFENSE,
+    "assignment_defense": ROLL_TRIGGER_ASSIGNMENT_DEFENSE,
+    # Hard stop
+    "approaching_hard_stop_roll": ROLL_TRIGGER_HARD_STOP,
+    "hard_stop_approaching": ROLL_TRIGGER_HARD_STOP,
+    # Earnings
+    "earnings_approaching": ROLL_TRIGGER_EARNINGS,
+    "earnings_approaching_roll": ROLL_TRIGGER_EARNINGS,
+    "pre_earnings_roll": ROLL_TRIGGER_EARNINGS,
+    # Gamma
+    "gamma_danger_zone": ROLL_TRIGGER_GAMMA_DANGER,
+    "gamma_dominant_roll": ROLL_TRIGGER_GAMMA_DANGER,
+    # Dividend
+    "dividend_assignment_risk": ROLL_TRIGGER_DIVIDEND,
+    "dividend_risk_roll": ROLL_TRIGGER_DIVIDEND,
+    # Recovery
+    "moderate_recovery_roll_down": ROLL_TRIGGER_RECOVERY,
+    "basis_reduction_roll": ROLL_TRIGGER_RECOVERY,
+    "strike_below_basis": ROLL_TRIGGER_RECOVERY,
+    "strike_below_basis_mild": ROLL_TRIGGER_RECOVERY,
+    "assignment_at_loss": ROLL_TRIGGER_RECOVERY,
+    "expiration_itm": ROLL_TRIGGER_RECOVERY,
+    "expiration_otm": ROLL_TRIGGER_RECOVERY,
+    # Structural
+    "structural_fragility_roll": ROLL_TRIGGER_STRUCTURAL,
+    "equity_integrity_roll": ROLL_TRIGGER_STRUCTURAL,
+}
+
+# Per-trigger scoring weight adjustments (delta, yield, dte, liquidity, iv)
+# Values are multipliers on the default weights (1.0 = no change).
+_TRIGGER_WEIGHT_ADJUSTMENTS = {
+    ROLL_TRIGGER_INCOME_GATE: {
+        # Income cycle: yield matters most, delta secondary
+        "yield_w": 1.4, "delta_w": 0.8, "dte_w": 1.0, "liq_w": 1.0, "iv_w": 0.8,
+    },
+    ROLL_TRIGGER_PREMIUM_CAPTURE: {
+        # Premium captured: yield is the goal, accept wider delta
+        "yield_w": 1.5, "delta_w": 0.7, "dte_w": 1.0, "liq_w": 1.0, "iv_w": 0.8,
+    },
+    ROLL_TRIGGER_ASSIGNMENT_DEFENSE: {
+        # Delta reduction is critical; yield secondary
+        "yield_w": 0.6, "delta_w": 1.6, "dte_w": 1.0, "liq_w": 1.0, "iv_w": 0.8,
+    },
+    ROLL_TRIGGER_HARD_STOP: {
+        # Survival: delta + DTE flexibility, yield less important
+        "yield_w": 0.5, "delta_w": 1.4, "dte_w": 1.3, "liq_w": 1.0, "iv_w": 0.8,
+    },
+    ROLL_TRIGGER_EARNINGS: {
+        # Get short exposure off the table: DTE matters, avoid earnings window
+        "yield_w": 0.8, "delta_w": 1.0, "dte_w": 1.5, "liq_w": 1.0, "iv_w": 0.7,
+    },
+    ROLL_TRIGGER_GAMMA_DANGER: {
+        # Extend DTE to reduce gamma drag; delta secondary
+        "yield_w": 0.7, "delta_w": 0.8, "dte_w": 1.6, "liq_w": 1.0, "iv_w": 0.9,
+    },
+    ROLL_TRIGGER_DIVIDEND: {
+        # Avoid assignment: DTE beyond ex-div, delta secondary
+        "yield_w": 0.8, "delta_w": 1.2, "dte_w": 1.2, "liq_w": 1.0, "iv_w": 0.8,
+    },
+    ROLL_TRIGGER_RECOVERY: {
+        # Basis reduction: yield paramount, accept tighter strikes
+        "yield_w": 1.5, "delta_w": 0.7, "dte_w": 0.8, "liq_w": 1.0, "iv_w": 1.0,
+    },
+    ROLL_TRIGGER_STRUCTURAL: {
+        # Structural: DTE flexibility, cautious on everything else
+        "yield_w": 0.7, "delta_w": 1.0, "dte_w": 1.5, "liq_w": 1.0, "iv_w": 0.8,
+    },
+    ROLL_TRIGGER_DISCRETIONARY: {
+        # Default: balanced
+        "yield_w": 1.0, "delta_w": 1.0, "dte_w": 1.0, "liq_w": 1.0, "iv_w": 1.0,
+    },
+}
+
+
+def _classify_roll_trigger(winning_gate: str) -> str:
+    """Map doctrine Winning_Gate to roll trigger category."""
+    if not winning_gate:
+        return ROLL_TRIGGER_DISCRETIONARY
+    gate_lower = winning_gate.lower().strip()
+    # Exact match first
+    if gate_lower in _GATE_TO_TRIGGER:
+        return _GATE_TO_TRIGGER[gate_lower]
+    # Substring match fallback — gate names may have suffixes/prefixes
+    for pattern, trigger in _GATE_TO_TRIGGER.items():
+        if pattern in gate_lower or gate_lower in pattern:
+            return trigger
+    return ROLL_TRIGGER_DISCRETIONARY
+
+
+def _get_trigger_weights(roll_trigger: str) -> dict:
+    """Return scoring weight adjustments for the given roll trigger."""
+    return _TRIGGER_WEIGHT_ADJUSTMENTS.get(
+        roll_trigger, _TRIGGER_WEIGHT_ADJUSTMENTS[ROLL_TRIGGER_DISCRETIONARY]
+    )
 
 # ── Strategy roll configuration ───────────────────────────────────────────────
 
@@ -198,8 +331,48 @@ _ROLL_DELTA_TARGETS_INCOME_SAME: Dict[str, Tuple[float, float]] = {
     "CSP":           (-0.55, -0.15),
 }
 
-# How many candidates to return
-_TOP_N = 3
+# BASIS_REDUCTION mode — approaching hard stop: roll DOWN to tighter strike.
+# Allows same-expiry candidates (no DTE > current_dte constraint).
+# Stock has drifted significantly — far-OTM call is dead weight, need to roll
+# to a strike that generates meaningful premium for basis recovery.
+# McMillan Ch.3: "Roll down to recycle premium when OTM call is earning nothing."
+_ROLL_DTE_WINDOWS_BASIS_REDUCTION: Dict[str, Tuple[int, int, int]] = {
+    "BUY_WRITE":     (21, 90,  45),   # Accept same-expiry or one cycle out
+    "COVERED_CALL":  (21, 90,  45),
+    "SHORT_PUT":     (21, 60,  45),
+    "CSP":           (21, 60,  45),
+}
+
+_ROLL_DELTA_TARGETS_BASIS_REDUCTION: Dict[str, Tuple[float, float]] = {
+    "BUY_WRITE":     (0.25, 0.45),   # Tighter strike: more premium, more extrinsic
+    "COVERED_CALL":  (0.25, 0.45),
+    "SHORT_PUT":     (-0.45, -0.20),
+    "CSP":           (-0.45, -0.20),
+}
+
+# RECOVERY_PREMIUM mode — Doctrine_State=RECOVERY_PREMIUM: damaged buy-write
+# optimizing multi-cycle basis reduction. Short cycles (14-45 DTE) maximize
+# premium cycling frequency. No above-basis filter — stock is far below basis,
+# all reasonable OTM strikes are valid.
+# Jabbour Ch.4: "In repair mode, premium collection frequency is the recovery
+# driver — shorter cycles compound faster and allow strike re-optimization."
+_ROLL_DTE_WINDOWS_RECOVERY_PREMIUM: Dict[str, Tuple[int, int, int]] = {
+    "BUY_WRITE":     (14, 45,  30),   # 2-6 week cycles for maximum premium frequency
+    "COVERED_CALL":  (14, 45,  30),
+    "SHORT_PUT":     (14, 45,  30),
+    "CSP":           (14, 45,  30),
+}
+
+_ROLL_DELTA_TARGETS_RECOVERY_PREMIUM: Dict[str, Tuple[float, float]] = {
+    "BUY_WRITE":     (0.25, 0.45),   # OTM: maximize premium without inviting assignment
+    "COVERED_CALL":  (0.25, 0.45),
+    "SHORT_PUT":     (-0.45, -0.25),
+    "CSP":           (-0.45, -0.25),
+}
+
+# How many candidates to return (heuristic shortlist).
+# MC rerank (in mc_management.py) reduces these to the best 3 by EV.
+_TOP_N = 5
 
 # Schwab call throttle
 _CHAIN_DELAY_SEC = 0.5
@@ -213,8 +386,9 @@ def find_roll_candidates(
 ) -> pd.DataFrame:
     """
     For every row where Action=ROLL (or covered by action_mask), fetch the chain
-    and attach top-3 roll candidates as Roll_Candidate_1 / Roll_Candidate_2 /
-    Roll_Candidate_3 JSON columns.
+    and attach up to 5 heuristic-shortlisted roll candidates as
+    Roll_Candidate_1 through Roll_Candidate_5 JSON columns.
+    MC rerank (run_management_mc) later reduces these to the best 3 by EV.
 
     action_mask: optional boolean Series override — use when pre-staging candidates
         for HOLD rows with active blocking conditions (dead_cat_bounce, iv_depressed)
@@ -232,10 +406,12 @@ def find_roll_candidates(
         return df
 
     # Ensure output columns exist
-    for i in (1, 2, 3):
+    for i in range(1, _TOP_N + 1):
         col = f"Roll_Candidate_{i}"
         if col not in df.columns:
             df[col] = None
+    if "Roll_Split_Suggestion" not in df.columns:
+        df["Roll_Split_Suggestion"] = None
 
     session_cache = session_chain_cache or {}
     option_roll_rows = df[roll_mask & (df["AssetType"] == "OPTION")]
@@ -315,12 +491,25 @@ def find_roll_candidates(
         strategy_key = _strategy_key(strategy, dte)
 
         # ── Roll mode detection ────────────────────────────────────────────────
-        # The current position's delta determines WHICH search mode to use.
-        # This is the core architectural split: pre-ITM is optimization mode
-        # (credit-first, standard DTE); emergency is rescue mode (extended DTE,
-        # above-basis hard filter, may produce no-viable-roll verdict).
+        # Recovery Premium Mode override: when doctrine has determined the position
+        # is in recovery premium mode, skip delta-based mode selection entirely.
+        # The normal delta-based modes (EMERGENCY, PRE_ITM) apply filters that
+        # are wrong for recovery: EMERGENCY hard-filters above-basis strikes,
+        # which is impossible when stock is far below basis ($6 stock, $17 basis).
+        # Recovery premium optimizes for premium cycling frequency, not strike
+        # placement relative to an unreachable basis.
+        # Jabbour Ch.4: "Recovery is about premium collection frequency, not
+        # strike placement relative to a cost basis the market may never revisit."
         current_delta = abs(float(row.get("Delta", row.get("Short_Call_Delta", 0)) or 0))
-        if current_delta > 0.70:
+        _doctrine_state_rc = str(row.get("Doctrine_State", "") or "").strip().upper()
+        if _doctrine_state_rc == "RECOVERY_PREMIUM":
+            roll_mode = _ROLL_MODE_RECOVERY_PREMIUM
+            logger.info(
+                f"[RollEngine] {ticker} → RECOVERY_PREMIUM mode: "
+                f"Doctrine_State=RECOVERY_PREMIUM, stock=${ul_price:.2f}, "
+                f"basis=${net_cost_basis:.2f}, delta={current_delta:.2f}"
+            )
+        elif current_delta > 0.70:
             roll_mode = _ROLL_MODE_EMERGENCY
         elif current_delta > 0.55:
             roll_mode = _ROLL_MODE_PRE_ITM
@@ -411,10 +600,9 @@ def find_roll_candidates(
                 import math as _math_rc
                 _rc_theta   = abs(float(row.get("Theta", 0) or 0))
                 _rc_gamma   = abs(float(row.get("Gamma", 0) or 0))
-                _rc_hv      = float(row.get("HV_20D", 0.20) or 0.20)
-                _rc_iv      = float(row.get("IV", 0) or row.get("IV_30D", 0) or 0)
-                if _rc_hv >= 1.0: _rc_hv /= 100.0
-                if _rc_iv >= 1.0: _rc_iv /= 100.0
+                from core.shared.finance_utils import normalize_iv as _niv_rc
+                _rc_hv      = _niv_rc(float(row.get("HV_20D", 0.20) or 0.20)) or 0.20
+                _rc_iv      = _niv_rc(float(row.get("IV", 0) or row.get("IV_30D", 0) or 0)) or 0.0
                 _rc_spot    = float(row.get("Last", 0) or row.get("UL Last", 0) or 0)
                 _rc_strike  = float(row.get("Strike", 0) or 0)
                 _rc_sigma   = _rc_spot * (_rc_hv / _math_rc.sqrt(252)) if _rc_spot > 0 else 0
@@ -461,7 +649,7 @@ def find_roll_candidates(
             elif _ei_state == "WEAKENING":
                 # Deteriorating but not yet broken — only go weekly if earnings
                 # compound the risk (≤45d) or earnings date is unknown.
-                _earnings_date_raw = row.get("Earnings Date")
+                _earnings_date_raw = row.get("Earnings_Date")
                 _earnings_risk = True  # default: assume risk if date unknown
                 if _earnings_date_raw not in (None, "", "nan", "N/A") and not (
                     isinstance(_earnings_date_raw, float) and pd.isna(_earnings_date_raw)
@@ -478,6 +666,25 @@ def find_roll_candidates(
                     logger.info(
                         f"[RollEngine] {ticker} → WEEKLY mode: "
                         f"Equity_Integrity=WEAKENING, earnings_risk={_earnings_risk}"
+                    )
+
+        # ── Basis-reduction mode: approaching hard stop → roll DOWN ─────────
+        # When drift_from_net is between -15% and -20% (approaching hard stop),
+        # the current OTM call is too far out of the money to generate meaningful
+        # premium. Roll DOWN to a tighter strike — same expiry allowed — to
+        # maximize premium collection for basis recovery.
+        # McMillan Ch.3: "Roll down to recycle premium when OTM call is dead weight."
+        # Overrides NORMAL and PRE_ITM. Emergency/weekly have structural priority.
+        if roll_mode in (_ROLL_MODE_NORMAL, _ROLL_MODE_PRE_ITM):
+            # Use resolved net_cost_basis (already lifted from stock leg at line 304+)
+            if net_cost_basis > 0 and ul_price > 0:
+                _drift_for_roll = (ul_price - net_cost_basis) / net_cost_basis
+                if -0.20 <= _drift_for_roll <= -0.10:
+                    roll_mode = _ROLL_MODE_BASIS_REDUCTION
+                    logger.info(
+                        f"[RollEngine] {ticker} → BASIS_REDUCTION mode: "
+                        f"drift={_drift_for_roll:.1%} approaching hard stop — "
+                        f"allow same-expiry roll-down for premium recycling"
                     )
 
         # ── Income-friendly regimes: prefer same-strike credit rolls ────────
@@ -527,9 +734,43 @@ def find_roll_candidates(
                             _ROLL_DTE_WINDOWS.get(strategy_key, (21, 60, 45)))
             delta_range = _ROLL_DELTA_TARGETS_INCOME_SAME.get(strategy_key,
                             _ROLL_DELTA_TARGETS.get(strategy_key, (0.20, 0.55)))
+        elif roll_mode == _ROLL_MODE_BASIS_REDUCTION:
+            dte_window  = _ROLL_DTE_WINDOWS_BASIS_REDUCTION.get(strategy_key,
+                            _ROLL_DTE_WINDOWS.get(strategy_key, (21, 90, 45)))
+            delta_range = _ROLL_DELTA_TARGETS_BASIS_REDUCTION.get(strategy_key,
+                            _ROLL_DELTA_TARGETS.get(strategy_key, (0.25, 0.45)))
+        elif roll_mode == _ROLL_MODE_RECOVERY_PREMIUM:
+            dte_window  = _ROLL_DTE_WINDOWS_RECOVERY_PREMIUM.get(strategy_key,
+                            _ROLL_DTE_WINDOWS.get(strategy_key, (14, 45, 30)))
+            delta_range = _ROLL_DELTA_TARGETS_RECOVERY_PREMIUM.get(strategy_key,
+                            _ROLL_DELTA_TARGETS.get(strategy_key, (0.25, 0.45)))
         else:
             dte_window  = _ROLL_DTE_WINDOWS.get(strategy_key, (30, 120, 60))
             delta_range = _ROLL_DELTA_TARGETS.get(strategy_key, (0.25, 0.50))
+
+        # ── Widen delta band when near breakeven (cross-cutting) ──────────
+        # When the underlying is within ~5% of net cost, the position is
+        # close to breakeven and ATM/ITM credit rolls become attractive.
+        # Standard OTM delta bands (0.20–0.45) reject these higher-delta
+        # strikes. Widen to 0.65 so the heuristic shortlist includes credit
+        # roll candidates; MC rerank will sort them by EV against debit rolls.
+        # Applies to any income mode (NORMAL, RECOVERY_PREMIUM, etc.) — not
+        # just RECOVERY_PREMIUM, since near-breakeven positions in NORMAL mode
+        # also benefit from seeing credit roll options.
+        if net_cost_basis > 0 and ul_price > 0 and strategy_key in (
+            "BUY_WRITE", "COVERED_CALL", "SHORT_PUT", "CSP"
+        ):
+            _basis_proximity = abs(ul_price - net_cost_basis) / net_cost_basis
+            if _basis_proximity <= 0.05:
+                _lo, _hi = delta_range
+                if strategy_key in ("SHORT_PUT", "CSP"):
+                    delta_range = (min(_lo, -0.65), _hi)  # widen magnitude
+                else:
+                    delta_range = (_lo, max(_hi, 0.65))
+                logger.info(
+                    f"[RollEngine] {ticker} near-breakeven ({roll_mode}): "
+                    f"proximity={_basis_proximity:.1%}, widened delta band → {delta_range}"
+                )
 
         # ── DTE window extension when current_dte is near max_dte ──────────
         # Problem: when current_dte is already close to max_dte, the "must roll OUT"
@@ -646,9 +887,9 @@ def find_roll_candidates(
         # Compute days_to_earnings for the scoring penalty in _score_candidate().
         # The penalty fires when earnings fall BEFORE this candidate's expiry DTE,
         # meaning the new position would be held through the IV event.
-        # Source: "Earnings Date" column from doctrine CSV (injected by DoctrineAuthority).
+        # Source: "Earnings_Date" column from doctrine CSV (injected by DoctrineAuthority).
         _days_to_earnings: int | None = None
-        _earn_raw = row.get("Earnings Date")
+        _earn_raw = row.get("Earnings_Date")
         if _earn_raw not in (None, "", "nan", "N/A") and not (
             isinstance(_earn_raw, float) and pd.isna(_earn_raw)
         ):
@@ -658,6 +899,40 @@ def find_roll_candidates(
                     _days_to_earnings = (_ed.normalize() - pd.Timestamp.now().normalize()).days
             except Exception:
                 pass
+
+        # Current option mid (for net-roll economics in scoring)
+        _cur_bid = float(row.get("Bid", 0) or 0)
+        _cur_ask = float(row.get("Ask", 0) or 0)
+        _cur_option_mid = (
+            (_cur_bid + _cur_ask) / 2
+            if _cur_bid and _cur_ask
+            else float(row.get("Last", 0) or 0)
+        )
+
+        # Dividend data (for assignment-bait penalty in scoring)
+        # McMillan Ch.2: early exercise when extrinsic < dividend
+        _days_to_div = float(row.get("Days_To_Dividend", 9999) or 9999)
+        _div_amount = float(row.get("Dividend_Amount", 0) or 0)
+
+        # PMCC LEAP strike constraint (short call must stay below LEAP strike)
+        _leap_strike = 0.0
+        if strategy.upper() == "PMCC":
+            _leap_strike = float(row.get("LEAP_Call_Strike", 0) or 0)
+
+        # Churn guard — consecutive debit rolls from position trajectory
+        _consec_debit_rolls = int(
+            float(row.get("Trajectory_Consecutive_Debit_Rolls", 0) or 0)
+        )
+
+        # Roll trigger classification — WHY doctrine is rolling
+        # Winning_Gate carries the doctrine gate name that produced the ROLL action.
+        # This gives the scorer explicit context for what matters most.
+        _winning_gate = str(row.get("Winning_Gate", "") or "")
+        _roll_trigger = _classify_roll_trigger(_winning_gate)
+        logger.debug(
+            f"[RollEngine] {ticker} roll_trigger={_roll_trigger} "
+            f"(from Winning_Gate={_winning_gate!r})"
+        )
 
         # Find candidates
         candidates = _select_roll_candidates(
@@ -674,6 +949,12 @@ def find_roll_candidates(
             hv_20d           = hv_20d,
             roll_mode        = roll_mode,
             days_to_earnings = _days_to_earnings,
+            current_option_mid = _cur_option_mid,
+            leap_strike      = _leap_strike,
+            days_to_dividend = _days_to_div,
+            dividend_amount  = _div_amount,
+            consecutive_debit_rolls = _consec_debit_rolls,
+            roll_trigger     = _roll_trigger,
         )
 
         # ── No-viable-roll assessment (emergency mode only) ───────────────────
@@ -693,13 +974,46 @@ def find_roll_candidates(
             )
             continue
 
+        # ── RECOVERY_PREMIUM no-viable-roll fallback ─────────────────────────
+        # If RECOVERY_PREMIUM mode finds zero candidates (illiquid chain, IV too
+        # low for viable premium), surface an explicit verdict so the dashboard
+        # shows actionable guidance instead of "could not be parsed".
+        if roll_mode == _ROLL_MODE_RECOVERY_PREMIUM and not candidates:
+            _rp_gap = net_cost_basis - ul_price if net_cost_basis > 0 else 0
+            _rp_verdict = {
+                "verdict": "NO_VIABLE_RECOVERY_ROLL",
+                "roll_mode": _ROLL_MODE_RECOVERY_PREMIUM,
+                "no_viable_roll": True,
+                "current_strike": round(strike, 2),
+                "net_cost_basis": round(net_cost_basis, 2) if net_cost_basis else None,
+                "ul_price": round(ul_price, 2),
+                "current_delta": round(current_delta, 3),
+                "roll_rationale": (
+                    f"[RECOVERY PREMIUM] No viable roll candidates in "
+                    f"14-45 DTE at delta 0.25-0.45. "
+                    f"Stock ${ul_price:.2f}, basis ${net_cost_basis:.2f}, "
+                    f"gap ${_rp_gap:.2f}/share. "
+                    f"Options: (1) Wait for IV expansion to generate viable premium; "
+                    f"(2) Accept wider delta range; "
+                    f"(3) Re-evaluate thesis if IV consistently too low for recovery. "
+                    f"(Jabbour Ch.4: don't force uneconomical writes)"
+                ),
+                "score": 0.0,
+            }
+            df.at[idx, "Roll_Candidate_1"] = json.dumps(_rp_verdict)
+            logger.info(
+                f"[RollEngine] {ticker} RECOVERY_PREMIUM mode — no viable candidates. "
+                f"Stock=${ul_price:.2f}, basis=${net_cost_basis:.2f}"
+            )
+            continue
+
         # ── INCOME_SAME credit-preference re-ranking ──────────────────────────
         # In SIDEWAYS_INCOME, credit rolls are structurally correct — they reduce
         # basis and continue the income cycle. Debit rolls erode collected premium.
         # After scoring, re-sort: credits first (by score), then debits (by score).
         # This ensures the top candidate is always the best credit roll, even if a
         # far-OTM debit roll scored higher on raw delta proximity.
-        if roll_mode == _ROLL_MODE_INCOME_SAME and candidates:
+        if roll_mode in (_ROLL_MODE_INCOME_SAME, _ROLL_MODE_RECOVERY_PREMIUM) and candidates:
             # Pre-compute cost for re-ranking
             for _c in candidates:
                 _c["_pre_cost"] = _estimate_roll_cost(row, _c)
@@ -713,7 +1027,7 @@ def find_roll_candidates(
                 _c.pop("_pre_cost", None)
             if _credits:
                 logger.info(
-                    f"[RollEngine] {ticker} INCOME_SAME: {len(_credits)} credit candidate(s) "
+                    f"[RollEngine] {ticker} {roll_mode}: {len(_credits)} credit candidate(s) "
                     f"prioritised over {len(_debits)} debit candidate(s)"
                 )
 
@@ -728,6 +1042,14 @@ def find_roll_candidates(
             cand.update(_compute_trader_metrics(
                 cand, cost_to_roll, net_cost_basis, cum_premium, ul_price, strategy_key
             ))
+            # ── Economics vector: decomposed roll analysis ────────────────
+            econ_vec = _compute_economics_vector(
+                cand, cost_to_roll, row, net_cost_basis, ul_price, strategy_key
+            )
+            edge_label, edge_summary = _classify_candidate_edge(econ_vec)
+            cand["economics"]    = econ_vec
+            cand["primary_edge"] = edge_label
+            cand["edge_summary"] = edge_summary
             cand["calendar_note"]     = calendar_note  # surfaced in dashboard trade-off line
             cand["roll_rationale"]    = _build_roll_rationale(
                 cand, strategy_key, ul_price, net_cost_basis, roll_mode=roll_mode,
@@ -743,6 +1065,28 @@ def find_roll_candidates(
                 calendar_note=calendar_note,
             )
             df.at[idx, f"Roll_Candidate_{rank}"] = json.dumps(cand)
+
+        # ── Split execution suggestion (multi-contract positions) ──────────
+        # After all candidates are ranked and enriched, evaluate whether
+        # splitting execution produces a better outcome than rolling all
+        # contracts to a single candidate.
+        _qty = abs(int(float(row.get("Quantity", 1) or 1)))
+        if _qty >= 4 and candidates:
+            _top_cands = [
+                json.loads(df.at[idx, f"Roll_Candidate_{r}"])
+                for r in range(1, min(_TOP_N + 1, len(candidates) + 1))
+                if pd.notna(df.at[idx, f"Roll_Candidate_{r}"])
+            ]
+            split_sug = _compute_split_suggestion(
+                _top_cands, _qty, strategy_key,
+                net_cost_basis=net_cost_basis, ul_price=ul_price,
+            )
+            if split_sug:
+                df.at[idx, "Roll_Split_Suggestion"] = json.dumps(split_sug)
+                logger.info(
+                    f"[RollEngine] {ticker} split suggestion: {split_sug['type']} "
+                    f"({split_sug.get('rationale', '')[:80]}...)"
+                )
 
     rolled_count = roll_mask.sum()
     filled_count = df[roll_mask]["Roll_Candidate_1"].notna().sum()
@@ -902,6 +1246,12 @@ def _select_roll_candidates(
     hv_20d: float = 0.0,
     roll_mode: str = _ROLL_MODE_NORMAL,
     days_to_earnings: int | None = None,
+    current_option_mid: float = 0.0,
+    leap_strike: float = 0.0,
+    days_to_dividend: float = 9999.0,
+    dividend_amount: float = 0.0,
+    consecutive_debit_rolls: int = 0,
+    roll_trigger: str = ROLL_TRIGGER_DISCRETIONARY,
 ) -> List[Dict[str, Any]]:
     """
     Parse the chain, filter for roll-eligible contracts, score and rank them.
@@ -918,6 +1268,14 @@ def _select_roll_candidates(
     min_dte, max_dte, target_dte = dte_window
     delta_min, delta_max = delta_range
     is_short_vol = strategy_key in ("BUY_WRITE", "COVERED_CALL", "SHORT_PUT", "CSP")
+
+    # BASIS_REDUCTION: prefer same expiry — the intent is roll DOWN (tighter strike),
+    # not OUT (longer DTE). Override target_dte so same-expiry candidates score 1.0
+    # on DTE instead of being penalized for not matching the default 45d target.
+    # McMillan Ch.3: "Roll down to capture extrinsic, not out to buy time."
+    if roll_mode == _ROLL_MODE_BASIS_REDUCTION and current_dte > 0:
+        target_dte = int(current_dte)
+
     _emergency_basis_filter = (
         roll_mode == _ROLL_MODE_EMERGENCY
         and is_short_vol
@@ -982,10 +1340,20 @@ def _select_roll_candidates(
             continue
 
         # Filter by DTE window — must be FURTHER out than current (rolling out)
+        # Exception: BASIS_REDUCTION allows same-expiry (roll DOWN to lower strike)
+        # but NOT drastically shorter DTE. Floor at 75% of current_dte to prevent
+        # yield inflation from short-dated weeklies dominating the score.
+        # E.g., at 66 DTE current → floor 49 DTE (allows May 1 but rejects Apr 10).
         if actual_dte < min_dte or actual_dte > max_dte:
             _diag_dte_rejected += len(strikes_map)
             continue
-        if actual_dte <= current_dte:
+        _is_basis_reduction = roll_mode == _ROLL_MODE_BASIS_REDUCTION
+        if _is_basis_reduction:
+            _basis_dte_floor = max(min_dte, int(current_dte * 0.75))
+            if actual_dte < _basis_dte_floor:
+                _diag_rollout_rejected += len(strikes_map)
+                continue  # Too short for basis reduction — prefer same horizon
+        elif actual_dte <= current_dte:
             _diag_rollout_rejected += len(strikes_map)
             continue  # Cannot roll to same or shorter DTE
 
@@ -1035,6 +1403,15 @@ def _select_roll_candidates(
                 _diag_liq_rejected += 1
                 continue
 
+            # ── PMCC width constraint — short call must stay below LEAP strike ──
+            # PMCC = long deep-ITM LEAP + short near-term OTM call. The short call
+            # strike MUST be below the LEAP strike to maintain debit spread structure.
+            # If short call strike ≥ LEAP strike → width inversion → broken PMCC.
+            # Passarelli Ch.5: "The short strike above the long creates unlimited risk."
+            if leap_strike > 0 and strike >= leap_strike:
+                _diag_basis_rejected += 1  # reuse counter (structural rejection)
+                continue
+
             # ── EMERGENCY mode: hard filter — above net cost basis only ──────
             # McMillan Ch.3: "If no roll above your cost basis exists, assignment
             # is preferable to locking in a debit roll that still realizes a loss."
@@ -1049,8 +1426,8 @@ def _select_roll_candidates(
             _skew_ratio = _surf.get("skew_ratio")
             _term_slope = _surf.get("term_slope")
 
-            # Score: composite of delta proximity, DTE fit, IV, theta yield, liquidity
-            score = _score_candidate(
+            # Score: returns full economics vector (sub-scores + composite)
+            score_vector = _score_candidate(
                 delta            = abs(delta_raw),
                 target_delta     = abs((delta_range[0] + delta_range[1]) / 2),
                 actual_dte       = actual_dte,
@@ -1065,12 +1442,19 @@ def _select_roll_candidates(
                 hv_20d           = hv_20d,
                 ul_price         = ul_price,
                 strike           = strike,
+                current_option_mid = current_option_mid,
+                current_strike   = current_strike,
+                days_to_dividend = days_to_dividend,
+                dividend_amount  = dividend_amount,
+                consecutive_debit_rolls = consecutive_debit_rolls,
                 roll_mode        = roll_mode,
                 days_to_earnings = days_to_earnings,
                 atm_iv           = _atm_iv,
                 skew_ratio       = _skew_ratio,
                 term_slope       = _term_slope,
+                roll_trigger     = roll_trigger,
             )
+            score = score_vector["composite"]
 
             candidates.append({
                 "strike":     round(strike, 2),
@@ -1091,10 +1475,12 @@ def _select_roll_candidates(
                 "spread_pct": round(spread_pct, 1),
                 "liq_grade":  liq_grade,
                 "score":      round(score, 4),
+                "score_vector": score_vector,
                 "hv_20d":     round(hv_20d, 4) if hv_20d else None,
                 "atm_iv":     round(_atm_iv, 4) if _atm_iv is not None else None,
                 "skew_ratio": round(_skew_ratio, 3) if _skew_ratio is not None else None,
                 "term_slope": round(_term_slope, 6) if _term_slope is not None else None,
+                "roll_trigger": roll_trigger,
             })
 
     # ── Diagnostic summary ──────────────────────────────────────────────
@@ -1106,9 +1492,58 @@ def _select_roll_candidates(
         f"→ {len(candidates)} candidates survived"
     )
 
-    # Sort by score descending
+    # Sort by score descending, then enforce expiry diversity in top N.
+    # Without diversity, all 5 candidates can cluster in the same expiry
+    # with tiny strike differences — MC rerank then can't discover that a
+    # different expiration has better EV.
     candidates.sort(key=lambda x: x["score"], reverse=True)
+    candidates = _enforce_expiry_diversity(candidates, _TOP_N)
     return candidates
+
+
+def _enforce_expiry_diversity(candidates: list, top_n: int) -> list:
+    """
+    Ensure the top-N shortlist spans at least 2 expirations when possible.
+
+    Algorithm: greedily pick best-scored candidates, but cap any single
+    expiration at (top_n - 1) slots so at least one alternate expiry can
+    enter. Remaining candidates follow in score order.
+
+    If fewer than 2 distinct expirations exist in the full list, returns
+    plain score-sorted order (no diversity possible).
+    """
+    if len(candidates) <= top_n:
+        return candidates
+
+    # Count distinct expirations
+    expiries = {c.get("expiry", c.get("actual_dte", "")) for c in candidates}
+    if len(expiries) < 2:
+        return candidates  # only one expiration available
+
+    max_per_expiry = top_n - 1  # reserve at least 1 slot for diversity
+    selected = []
+    expiry_counts: dict = {}
+    remainder = []
+
+    for c in candidates:
+        exp = c.get("expiry", c.get("actual_dte", ""))
+        if len(selected) < top_n:
+            if expiry_counts.get(exp, 0) < max_per_expiry:
+                selected.append(c)
+                expiry_counts[exp] = expiry_counts.get(exp, 0) + 1
+            else:
+                remainder.append(c)
+        else:
+            remainder.append(c)
+
+    # If we didn't fill all slots (unlikely), backfill from remainder
+    for c in remainder:
+        if len(selected) >= top_n:
+            break
+        selected.append(c)
+    remainder = [c for c in remainder if c not in selected]
+
+    return selected + remainder
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
@@ -1133,13 +1568,19 @@ def _score_candidate(
     atm_iv: float | None = None,
     skew_ratio: float | None = None,
     term_slope: float | None = None,
+    current_option_mid: float = 0.0,
+    current_strike: float = 0.0,
+    days_to_dividend: float = 9999.0,
+    dividend_amount: float = 0.0,
+    consecutive_debit_rolls: int = 0,
+    roll_trigger: str = ROLL_TRIGGER_DISCRETIONARY,
 ) -> float:
     """
     Composite score (higher = better roll candidate). Think like a trader.
 
     McMillan Ch.3 / Passarelli Ch.6 / Natenberg Ch.11 / Gatheral Ch.1:
 
-    Components and weights:
+    Components and weights (default, adjusted by roll_trigger):
       1. Delta proximity  (25%) — strike placement relative to directional thesis
       2. Annualized yield (25%) — premium efficiency on net cost basis (Passarelli Ch.6)
                                    blended 70/30 with theta efficiency (Phase 1c)
@@ -1148,6 +1589,13 @@ def _score_candidate(
       5. IV advantage     (10%) — vol edge: IV/HV ratio + vol surface signals (Phase 2)
                                    atm_iv vs strike iv (skew position)
                                    term structure slope (contango vs backwardation)
+
+    roll_trigger adjusts these weights situationally:
+      ASSIGNMENT_DEFENSE: delta weight 1.6×, yield 0.6× (rescue mode — delta reduction is critical)
+      INCOME_GATE:        yield weight 1.4×, delta 0.8× (income cycle — maximize premium)
+      HARD_STOP:          delta 1.4×, dte 1.3×, yield 0.5× (survival over income)
+      GAMMA_DANGER:       dte weight 1.6× (extend DTE to cut gamma ∝ 1/√T)
+      etc. — see _TRIGGER_WEIGHT_ADJUSTMENTS
 
     Post-scoring multipliers:
       Earnings-in-window penalty (Phase 1b) — if earnings fall before this contract
@@ -1174,16 +1622,17 @@ def _score_candidate(
     # Excellent = 2× margin rate (~20.75%/yr), neutral = margin rate (just covering carry),
     # poor = below margin rate (negative carry — this roll loses money on financing alone).
     # McMillan Ch.3: "Any roll that fails to cover the financing cost is negative carry."
+    from core.shared.finance_utils import annualized_yield as _ann_yield
     yield_score = 0.5  # neutral default
     if actual_dte > 0 and mid > 0:
         if is_short_vol and net_cost_basis > 0:
             # Per-share income annualized on net cost basis
-            annualized_yield = (mid / net_cost_basis) * (365 / actual_dte)
+            annualized_yield = _ann_yield(mid, net_cost_basis, actual_dte)
             # Score: 0 at 0%/yr, 0.5 at margin rate (10.375%), 1.0 at 2× margin rate (~20.75%)
             yield_score = min(1.0, annualized_yield / _YIELD_BENCHMARK_EXCELLENT)
         elif is_short_vol and ul_price > 0:
             # Fallback: yield on current stock price
-            annualized_yield = (mid / ul_price) * (365 / actual_dte)
+            annualized_yield = _ann_yield(mid, ul_price, actual_dte)
             yield_score = min(1.0, annualized_yield / _YIELD_BENCHMARK_EXCELLENT)
         elif not is_short_vol:
             # Long vol: score by extrinsic value as % of premium paid
@@ -1207,6 +1656,98 @@ def _score_candidate(
         # Scale: 0.033/day = score 1.0 (1%/day); anything above is capped
         theta_score = min(1.0, theta_per_dollar / 0.033)
         yield_score = 0.70 * yield_score + 0.30 * theta_score
+
+    # ── Net-roll economics adjustment (non-INCOME_SAME short-vol modes) ──────
+    # Problem: yield_score uses `mid` (new premium only), ignoring the cost to
+    # close the current option. A candidate showing 22%/yr on $0.65 open premium
+    # that costs $0.75 to close = net -$0.10 debit. Without this adjustment,
+    # the scorer ranks debit rolls as if they were free credits.
+    #
+    # McMillan Ch.3: "The roll credit or debit is the actual economics of the trade."
+    # Passarelli Ch.6: "Net premium received, not gross, determines carry."
+    #
+    # For INCOME_SAME mode: credit-preference re-ranking (line ~746) handles this
+    # via post-scoring partition. All other short-vol modes need it in-score.
+    #
+    # Components:
+    #   1. net_roll_economics: adjusts yield_score based on net credit/debit
+    #   2. recovery_improvement: bonus/penalty for strike lift vs basis
+    #      - Small debit can win if strike lift materially improves recovery geometry
+    #      - Large debit with weak strike improvement → penalty
+    net_roll_adj = 0.0
+    recovery_score = 0.0
+    if (is_short_vol
+        and current_option_mid > 0
+        and mid > 0
+        and roll_mode != _ROLL_MODE_INCOME_SAME):
+
+        # Net roll: positive = credit, negative = debit
+        # For short vol: close = buy at ask, open = sell at bid.
+        # Conservative slippage model: assume ~2% adverse fill on each leg.
+        # Mid-to-mid overstates credit by 2-5%, especially for THIN candidates.
+        # Natenberg Ch.11: "Theoretical edge disappears in the spread."
+        # Actual cost is computed precisely by _estimate_roll_cost() post-scoring
+        # using real bid/ask — this is a scoring-time conservative estimate.
+        _close_cost = current_option_mid * 1.02   # buy back at ask (~2% worse)
+        _open_proceeds = mid * 0.98               # sell at bid (~2% worse)
+        net_roll = _open_proceeds - _close_cost   # positive = net credit roll
+
+        # --- Component 1: Net roll economics on yield ---
+        # Replace gross yield with net-aware yield when net_roll is negative (debit).
+        # Credit rolls: yield_score already reflects actual economics (good).
+        # Debit rolls: penalize yield proportionally to how much debit eats the premium.
+        if net_roll < 0:
+            # Debit magnitude as fraction of new premium: e.g. -0.10/0.65 = 15% eaten
+            debit_fraction = abs(net_roll) / mid
+            # Penalty: scale yield down. Full debit (fraction=1.0) → yield_score × 0.20
+            # Half debit (fraction=0.5) → yield_score × 0.60. Mild debit (<10%) → minor.
+            debit_penalty = max(0.20, 1.0 - debit_fraction * 0.80)
+            yield_score *= debit_penalty
+        else:
+            # Credit roll in non-INCOME_SAME mode: mild bonus (credit = preferred)
+            # Bonus proportional to credit size vs premium: 0.15 credit on 0.65 = 23% bonus
+            credit_bonus = min(0.15, (net_roll / mid) * 0.30)
+            net_roll_adj = credit_bonus
+
+        # --- Component 2: Recovery improvement (strike lift vs basis) ---
+        # A debit roll is justified when it materially lifts the strike toward/above basis.
+        # McMillan Ch.3: "Pay a small debit to move the strike from deeply underwater to
+        # near breakeven — the assignment path improves even if you pay to get there."
+        if net_cost_basis > 0 and current_strike > 0:
+            # Strike improvement: how much closer to (or above) basis does the new strike get?
+            # Old gap: current_strike vs basis (negative = underwater)
+            old_gap_pct = (current_strike - net_cost_basis) / net_cost_basis
+            new_gap_pct = (strike - net_cost_basis) / net_cost_basis
+            strike_improvement = new_gap_pct - old_gap_pct  # positive = closer to basis
+
+            if strike_improvement > 0:
+                # Bonus: meaningful strike lift toward basis
+                # 5% improvement = +0.10, 10% = +0.15, cap at +0.20
+                recovery_score = min(0.20, strike_improvement * 2.0)
+
+                # If debit roll BUT strike crosses above basis → strong recovery signal
+                # Guard: crossing must be economically meaningful (>1% above basis)
+                # to avoid rewarding symbolic $0.01 crossings that disappear in slippage.
+                # Passarelli Ch.6: "Breakeven after friction is the real breakeven."
+                if net_roll < 0 and strike > net_cost_basis and current_strike <= net_cost_basis:
+                    basis_clearance_pct = (strike - net_cost_basis) / net_cost_basis
+                    if basis_clearance_pct >= 0.01:  # ≥1% above basis = meaningful
+                        recovery_score = min(0.25, recovery_score + 0.10)
+                    # else: symbolic crossing (<1%) — keep normal recovery_score, no extra bonus
+            elif strike_improvement < -0.02 and net_roll < 0:
+                # Rolling DOWN in strike AND paying a debit → worst case: penalty
+                recovery_score = -0.10
+
+        # --- Liquidity gate on bonuses ---
+        # Bonuses (credit, recovery) are theoretical if the candidate can't fill.
+        # A THIN/ILLIQUID candidate with OI=14 and 30%+ spread cannot execute at mid —
+        # the credit is phantom and the recovery geometry is unrealizable.
+        # McMillan Ch.3: "A roll that can't fill at a reasonable price is not a roll."
+        # Suppress bonuses for poor liquidity; preserve penalties (debit penalty stands
+        # regardless of liquidity — a debit roll on a THIN candidate is doubly bad).
+        if liq_grade in ("THIN", "ILLIQUID"):
+            net_roll_adj = min(net_roll_adj, 0.0)     # suppress credit bonus
+            recovery_score = min(recovery_score, 0.0)  # suppress recovery bonus
 
     # 3. DTE fit (20%) — time horizon match
     max_dte_deviation = 60
@@ -1313,9 +1854,28 @@ def _score_candidate(
     # Rationale: liquidity raised from 10% to 20% (execution feasibility is binary —
     # a THIN strike with 30%+ spread will not fill at mid, making the credit theoretical).
     # Delta reduced from 30% to 25% (small delta deviation matters less than executability).
-    base_score = (0.25 * delta_score + 0.25 * yield_score +
-                  0.20 * dte_score   + 0.10 * iv_score +
-                  0.20 * liq_score)
+    # net_roll_adj and recovery_score are additive bonuses/penalties from net-roll economics.
+    #
+    # Roll trigger adjusts weights situationally — e.g., ASSIGNMENT_DEFENSE boosts delta
+    # weight 1.6× and reduces yield to 0.6× because delta reduction is the goal, not income.
+    _tw = _get_trigger_weights(roll_trigger)
+    _w_delta = 0.25 * _tw["delta_w"]
+    _w_yield = 0.25 * _tw["yield_w"]
+    _w_dte   = 0.20 * _tw["dte_w"]
+    _w_iv    = 0.10 * _tw["iv_w"]
+    _w_liq   = 0.20 * _tw["liq_w"]
+    _w_total = _w_delta + _w_yield + _w_dte + _w_iv + _w_liq
+    # Renormalize so weights sum to 1.0 (preserve score scale)
+    if _w_total > 0:
+        _w_delta /= _w_total
+        _w_yield /= _w_total
+        _w_dte   /= _w_total
+        _w_iv    /= _w_total
+        _w_liq   /= _w_total
+
+    base_score = (_w_delta * delta_score + _w_yield * yield_score +
+                  _w_dte   * dte_score   + _w_iv    * iv_score +
+                  _w_liq   * liq_score   + net_roll_adj + recovery_score)
 
     # ── Mode-specific score adjustments ─────────────────────────────────────
     # PRE_ITM: credit-first prioritization + above-basis bonus.
@@ -1349,6 +1909,63 @@ def _score_candidate(
             if delta < 0.30:
                 mode_bonus -= 0.10
 
+    elif roll_mode == _ROLL_MODE_BASIS_REDUCTION and is_short_vol:
+        # Basis reduction: strongly reward strikes closer to ATM (more extrinsic).
+        # The whole point is rolling DOWN to a tighter strike for premium recycling.
+        # McMillan Ch.3: "Roll down to capture extrinsic, not out to buy time."
+        # Previous bonus (max 0.15) was too weak — $145 vs $150 only differed by
+        # 0.037, which was noise against the base score. Strengthened to dominate
+        # strike selection: up to +0.30 for near-ATM, with penalty for far-OTM
+        # (>10% OTM) strikes that defeat the purpose of rolling down.
+        if ul_price > 0 and strike > 0:
+            _otm_ratio = (strike - ul_price) / ul_price if strike > ul_price else 0.0
+            # Strong bonus: ATM → +0.30, 5% OTM → +0.20, 10% OTM → +0.10, 15%+ → 0
+            _tightness_bonus = max(0.0, 0.30 - _otm_ratio * 2.0)
+            mode_bonus += _tightness_bonus
+            # Penalty for strikes >10% OTM — these are still dead weight, not basis
+            # reduction. The current $150 at $135 stock = 11.1% OTM should score
+            # lower than $145 at 7.4% OTM or $140 at 3.7% OTM.
+            if _otm_ratio > 0.10:
+                mode_bonus -= 0.08
+        # Credit preference: basis reduction exists to collect premium and reduce
+        # net cost. A debit roll defeats the purpose. Compare candidate mid to a
+        # rough estimate of current option value (use mid if available, else 0).
+        # Higher candidate mid → more likely to produce net credit when closing
+        # the current (further OTM) call and selling this (tighter) one.
+        # Mild bonus only — the DTE floor is the primary guard against bad candidates.
+        if mid > 0 and net_cost_basis > 0:
+            _premium_yield = mid / net_cost_basis  # raw premium as % of basis
+            # Bonus: 2% premium → +0.05, 3% → +0.075, 4%+ → +0.10 (capped)
+            mode_bonus += min(0.10, _premium_yield * 2.5)
+
+    elif roll_mode == _ROLL_MODE_RECOVERY_PREMIUM and is_short_vol:
+        # Recovery premium: score by basis improvement per cycle.
+        # The question is: "How many dollars of basis reduction does this
+        # contract deliver per cycle, relative to the current gap?"
+        # Jabbour Ch.4: "In repair, premium/cycle captures compounding."
+        #
+        # 1. Premium density: mid / dte — dollars of premium per day of exposure
+        if actual_dte > 0 and mid > 0:
+            _prem_per_day = mid / actual_dte
+            # Benchmark: $0.10/day = excellent for recovery (high IV scenarios)
+            _density_score = min(1.0, _prem_per_day / 0.10)
+            mode_bonus += min(0.15, _density_score * 0.15)
+
+        # 2. Strike safety — OTM cushion (avoid assignment at massive loss)
+        if ul_price > 0 and strike > 0:
+            _otm_pct_rp = (strike - ul_price) / ul_price if strike > ul_price else 0.0
+            # Sweet spot: 5-15% OTM. Below 5% = too tight. Above 20% = too cheap.
+            if 0.05 <= _otm_pct_rp <= 0.15:
+                mode_bonus += 0.10
+            elif _otm_pct_rp > 0.20:
+                mode_bonus -= 0.05  # premium too thin at far OTM
+
+        # 3. Basis reduction rate — fraction of gap closed per cycle
+        if net_cost_basis > 0 and mid > 0 and net_cost_basis > ul_price:
+            _rp_gap = net_cost_basis - ul_price
+            _reduction_pct = mid / _rp_gap  # e.g. $0.50 / $11 gap = 4.5%
+            mode_bonus += min(0.10, _reduction_pct * 2.0)
+
     # ── Phase 1b — Earnings-in-window penalty ───────────────────────────────
     # If earnings fall BEFORE this contract's expiry, the new position is forced
     # to hold through the IV event. Natenberg Ch.8: "Post-earnings IV crush destroys
@@ -1373,7 +1990,80 @@ def _score_candidate(
             # Earnings inside DTE but >3 weeks — moderate awareness penalty
             earnings_multiplier = 0.90 if is_short_vol else 0.93
 
-    return min(1.0, (base_score + mode_bonus) * earnings_multiplier)
+    # ── Dividend assignment penalty ──────────────────────────────────────────
+    # McMillan Ch.2: "Call owners exercise early to capture the dividend when
+    # remaining extrinsic < dividend — the call is worth more dead than alive."
+    # A roll candidate where extrinsic < dividend is assignment bait: the new
+    # strike will trigger the same early-exercise incentive that forced this roll.
+    # Natenberg Ch.15: "The roll must lift the strike beyond the assignment
+    # incentive threshold — extrinsic must exceed dividend amount."
+    # Only applies to SHORT CALL strategies (BW, CC, PMCC) — puts don't face
+    # dividend early exercise. CSP/SHORT_PUT are excluded.
+    _is_short_call = strategy_key in ("BUY_WRITE", "COVERED_CALL", "PMCC")
+    dividend_multiplier = 1.0
+    if (_is_short_call and dividend_amount > 0
+            and days_to_dividend < actual_dte and days_to_dividend < 45):
+        # Candidate expires AFTER next ex-div → assignment risk exists
+        # Compute extrinsic value at candidate strike
+        _intrinsic_call = max(0.0, ul_price - strike)  # call intrinsic (ITM amount)
+        _extrinsic = max(0.0, mid - _intrinsic_call)
+        if _extrinsic < dividend_amount:
+            # Assignment bait: extrinsic doesn't compensate for holding through div
+            # Severe penalty — this strike WILL get exercised early
+            dividend_multiplier = 0.60
+        elif _extrinsic < dividend_amount * 1.5:
+            # Marginal: extrinsic barely exceeds dividend — at risk of assignment
+            # after any adverse move narrows the gap
+            dividend_multiplier = 0.80
+        elif _extrinsic < dividend_amount * 2.0 and days_to_dividend <= 10:
+            # Near-term div + thin extrinsic cushion → mild caution
+            dividend_multiplier = 0.90
+
+    # ── Churn guard — consecutive debit roll penalty ─────────────────────────
+    # Passarelli Ch.6: "Each roll pays the market-maker's spread — at some point
+    # the position is too damaged to keep rolling."
+    # If the last 2+ rolls were all net debits, this position is bleeding basis
+    # through roll friction. Escalating penalty discourages a 4th debit roll
+    # when the position should probably be closed or assigned.
+    # Only fires when current_option_mid > 0 AND this candidate would also be a
+    # debit (net_roll_adj <= 0 means no credit bonus was earned → debit or neutral).
+    churn_multiplier = 1.0
+    if consecutive_debit_rolls >= 2 and is_short_vol and current_option_mid > 0:
+        # Check if THIS roll would also be a debit
+        _would_be_debit = (net_roll_adj <= 0) if current_option_mid > 0 else False
+        if _would_be_debit:
+            # This would be ANOTHER debit roll on top of 2+ prior debits
+            if consecutive_debit_rolls >= 3:
+                churn_multiplier = 0.70  # 3+ consecutive debits → strong penalty
+            else:
+                churn_multiplier = 0.85  # 2 consecutive debits → moderate penalty
+
+    composite = min(1.0, (base_score + mode_bonus) * earnings_multiplier
+                    * dividend_multiplier * churn_multiplier)
+
+    return {
+        "composite": round(composite, 4),
+        # ── Quality sub-scores (0-1 each) ─────────────────────────────
+        "delta_score":    round(delta_score, 4),
+        "yield_score":    round(yield_score, 4),
+        "dte_score":      round(dte_score, 4),
+        "iv_score":       round(iv_score, 4),
+        "liq_score":      round(liq_score, 4),
+        # ── Economics adjustments ──────────────────────────────────────
+        "net_roll_adj":   round(net_roll_adj, 4),
+        "recovery_score": round(recovery_score, 4),
+        "mode_bonus":     round(mode_bonus, 4),
+        # ── Multipliers ───────────────────────────────────────────────
+        "earnings_mult":  round(earnings_multiplier, 4),
+        "dividend_mult":  round(dividend_multiplier, 4),
+        "churn_mult":     round(churn_multiplier, 4),
+        # ── Weights applied (after trigger renormalization) ────────────
+        "w_delta": round(_w_delta, 4),
+        "w_yield": round(_w_yield, 4),
+        "w_dte":   round(_w_dte, 4),
+        "w_iv":    round(_w_iv, 4),
+        "w_liq":   round(_w_liq, 4),
+    }
 
 
 # ── Liquidity grading ─────────────────────────────────────────────────────────
@@ -1439,6 +2129,370 @@ def _grade_liquidity(
                 grade = _target
 
     return grade
+
+
+# ── Roll economics vector ─────────────────────────────────────────────────────
+
+def _compute_economics_vector(
+    cand: Dict[str, Any],
+    cost_to_roll: Dict[str, Any],
+    current_row: pd.Series,
+    net_cost_basis: float,
+    ul_price: float,
+    strategy_key: str,
+) -> Dict[str, Any]:
+    """
+    Assemble the full roll economics vector from separated components.
+
+    Each candidate gets a decomposed view of what the roll actually does:
+    leg economics, strike change value, time change value, post-roll state.
+    This replaces the single-score ranking with a multi-dimensional view
+    that lets the trader (and doctrine) see WHY a candidate is good or bad.
+
+    McMillan Ch.3 / Passarelli Ch.6: "A roll is not one number — it is a
+    collection of economic changes that must each be evaluated."
+    """
+    is_short_vol = strategy_key in ("BUY_WRITE", "COVERED_CALL", "SHORT_PUT", "CSP")
+    score_vec = cand.get("score_vector", {})
+
+    # ── Leg economics ─────────────────────────────────────────────────
+    net_per = float(cost_to_roll.get("net_per_contract") or 0)
+    net_total = float(cost_to_roll.get("net_total") or 0)
+    cost_type = cost_to_roll.get("type", "unknown")
+    contracts = int(cost_to_roll.get("contracts", 1) or 1)
+
+    # Slippage warning: spread > 10% on either leg = real fill risk
+    cand_spread = float(cand.get("spread_pct", 0) or 0)
+    slippage_warning = cand_spread > 10 or cand.get("liq_grade") in ("THIN", "ILLIQUID")
+
+    # ── Strike change analysis ────────────────────────────────────────
+    current_strike = float(cand.get("roll_from_strike", 0) or 0)
+    new_strike = float(cand.get("strike", 0) or 0)
+    strike_change = round(new_strike - current_strike, 2) if current_strike > 0 else None
+    strike_change_pct = (
+        round((new_strike - current_strike) / current_strike * 100, 1)
+        if current_strike > 0 else None
+    )
+
+    # Basis improvement: how much closer to or above basis?
+    basis_improvement_pct = None
+    if net_cost_basis > 0 and current_strike > 0 and new_strike > 0:
+        old_gap = (current_strike - net_cost_basis) / net_cost_basis
+        new_gap = (new_strike - net_cost_basis) / net_cost_basis
+        basis_improvement_pct = round((new_gap - old_gap) * 100, 2)
+
+    # Assignment risk change
+    assignment_risk = "UNCHANGED"
+    if is_short_vol and current_strike > 0 and new_strike > 0 and ul_price > 0:
+        old_otm_pct = (current_strike - ul_price) / ul_price if is_short_vol else 0
+        new_otm_pct = (new_strike - ul_price) / ul_price if is_short_vol else 0
+        if new_otm_pct > old_otm_pct + 0.01:
+            assignment_risk = "IMPROVED"
+        elif new_otm_pct < old_otm_pct - 0.01:
+            assignment_risk = "WORSENED"
+
+    # ── Time change analysis ──────────────────────────────────────────
+    current_dte = int(cand.get("roll_from_dte", 0) or 0)
+    new_dte = int(cand.get("dte", 0) or 0)
+    dte_extension = new_dte - current_dte if current_dte > 0 else None
+
+    # Gamma reduction estimate: gamma ∝ 1/√T — extending DTE cuts gamma
+    gamma_reduction_pct = None
+    if current_dte > 0 and new_dte > 0 and new_dte > current_dte:
+        import math
+        gamma_reduction_pct = round(
+            (1.0 - math.sqrt(current_dte / new_dte)) * 100, 1
+        )
+
+    # ── Post-roll state ───────────────────────────────────────────────
+    # These are already computed by _compute_trader_metrics and embedded in cand
+    new_breakeven = cand.get("breakeven_after_roll")
+    new_ann_yield = cand.get("annualized_yield_pct")
+    new_otm_pct_val = cand.get("otm_pct")
+    prob_expire_otm = cand.get("prob_otm_at_expiry")
+    theta_per_day = cand.get("theta_per_day_dollars")
+
+    # ── New breakeven from roll credit/debit ───────────────────────────
+    # Net cost basis adjusted for the roll credit/debit
+    new_basis_after_roll = None
+    if net_cost_basis > 0 and is_short_vol:
+        new_basis_after_roll = round(net_cost_basis - net_per, 2)
+
+    return {
+        # Leg economics
+        "close_cost": round(-net_per + float(cand.get("mid", 0) or 0), 2) if is_short_vol else None,
+        "open_proceeds": round(float(cand.get("mid", 0) or 0), 2),
+        "net_credit_debit": round(net_per, 2),
+        "net_total": round(net_total, 2),
+        "cost_type": cost_type,
+        "contracts": contracts,
+        "slippage_warning": slippage_warning,
+        # Strike change
+        "strike_change": strike_change,
+        "strike_change_pct": strike_change_pct,
+        "basis_improvement_pct": basis_improvement_pct,
+        "assignment_risk_change": assignment_risk,
+        # Time change
+        "dte_extension": dte_extension,
+        "gamma_reduction_pct": gamma_reduction_pct,
+        # Post-roll state
+        "new_breakeven": new_breakeven,
+        "new_basis_after_roll": new_basis_after_roll,
+        "new_annualized_yield_pct": new_ann_yield,
+        "new_otm_pct": new_otm_pct_val,
+        "prob_expire_otm": prob_expire_otm,
+        "theta_per_day": theta_per_day,
+        # Score decomposition (from _score_candidate vector)
+        "delta_score": score_vec.get("delta_score"),
+        "yield_score": score_vec.get("yield_score"),
+        "dte_score": score_vec.get("dte_score"),
+        "iv_score": score_vec.get("iv_score"),
+        "liq_score": score_vec.get("liq_score"),
+        "net_roll_adj": score_vec.get("net_roll_adj"),
+        "recovery_score": score_vec.get("recovery_score"),
+        "earnings_mult": score_vec.get("earnings_mult"),
+        "dividend_mult": score_vec.get("dividend_mult"),
+        "churn_mult": score_vec.get("churn_mult"),
+        "composite_score": score_vec.get("composite"),
+    }
+
+
+def _classify_candidate_edge(econ: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Classify the primary economic edge of a roll candidate.
+
+    Returns (edge_label, edge_summary) — human-readable classification of
+    what this candidate is best at.
+
+    Edge labels:
+      INCOME_EXTENSION    — small change, mostly DTE extension for more theta
+      STRIKE_IMPROVEMENT  — meaningful strike lift toward/above basis
+      RECOVERY_ROLL       — debit roll justified by strong recovery geometry
+      INCOME_CREDIT       — credit roll that adds income + optionality
+      DEFENSIVE_ROLL      — assignment risk improvement via strike lift
+      ASSIGNMENT_PREFERABLE — roll economics don't justify the cost
+      WEAK_LIQUIDITY      — apparent edge may be unrealizable due to poor fills
+
+    McMillan Ch.3: "Name what the roll does for you — if you can't, don't roll."
+    """
+    net = econ.get("net_credit_debit") or 0
+    strike_change = econ.get("strike_change") or 0
+    basis_imp = econ.get("basis_improvement_pct") or 0
+    dte_ext = econ.get("dte_extension") or 0
+    assign_risk = econ.get("assignment_risk_change", "UNCHANGED")
+    slippage = econ.get("slippage_warning", False)
+    liq_score = econ.get("liq_score") or 0
+    composite = econ.get("composite_score") or 0
+    cost_type = econ.get("cost_type", "unknown")
+
+    # Check for weak liquidity first — it overrides everything
+    if slippage and liq_score < 0.30:
+        label = "WEAK_LIQUIDITY"
+        summary = f"{'credit' if net >= 0 else 'debit'} on paper, but wide spread/thin book — real fill uncertain"
+        return label, summary
+
+    # Classify based on what the candidate primarily offers
+    parts = []
+
+    if net >= 0:
+        parts.append(f"${abs(net):.2f} {'credit' if net > 0.005 else 'flat'}")
+    else:
+        parts.append(f"${abs(net):.2f} debit")
+
+    if abs(strike_change) > 0.50:
+        parts.append(f"${strike_change:+.0f} strike {'up' if strike_change > 0 else 'down'}")
+
+    if dte_ext and dte_ext > 0:
+        parts.append(f"+{dte_ext}d DTE")
+
+    # Determine primary edge
+    if composite < 0.25:
+        label = "ASSIGNMENT_PREFERABLE"
+        summary = "roll economics weak — assignment or close may be better"
+    elif basis_imp is not None and basis_imp > 3.0 and net < 0:
+        label = "RECOVERY_ROLL"
+        summary = ", ".join(parts) + " — debit justified by recovery geometry"
+    elif basis_imp is not None and basis_imp > 2.0 and assign_risk == "IMPROVED":
+        label = "STRIKE_IMPROVEMENT"
+        summary = ", ".join(parts) + " — meaningful recovery room gained"
+    elif assign_risk == "IMPROVED" and strike_change > 0 and net >= 0:
+        label = "DEFENSIVE_ROLL"
+        summary = ", ".join(parts) + " — assignment risk reduced at no cost"
+    elif dte_ext is not None and dte_ext > 14 and abs(strike_change) < 1.0:
+        label = "INCOME_EXTENSION"
+        summary = ", ".join(parts) + " — time extension for more theta"
+    elif net > 0.05 and abs(strike_change) < 1.0:
+        label = "INCOME_CREDIT"
+        summary = ", ".join(parts) + " — adds income with similar positioning"
+    elif net > 0:
+        label = "INCOME_CREDIT"
+        summary = ", ".join(parts)
+    else:
+        label = "INCOME_EXTENSION"
+        summary = ", ".join(parts)
+
+    return label, summary
+
+
+# ── Split execution suggestion ────────────────────────────────────────────────
+
+def _compute_split_suggestion(
+    candidates: List[Dict[str, Any]],
+    total_contracts: int,
+    strategy_key: str,
+    net_cost_basis: float = 0.0,
+    ul_price: float = 0.0,
+) -> Optional[Dict[str, Any]]:
+    """
+    For multi-contract positions (qty >= 4), evaluate whether splitting
+    execution across different paths produces a better outcome than
+    rolling all contracts to a single candidate.
+
+    Passarelli Ch.6: "With size, you can split the roll — capture income on
+    half, buy recovery on the other half."
+
+    Returns None if split is not recommended (single-contract, or no
+    meaningful benefit), or a dict with the suggestion.
+    """
+    if total_contracts < 4 or not candidates:
+        return None
+
+    is_short_vol = strategy_key in ("BUY_WRITE", "COVERED_CALL", "SHORT_PUT", "CSP")
+
+    # Need at least one candidate with economics
+    top = candidates[0]
+    top_edge = top.get("primary_edge", "")
+    top_econ = top.get("economics", {})
+    if not top_econ:
+        return None
+
+    # Split ratio: default 50/50 rounded to integer contracts
+    half_a = total_contracts // 2
+    half_b = total_contracts - half_a
+
+    # ── Strategy 1: Stagger across two candidates ─────────────────────
+    # When candidate #1 and #2 have different edge types, splitting
+    # across both captures two economic benefits simultaneously.
+    # Checked FIRST because diversification across candidates is higher
+    # value than single-candidate partial execution.
+    if len(candidates) >= 2:
+        second = candidates[1]
+        sec_edge = second.get("primary_edge", "")
+        sec_econ = second.get("economics", {})
+
+        # Only suggest if edges are meaningfully different
+        _different_edges = (
+            top_edge != sec_edge
+            and sec_edge not in ("ASSIGNMENT_PREFERABLE", "WEAK_LIQUIDITY")
+            and top_edge not in ("ASSIGNMENT_PREFERABLE", "WEAK_LIQUIDITY")
+            and sec_econ
+        )
+
+        # Different expirations = staggered expiry benefit
+        _different_expiry = (
+            top.get("expiry") and second.get("expiry")
+            and top.get("expiry") != second.get("expiry")
+        )
+
+        if _different_edges and _different_expiry:
+            return {
+                "type": "STAGGER_EXPIRY",
+                "tranche_a_contracts": half_a,
+                "tranche_b_contracts": half_b,
+                "tranche_a": f"${top.get('strike', '?')} {top.get('expiry', '?')}",
+                "tranche_b": f"${second.get('strike', '?')} {second.get('expiry', '?')}",
+                "rationale": (
+                    f"Stagger: {half_a} contracts to "
+                    f"#{1} ({top_edge.replace('_', ' ').lower()}: "
+                    f"${top.get('strike', '?')} {top.get('expiry', '?')}), "
+                    f"{half_b} to "
+                    f"#{2} ({sec_edge.replace('_', ' ').lower()}: "
+                    f"${second.get('strike', '?')} {second.get('expiry', '?')}). "
+                    f"Two different economic profiles reduce concentration risk."
+                ),
+                "edge_type": f"{top_edge}+{sec_edge}",
+            }
+        elif _different_edges and not _different_expiry:
+            return {
+                "type": "SPLIT_STRIKE",
+                "tranche_a_contracts": half_a,
+                "tranche_b_contracts": half_b,
+                "tranche_a": f"${top.get('strike', '?')} {top.get('expiry', '?')}",
+                "tranche_b": f"${second.get('strike', '?')} {second.get('expiry', '?')}",
+                "rationale": (
+                    f"Split: {half_a} contracts to "
+                    f"#{1} ({top_edge.replace('_', ' ').lower()}: "
+                    f"${top.get('strike', '?')}), "
+                    f"{half_b} to "
+                    f"#{2} ({sec_edge.replace('_', ' ').lower()}: "
+                    f"${second.get('strike', '?')}). "
+                    f"Diversifies strike exposure within same expiration."
+                ),
+                "edge_type": f"{top_edge}+{sec_edge}",
+            }
+
+    # ── Strategy 2: Partial close + partial roll ──────────────────────
+    # When assignment is close to preferable but roll still has some value,
+    # close half and roll half.
+    if top_edge == "ASSIGNMENT_PREFERABLE" and is_short_vol and len(candidates) >= 2:
+        second = candidates[1]
+        sec_edge = second.get("primary_edge", "")
+        if sec_edge not in ("ASSIGNMENT_PREFERABLE", "WEAK_LIQUIDITY"):
+            return {
+                "type": "PARTIAL_CLOSE_PARTIAL_ROLL",
+                "close_contracts": half_a,
+                "roll_contracts": half_b,
+                "roll_to": f"${second.get('strike', '?')} {second.get('expiry', '?')}",
+                "rationale": (
+                    f"Close/assign {half_a} contracts (roll economics weak), "
+                    f"roll {half_b} to #{2} ({sec_edge.replace('_', ' ').lower()}: "
+                    f"${second.get('strike', '?')} {second.get('expiry', '?')}). "
+                    f"Reduces position size while maintaining partial exposure."
+                ),
+                "edge_type": f"CLOSE+{sec_edge}",
+            }
+
+    # ── Strategy 3: Roll partial + hold ────────────────────────────────
+    # Income credit or extension on a short-vol position: roll half to
+    # capture income, hold the other half (let remaining theta decay).
+    if is_short_vol and top_edge in ("INCOME_CREDIT", "INCOME_EXTENSION"):
+        net = top_econ.get("net_credit_debit", 0) or 0
+        credit_total = round(abs(net) * half_a * 100, 2)
+        return {
+            "type": "ROLL_PARTIAL_HOLD",
+            "roll_contracts": half_a,
+            "hold_contracts": half_b,
+            "edge_type": top_edge,
+            "rationale": (
+                f"Roll {half_a} contracts for "
+                f"${credit_total:.0f} credit, hold {half_b} "
+                f"for remaining theta. {top_edge.replace('_', ' ').lower()} "
+                f"captured on partial position."
+            ),
+        }
+
+    # ── Strategy 4: Split debit exposure ─────────────────────────────
+    # Recovery roll (debit) with meaningful basis improvement: roll half
+    # to limit debit commitment while still improving cost basis.
+    if top_edge == "RECOVERY_ROLL":
+        basis_imp = top_econ.get("basis_improvement_pct", 0) or 0
+        if basis_imp > 2.0:
+            net = top_econ.get("net_credit_debit", 0) or 0
+            debit_total = round(abs(net) * half_a * 100, 2)
+            return {
+                "type": "SPLIT_DEBIT_EXPOSURE",
+                "roll_contracts": half_a,
+                "hold_contracts": half_b,
+                "edge_type": top_edge,
+                "rationale": (
+                    f"Roll {half_a} contracts (reduces debit commitment "
+                    f"to ${debit_total:.0f} vs ${round(abs(net) * total_contracts * 100, 2):.0f}). "
+                    f"Hold {half_b} — basis improvement {basis_imp:.1f}% "
+                    f"captured on half the position."
+                ),
+            }
+
+    return None
 
 
 # ── Roll cost ─────────────────────────────────────────────────────────────────
@@ -1531,10 +2585,11 @@ def _compute_trader_metrics(
 
     # ── 2. Annualized yield on capital ───────────────────────────────────────
     # Passarelli Ch.6: the metric that actually tells you if the roll is worth doing
+    from core.shared.finance_utils import annualized_yield as _ann_yield
     annualized_yield_pct = None
     capital = net_cost_basis if net_cost_basis > 0 else ul_price
     if is_short_vol and mid > 0 and capital > 0 and dte > 0:
-        annualized_yield_pct = round((mid / capital) * (365 / dte) * 100, 1)
+        annualized_yield_pct = round(_ann_yield(mid, capital, dte) * 100, 1)
 
     # ── 3. OTM percentage ─────────────────────────────────────────────────────
     # McMillan Ch.3: distance from spot tells you how much the stock can move before
@@ -1714,6 +2769,16 @@ def _build_roll_rationale(
             else ""
         )
         _mode_prefix = f"🚨 [EMERGENCY — extended DTE search] {_emg_basis}"
+
+    elif roll_mode == _ROLL_MODE_RECOVERY_PREMIUM:
+        _rp_gap = net_cost_basis - ul_price if net_cost_basis > 0 else 0
+        _rp_gap_str = f"Gap to basis: ${_rp_gap:.2f}/share. " if _rp_gap > 0 else ""
+        _rp_mid = float(candidate.get("mid", 0) or 0)
+        _rp_cycles = round(_rp_gap / _rp_mid, 1) if _rp_mid > 0 and _rp_gap > 0 else "?"
+        _mode_prefix = (
+            f"💰 [RECOVERY PREMIUM — basis reduction cycle] {_rp_gap_str}"
+            f"~{_rp_cycles} cycles at this premium to close gap. "
+        )
 
     # ── Debit roll judgment (BUY_WRITE / COVERED_CALL only) ──────────────────
     # When the roll requires a net debit, the engine answers three questions

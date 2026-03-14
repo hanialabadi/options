@@ -31,7 +31,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 import os
-from core.shared.data_contracts.config import MANAGEMENT_SAFE_MODE
+from core.shared.data_contracts.config import MANAGEMENT_SAFE_MODE, KNOWN_ETFS
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +51,7 @@ def get_earnings_date_yfinance(ticker: str) -> Optional[datetime]:
         return None
 
     # Skip known ETFs to avoid yfinance 404 errors on fundamentals
-    etfs = {'SPY', 'QQQ', 'IWM', 'DIA', 'TLT', 'GLD', 'SLV', 'XLE', 'XLF', 'XLI', 'XLK', 'XLU', 'XLP', 'XLV', 'XLY', 'XLB', 'XLC', 'XRE', 'SMH'}
-    if ticker.upper() in etfs:
+    if ticker.upper() in KNOWN_ETFS:
         return None
 
     try:

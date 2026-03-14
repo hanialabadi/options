@@ -45,26 +45,26 @@ import logging
 import numpy as np
 from typing import Optional
 
+from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
+
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 LAMBDA       = 0.94    # RiskMetrics decay factor
 TRADING_DAYS = 252
 MIN_SESSIONS = 10      # minimum returns needed for a stable EWMA estimate
-DB_PATH      = "data/pipeline.duckdb"
 
 
 def _load_close_prices(ticker: str, n_sessions: int = 60,
-                       db_path: str = DB_PATH) -> Optional[np.ndarray]:
+                       db_path: str = None) -> Optional[np.ndarray]:
     """
     Load the most recent `n_sessions` daily close prices for `ticker`
-    from pipeline.duckdb price_history table.
+    from price_history table (CHART domain).
 
     Returns np.ndarray of closes (oldest→newest), or None on any failure.
     """
     try:
-        import duckdb
-        con = duckdb.connect(db_path, read_only=True)
+        con = get_domain_connection(DbDomain.CHART, read_only=True)
         rows = con.execute(
             """
             SELECT close_price
@@ -92,24 +92,24 @@ def ewma_vol(
     ticker: str,
     lam: float = LAMBDA,
     annualise: bool = True,
-    db_path: str = DB_PATH,
+    db_path: str = None,
 ) -> Optional[float]:
     """
-    Compute EWMA volatility for `ticker` from pipeline.duckdb price history.
+    Compute EWMA volatility for `ticker` from price_history (CHART domain).
 
     Parameters
     ----------
     ticker    : equity ticker (e.g. 'AAPL')
     lam       : EWMA decay factor (default 0.94 = RiskMetrics)
     annualise : if True, return annualised vol (× √252); else daily
-    db_path   : path to pipeline.duckdb
+    db_path   : deprecated — ignored, uses domain connection
 
     Returns
     -------
     float  — annualised vol as decimal (e.g. 0.285 for 28.5%)
     None   — if < MIN_SESSIONS history available or any error
     """
-    closes = _load_close_prices(ticker, n_sessions=60, db_path=db_path)
+    closes = _load_close_prices(ticker, n_sessions=60)
     if closes is None or len(closes) < MIN_SESSIONS + 1:
         return None
 
@@ -134,7 +134,7 @@ def ewma_vol(
 def ewma_vol_series(
     ticker: str,
     lam: float = LAMBDA,
-    db_path: str = DB_PATH,
+    db_path: str = None,
 ) -> Optional[np.ndarray]:
     """
     Return the full EWMA vol series (annualised, oldest→newest).
@@ -142,7 +142,7 @@ def ewma_vol_series(
 
     Returns np.ndarray or None.
     """
-    closes = _load_close_prices(ticker, n_sessions=60, db_path=db_path)
+    closes = _load_close_prices(ticker, n_sessions=60)
     if closes is None or len(closes) < MIN_SESSIONS + 1:
         return None
 

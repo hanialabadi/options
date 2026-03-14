@@ -25,8 +25,7 @@ from core.management.cycle1.ingest.clean import phase1_load_and_clean_positions
 from core.management.cycle1.identity.parse import phase2_run_all
 from core.management._future_cycles.enrich.sus_compose_pcs_snapshot import run_phase3_enrichment
 from core.management.cycle2.drift.compute_pnl_metrics import compute_pnl_metrics
-from core.management.cycle2.drift.compute_basic_drift import compute_drift_metrics
-from core.management._quarantine.legacy.compute_drift_metrics import classify_drift_severity
+from core.management.cycle2.drift.compute_basic_drift import compute_drift_metrics, classify_drift_severity
 from core.management.cycle1.snapshot.snapshot import save_clean_snapshot, validate_cycle1_ledger
 from core.management.cycle3.bootstrap import bootstrap_doctrines
 from core.management.cycle3.decision.engine import generate_recommendations

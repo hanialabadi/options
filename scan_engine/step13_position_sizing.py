@@ -134,6 +134,80 @@ def compute_thesis_capacity(
         # MC is non-blocking — ATR/FIXED sizing already populated Thesis_Max_Envelope
         logger.warning(f"⚠️ MC sizing failed (non-fatal, ATR/FIXED used): {_mc_err}")
 
+    # Step 4b: Correlation-aware sizing adjustment (Pedersen Ch.7)
+    # When a new candidate is correlated with existing portfolio holdings,
+    # scale down MC_Max_Contracts to prevent concentration risk.
+    try:
+        from .mc_correlation_sizing import mc_correlation_adjustment
+        # Get existing portfolio tickers from entry_anchors
+        _existing_tickers = []
+        if conn is not None:
+            try:
+                _ea = conn.execute(
+                    "SELECT DISTINCT Ticker FROM entry_anchors WHERE Status = 'OPEN'"
+                ).fetchdf()
+                _existing_tickers = _ea["Ticker"].tolist() if not _ea.empty else []
+            except Exception:
+                pass
+
+        if _existing_tickers and "MC_Max_Contracts" in df_allocated.columns:
+            _corr_count = 0
+            for idx, row in df_allocated.iterrows():
+                _ticker = str(row.get("Ticker", "") or "")
+                _mc_max = int(row.get("MC_Max_Contracts", 0) or 0)
+                if _ticker and _mc_max > 0:
+                    _ca = mc_correlation_adjustment(_ticker, _existing_tickers, _mc_max)
+                    if _ca["MC_Corr_Adjustment"] < 1.0:
+                        df_allocated.at[idx, "MC_Max_Contracts"] = _ca["MC_Corr_Max_Contracts"]
+                        df_allocated.at[idx, "Thesis_Max_Envelope"] = _ca["MC_Corr_Max_Contracts"]
+                        df_allocated.at[idx, "Contracts"] = _ca["MC_Corr_Max_Contracts"]
+                        _corr_count += 1
+                    for k, v in _ca.items():
+                        if k not in df_allocated.columns:
+                            df_allocated[k] = np.nan if isinstance(v, (int, float)) else ""
+                        df_allocated.at[idx, k] = v
+            if _corr_count > 0:
+                logger.info(f"📐 Correlation-aware sizing adjusted {_corr_count} positions")
+    except Exception as _corr_err:
+        logger.warning(f"⚠️ Correlation sizing failed (non-fatal): {_corr_err}")
+
+    # Step 4c: Trajectory-aware contract scaling
+    # EARLY_BREAKOUT / IMPROVING signals are fresh opportunities worth sizing into.
+    # LATE_CONFIRMATION means the move is largely priced in — don't overcommit.
+    # DEGRADING signals are actively deteriorating — scale down further.
+    # This scales the MC_Max_Contracts / Thesis_Max_Envelope before Vince caps it.
+    _TRAJECTORY_SCALE = {
+        'TREND_FORMING':     1.25,  # +25%: chart signals detect trend building before score confirms
+        'EARLY_BREAKOUT':    1.20,  # +20%: fresh breakout, size up
+        'IMPROVING':         1.10,  # +10%: strengthening, modest boost
+        'STABLE':            1.00,  # no change
+        'LATE_CONFIRMATION': 0.80,  # -20%: move largely done, scale down
+        'DEGRADING':         0.70,  # -30%: actively deteriorating, pull back
+    }
+    if 'Signal_Trajectory' in df_allocated.columns:
+        _traj_count = 0
+        for idx, row in df_allocated.iterrows():
+            _traj = str(row.get('Signal_Trajectory', 'STABLE') or 'STABLE').upper()
+            _scale = _TRAJECTORY_SCALE.get(_traj, 1.0)
+            if _scale == 1.0:
+                df_allocated.at[idx, 'Trajectory_Contract_Scale'] = 1.0
+                continue
+
+            for _col in ('MC_Max_Contracts', 'Thesis_Max_Envelope', 'Contracts'):
+                if _col in df_allocated.columns:
+                    _cur = pd.to_numeric(df_allocated.at[idx, _col], errors='coerce')
+                    if pd.notna(_cur) and _cur > 0:
+                        _new = max(1, int(round(_cur * _scale)))
+                        df_allocated.at[idx, _col] = _new
+
+            df_allocated.at[idx, 'Trajectory_Contract_Scale'] = round(_scale, 2)
+            _traj_count += 1
+
+        if _traj_count > 0:
+            logger.info(f"📈 Trajectory contract scaling adjusted {_traj_count} positions")
+    else:
+        df_allocated['Trajectory_Contract_Scale'] = 1.0
+
     # Step 5: Vince optimal-f constraint
     # Vince (1992): when historical trade P&L is available, use optimal-f to constrain
     # the MC contract ceiling. f* is derived from the trade distribution that actually

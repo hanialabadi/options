@@ -47,6 +47,7 @@ Contract modelling
   CSP / COVERED_CALL / CC      → short premium; loss = assignment - credit
   STRADDLE / STRANGLE          → net debit long vol; P&L from larger move
   CASH_SECURED_PUT             → short put, same as CSP
+  PMCC (DIAGONAL_CALL)         → long LEAP + short call; loss capped at net debit
 
 Volatility input priority
 --------------------------
@@ -72,12 +73,15 @@ import pandas as pd
 from typing import Optional
 
 from .ewma_vol import ewma_vol
+from core.shared.mc.paths import (
+    gbm_terminal, gbm_terminal_with_jumps, JumpConfig, TRADING_DAYS,
+)
+from core.shared.mc.pnl_models import compute_terminal_pnl
 
 logger = logging.getLogger(__name__)
 
 # ── Simulation constants ────────────────────────────────────────────────────
-N_PATHS        = 2_000   # paths per ticker — fast enough for pipeline, stable enough for P10
-TRADING_DAYS   = 252
+N_PATHS        = 5_000   # paths per ticker — 5K stabilises CVaR tail (worst 10% uses 500 paths)
 MIN_DTE        = 1       # floor to avoid division-by-zero on same-day expiry
 HV_FALLBACK    = 0.30    # 30% annualised — conservative fallback when HV/IV unavailable
 MAX_RISK_PCT   = 0.02    # 2% account risk per trade (McMillan Ch.3 hard cap)
@@ -100,6 +104,7 @@ _LONG_PREMIUM   = {"LONG_CALL", "LONG_PUT", "LEAP", "ULTRA_LEAP",
                    "STRADDLE", "STRANGLE", "LONG_STRADDLE", "LONG_STRANGLE"}
 _SHORT_PUT      = {"CASH_SECURED_PUT", "CSP", "PUT_CREDIT_SPREAD", "BULL_PUT_SPREAD"}
 _SHORT_CALL     = {"COVERED_CALL", "CC", "CALL_CREDIT_SPREAD", "BEAR_CALL_SPREAD"}
+_DIAGONAL_CALL  = {"PMCC"}  # diagonal: long LEAP call + short near-term call
 _INCOME         = _SHORT_PUT | _SHORT_CALL | {"IRON_CONDOR", "IRON_BUTTERFLY",
                                                "BUY_WRITE", "COVERED_CALL_DIAGONAL"}
 
@@ -116,30 +121,64 @@ def _resolve_hv(row: pd.Series) -> tuple[float, str]:
       4. IV30_Call / Implied_Volatility — IV proxy when HV absent
       5. HV_FALLBACK (30%) — last resort
 
+    After resolving HV, applies an IV floor: when IV > HV by >20%, the market
+    is pricing in expected future vol that HV hasn't captured yet (Bennett:
+    "total volatility = diffusive + jump volatility"). Using HV alone would
+    underestimate the real distribution width.
+
     Returns (vol, source) so callers can log which source was used.
     """
+    hv_val = None
+    hv_src = "HV_FALLBACK"
+
     # Priority 1: EWMA from DuckDB price history (forward-leaning)
     ticker = row.get("Ticker") or row.get("ticker")
     if ticker:
         try:
             ewma = ewma_vol(str(ticker))
             if ewma is not None and 0.01 <= ewma <= 5.0:
-                return ewma, f"EWMA(λ=0.94,{ticker})"
+                hv_val, hv_src = ewma, f"EWMA(λ=0.94,{ticker})"
         except Exception:
             pass  # fall through to static columns
 
     # Priority 2-4: static columns from snapshot
-    for col in ("hv_30", "HV_30_D_Cur", "hv_20", "HV_20_D_Cur",
-                "hv_60", "HV_60_D_Cur", "IV30_Call", "Implied_Volatility"):
-        val = row.get(col)
-        if val is not None and pd.notna(val):
-            v = float(val)
-            if v > 1.0:   # stored as percentage (e.g. 28.5 → 0.285)
-                v /= 100.0
-            if 0.01 <= v <= 5.0:
-                return v, col
+    if hv_val is None:
+        for col in ("hv_30", "HV_30_D_Cur", "hv_20", "HV_20_D_Cur",
+                    "hv_60", "HV_60_D_Cur", "IV30_Call", "Implied_Volatility"):
+            val = row.get(col)
+            if val is not None and pd.notna(val):
+                v = float(val)
+                if v > 1.0:   # stored as percentage (e.g. 28.5 → 0.285)
+                    v /= 100.0
+                if 0.01 <= v <= 5.0:
+                    hv_val, hv_src = v, col
+                    break
 
-    return HV_FALLBACK, "HV_FALLBACK"
+    if hv_val is None:
+        hv_val = HV_FALLBACK
+
+    # ── IV floor: when market-implied vol exceeds realized vol by >20%,
+    # use a blend that acknowledges the market's forward-looking view.
+    # Bennett: "total vol = diffusive vol + jump vol" — HV only captures diffusive.
+    # Blend: 70% HV + 30% IV — anchored on realized but respects the market signal.
+    _iv_raw = None
+    for _iv_col in ("iv_30d", "IV30_Call", "Implied_Volatility"):
+        _iv_v = row.get(_iv_col)
+        if _iv_v is not None and pd.notna(_iv_v):
+            _iv_f = float(_iv_v)
+            if _iv_f > 1.0:
+                _iv_f /= 100.0
+            if 0.01 <= _iv_f <= 5.0:
+                _iv_raw = _iv_f
+                break
+
+    if _iv_raw is not None and _iv_raw > hv_val * 1.20:
+        # IV exceeds HV by >20% — blend to capture expected future vol
+        blended = 0.70 * hv_val + 0.30 * _iv_raw
+        hv_src = f"{hv_src}+IV_blend"
+        hv_val = blended
+
+    return hv_val, hv_src
 
 
 def _resolve_spot(row: pd.Series) -> Optional[float]:
@@ -166,9 +205,27 @@ def _resolve_premium(row: pd.Series) -> Optional[float]:
     return None
 
 
+def _resolve_pmcc_legs(row: pd.Series) -> Optional[dict]:
+    """Extract PMCC dual-leg parameters.  Returns None if LEAP data missing."""
+    leap_strike = row.get("PMCC_LEAP_Strike")
+    leap_mid = row.get("PMCC_LEAP_Mid") or row.get("PMCC_LEAP_Last")
+    net_debit = row.get("PMCC_Net_Debit")
+    if leap_strike is None or pd.isna(leap_strike):
+        return None
+    if leap_mid is None or pd.isna(leap_mid):
+        return None
+    return {
+        "leap_strike": float(leap_strike),
+        "leap_premium": float(leap_mid),
+        "net_debit": float(net_debit) if net_debit is not None and pd.notna(net_debit) else None,
+    }
+
+
 def _classify_strategy(strategy_name: str) -> str:
-    """Return 'LONG', 'SHORT_PUT', 'SHORT_CALL', 'INCOME', or 'UNKNOWN'."""
+    """Return 'LONG', 'SHORT_PUT', 'SHORT_CALL', 'INCOME', 'DIAGONAL_CALL', or 'UNKNOWN'."""
     s = str(strategy_name).upper().replace(" ", "_").replace("-", "_")
+    if s in _DIAGONAL_CALL:
+        return "DIAGONAL_CALL"
     if s in _LONG_PREMIUM:
         return "LONG"
     if s in _SHORT_PUT:
@@ -194,9 +251,13 @@ def simulate_pnl_paths(
     dte: int,
     premium: float,
     option_type: str,          # 'call' or 'put'
-    strategy_class: str,       # 'LONG', 'SHORT_PUT', 'SHORT_CALL', 'INCOME'
+    strategy_class: str,       # 'LONG', 'SHORT_PUT', 'SHORT_CALL', 'INCOME', 'DIAGONAL_CALL'
     n_paths: int = N_PATHS,
     rng: Optional[np.random.Generator] = None,
+    *,
+    leap_strike: Optional[float] = None,
+    net_debit: Optional[float] = None,
+    macro_calibration: Optional[dict] = None,
 ) -> np.ndarray:
     """
     Simulate `n_paths` option P&L outcomes (per-share, $) at expiry.
@@ -206,14 +267,16 @@ def simulate_pnl_paths(
     Parameters
     ----------
     spot         : current underlying price
-    strike       : option strike
+    strike       : option strike (short call strike for DIAGONAL_CALL)
     hv_annual    : annualised HV as decimal (e.g. 0.285)
     dte          : days to expiry (will be floored at MIN_DTE)
     premium      : option mid-price per share (debit paid / credit received)
     option_type  : 'call' or 'put'
-    strategy_class: 'LONG' | 'SHORT_PUT' | 'SHORT_CALL' | 'INCOME'
+    strategy_class: 'LONG' | 'SHORT_PUT' | 'SHORT_CALL' | 'INCOME' | 'DIAGONAL_CALL'
     n_paths      : number of GBM paths
     rng          : optional numpy Generator for reproducibility
+    leap_strike  : LEAP call strike (DIAGONAL_CALL only)
+    net_debit    : total net debit per share (DIAGONAL_CALL only)
 
     Returns
     -------
@@ -222,71 +285,51 @@ def simulate_pnl_paths(
     if rng is None:
         rng = np.random.default_rng(SEED)
 
-    dte_safe     = max(dte, MIN_DTE)
-    t_years      = dte_safe / TRADING_DAYS
-    drift        = 0.0                         # risk-neutral; no directional drift assumption
-    sigma_daily  = hv_annual / np.sqrt(TRADING_DAYS)
+    dte_safe = max(dte, MIN_DTE)
 
-    # GBM + Merton jump-diffusion terminal prices:
-    # S_T = S_0 * exp((μ - σ²/2 - λ*k)*T + σ*√T*Z + Σ J_i)
-    # where J_i ~ N(μ_J, σ_J²) are Poisson(λ*T) jump events,
-    # and k = exp(μ_J + σ_J²/2) - 1 compensates for the jump drift.
-    # Reference: Merton (1976), Gatheral Ch.2 — jump-diffusion option pricing.
-    z = rng.standard_normal(n_paths)
+    # ── GBM terminal prices via shared path generator ────────────────────
+    if JUMP_ENABLED:
+        # Build JumpConfig, applying macro calibration if present
+        _j_intensity = JUMP_INTENSITY
+        _j_mean = JUMP_MEAN
+        _j_std = JUMP_STD
+        if macro_calibration is not None:
+            _j_intensity *= macro_calibration.get("jump_intensity_mult", 1.0)
+            _j_std *= macro_calibration.get("jump_std_mult", 1.0)
+            _j_mean += macro_calibration.get("jump_mean_adj", 0.0)
 
-    if JUMP_ENABLED and t_years > 0:
-        # Poisson number of jumps in [0, T]
-        n_jumps = rng.poisson(JUMP_INTENSITY * dte_safe, size=n_paths)
-        # Aggregate jump sizes: sum of N(JUMP_MEAN, JUMP_STD) for each jump event
-        jump_component = np.zeros(n_paths)
-        max_jumps = n_jumps.max() if n_jumps.max() > 0 else 0
-        if max_jumps > 0:
-            # Vectorized: generate max_jumps per path, mask out unused
-            all_jumps = rng.normal(JUMP_MEAN, JUMP_STD, size=(n_paths, max_jumps))
-            for j in range(max_jumps):
-                mask = n_jumps > j
-                jump_component[mask] += all_jumps[mask, j]
-        # Drift compensation: E[e^J] - 1, ensures risk-neutral pricing
-        # JUMP_INTENSITY is per-day; annualize for the log-return drift formula
-        k = np.exp(JUMP_MEAN + 0.5 * JUMP_STD**2) - 1
-        lambda_annual = JUMP_INTENSITY * TRADING_DAYS
-        drift_adj = drift - lambda_annual * k
-        log_ret = (drift_adj - 0.5 * hv_annual**2) * t_years + hv_annual * np.sqrt(t_years) * z + jump_component
+        jc = JumpConfig(intensity=_j_intensity, mean=_j_mean, std=_j_std)
+        s_T = gbm_terminal_with_jumps(
+            spot, hv_annual, dte_safe, n_paths, rng, jc
+        )
     else:
-        log_ret = (drift - 0.5 * hv_annual**2) * t_years + hv_annual * np.sqrt(t_years) * z
+        s_T = gbm_terminal(spot, hv_annual, dte_safe, n_paths, rng)
 
-    s_T = spot * np.exp(log_ret)
-
+    # ── P&L via shared pnl_models dispatch ───────────────────────────────
     is_call = str(option_type).lower().startswith("c")
 
-    if strategy_class == "LONG":
-        # Long option: P&L = intrinsic at expiry - premium paid
-        if is_call:
-            intrinsic = np.maximum(s_T - strike, 0.0)
-        else:
-            intrinsic = np.maximum(strike - s_T, 0.0)
-        pnl = intrinsic - premium
-
-    elif strategy_class in ("SHORT_PUT", "INCOME") and not is_call:
-        # Short put / CSP: credit received minus loss on assignment
-        if is_call:
-            loss_on_assign = np.maximum(s_T - strike, 0.0)
-        else:
-            loss_on_assign = np.maximum(strike - s_T, 0.0)
-        pnl = premium - loss_on_assign
-
-    elif strategy_class in ("SHORT_CALL", "INCOME") and is_call:
-        # Short call / covered call: credit received minus call loss
-        loss_on_assign = np.maximum(s_T - strike, 0.0)
-        pnl = premium - loss_on_assign
-
+    # Map strategy_class to shared pnl_model key
+    _model_map = {
+        "LONG": "long_option",
+        "SHORT_PUT": "short_put",
+        "SHORT_CALL": "short_call",
+        "DIAGONAL_CALL": "pmcc",
+    }
+    # INCOME class: dispatch by call/put
+    if strategy_class == "INCOME":
+        model_key = "short_call" if is_call else "short_put"
     else:
-        # Generic fallback: treat as long
-        if is_call:
-            intrinsic = np.maximum(s_T - strike, 0.0)
-        else:
-            intrinsic = np.maximum(strike - s_T, 0.0)
-        pnl = intrinsic - premium
+        model_key = _model_map.get(strategy_class, "long_option")
+
+    pnl = compute_terminal_pnl(
+        model=model_key,
+        s_terminal=s_T,
+        strike=strike,
+        premium=premium,
+        is_call=is_call,
+        leap_strike=leap_strike or 0.0,
+        net_debit=net_debit or 0.0,
+    )
 
     # Per-share → per-contract scale happens outside (caller multiplies by 100)
     return pnl
@@ -331,7 +374,20 @@ def mc_size_row(
     if strike_raw is None or (isinstance(strike_raw, float) and pd.isna(strike_raw)):
         result["MC_Sizing_Note"] = "MC_SKIP: no Selected_Strike"
         return result
-    strike = float(strike_raw)
+    # Multi-leg strategies store strikes as JSON list e.g. "[100.0, 120.0]"
+    # PMCC: [leap_strike, short_strike] — use short strike as primary
+    # Others: use closer strike (conservative)
+    _strike_str = str(strike_raw).strip()
+    if _strike_str.startswith("["):
+        import json as _json
+        try:
+            _strikes = _json.loads(_strike_str)
+            strike = float(max(_strikes))  # short call strike (higher) for PMCC
+        except (ValueError, TypeError):
+            result["MC_Sizing_Note"] = f"MC_SKIP: unparseable strike list {_strike_str}"
+            return result
+    else:
+        strike = float(strike_raw)
     if strike <= 0:
         result["MC_Sizing_Note"] = "MC_SKIP: strike ≤ 0"
         return result
@@ -353,6 +409,35 @@ def mc_size_row(
     strategy_name  = str(row.get("Strategy_Name", "") or "")
     strategy_class = _classify_strategy(strategy_name)
 
+    # ── PMCC diagonal: resolve LEAP leg parameters ─────────────────────────
+    _pmcc_kw = {}
+    if strategy_class == "DIAGONAL_CALL":
+        pmcc_legs = _resolve_pmcc_legs(row)
+        if pmcc_legs is not None:
+            _pmcc_kw["leap_strike"] = pmcc_legs["leap_strike"]
+            _pmcc_kw["net_debit"] = pmcc_legs["net_debit"] or premium
+            # Override premium to net debit for sizing (max loss = net debit)
+            premium = pmcc_legs["net_debit"] or premium
+        else:
+            # Fallback: treat as long call on the short call strike
+            strategy_class = "LONG"
+        # PMCC option_type is 'pmcc' from step10; force 'call' for the P&L model
+        option_type = "call"
+
+    # ── Macro event calibration ─────────────────────────────────────────────
+    # When the position is within a macro event week, MC uses empirical
+    # event impact data to calibrate jump parameters. This produces fatter
+    # tails that reflect actual macro-driven market reactions.
+    _macro_cal = None
+    _is_macro_week = bool(row.get("Is_Macro_Week", False))
+    _macro_type = str(row.get("Macro_Next_Type", "") or "").upper()
+    if _is_macro_week and _macro_type:
+        try:
+            from core.shared.data_layer.macro_event_impact import get_mc_macro_calibration
+            _macro_cal = get_mc_macro_calibration(_macro_type)
+        except Exception:
+            pass  # non-blocking — fall back to default jump params
+
     # ── Run simulation ──────────────────────────────────────────────────────
     try:
         pnl_per_share = simulate_pnl_paths(
@@ -365,6 +450,8 @@ def mc_size_row(
             strategy_class=strategy_class,
             n_paths=n_paths,
             rng=rng,
+            macro_calibration=_macro_cal,
+            **_pmcc_kw,
         )
     except Exception as exc:
         logger.warning(f"MC simulation failed for {row.get('Ticker','?')}: {exc}")
@@ -372,6 +459,41 @@ def mc_size_row(
         return result
 
     pnl_per_contract = pnl_per_share * 100.0   # standard 100-share multiplier
+
+    # ── IV crush overlay for long options at elevated IV ──────────────────
+    # Natenberg: "mean-reversion characteristics of volatility"
+    # Passarelli: "risk of a decline in IV" for long vega strategies
+    # When IV_Rank > 70 and IV > HV, deduct expected vega drag from each path.
+    # Crush estimate: vega × (IV - HV) × crush_factor, where crush_factor
+    # represents the expected fraction of the gap that mean-reverts over DTE.
+    # Empirical: ~50% reversion over 30-40 DTE (Natenberg term structure).
+    _iv_crush_applied = False
+    if strategy_class == "LONG":
+        _ivr_mc = pd.to_numeric(row.get('IV_Rank_20D'), errors='coerce')
+        _iv_mc  = pd.to_numeric(row.get('iv_30d') or row.get('Implied_Volatility'), errors='coerce')
+        _hv_mc  = pd.to_numeric(row.get('hv_30') or row.get('HV30'), errors='coerce')
+        _vega_mc = pd.to_numeric(row.get('Vega'), errors='coerce')
+
+        if (pd.notna(_ivr_mc) and float(_ivr_mc) > 70
+                and pd.notna(_iv_mc) and pd.notna(_hv_mc)
+                and pd.notna(_vega_mc) and float(_vega_mc) > 0):
+            iv_f = float(_iv_mc)
+            hv_f = float(_hv_mc)
+            # Both stored as percentage (e.g. 35.8)
+            gap_pts = iv_f - hv_f
+            if gap_pts > 0:
+                crush_factor = 0.50  # expect 50% reversion
+                # vega is per 1% IV move per share; gap in percentage points
+                vega_drag_per_share = float(_vega_mc) * gap_pts * crush_factor
+                pnl_per_contract -= vega_drag_per_share * 100.0
+                _iv_crush_applied = True
+
+    # ── Defined-risk floor for long/diagonal options ─────────────────────
+    # A long call/put cannot lose more than premium paid; PMCC cannot lose
+    # more than net debit.  Floor all paths at -premium × 100.
+    if strategy_class in ("LONG", "DIAGONAL_CALL"):
+        _max_loss = premium * 100.0
+        pnl_per_contract = np.maximum(pnl_per_contract, -_max_loss)
 
     p10 = float(np.percentile(pnl_per_contract, 10))
     p50 = float(np.percentile(pnl_per_contract, 50))
@@ -395,6 +517,12 @@ def mc_size_row(
             assign_prob = float(np.mean(pnl_per_share * 100 < 0))  # loss ↔ ITM for short
         else:
             assign_prob = float(np.mean(pnl_per_contract < 0))
+    elif strategy_class == "DIAGONAL_CALL":
+        # PMCC: short call assignment risk = fraction of paths where
+        # spread is at max profit (S_T > short strike → short call ITM)
+        # Approximate from P&L: max gain paths are the assigned paths
+        _max_gain = (strike - _pmcc_kw.get("leap_strike", strike)) - premium if _pmcc_kw else 0
+        assign_prob = float(np.mean(pnl_per_contract >= _max_gain * 100 * 0.95)) if _max_gain > 0 else np.nan
     else:
         assign_prob = np.nan
 
@@ -434,18 +562,22 @@ def mc_size_row(
     per_1k = (1000.0 / capital_deployed) if capital_deployed > 0 else np.nan
 
     # 1. Max loss per contract ($) — worst case for longs is full premium; shorts = unbounded
-    #    For longs: max loss = capital deployed (premium paid)
+    #    For longs/diagonals: max loss = capital deployed (premium/net debit paid)
     #    For income/short: max loss = CVaR tail (assignment/gap risk)
-    if strategy_class == "LONG":
-        max_loss_per_contract = capital_deployed   # premium paid, fully at risk
+    if strategy_class in ("LONG", "DIAGONAL_CALL"):
+        max_loss_per_contract = capital_deployed   # premium/net_debit paid, fully at risk
     else:
         max_loss_per_contract = abs(cvar) if cvar < 0 else capital_deployed
 
     # 2. Breakeven distance (%) — how far underlying must move to break even at expiry
     #    Long call: breakeven = strike + premium; Long put: breakeven = strike - premium
+    #    PMCC: breakeven = leap_strike + net_debit
     #    Expressed as % of spot price (higher = harder to reach)
     is_call_be = option_type.startswith("c")
-    if is_call_be:
+    if strategy_class == "DIAGONAL_CALL" and _pmcc_kw.get("leap_strike"):
+        breakeven_price = _pmcc_kw["leap_strike"] + premium
+        breakeven_distance_pct = ((breakeven_price - spot) / spot) * 100.0
+    elif is_call_be:
         breakeven_price = strike + premium
         breakeven_distance_pct = ((breakeven_price - spot) / spot) * 100.0
     else:
@@ -505,6 +637,12 @@ def mc_size_row(
     )
     if not np.isnan(assign_prob):
         note += f" | AssignProb={assign_prob:.0%}"
+    if _iv_crush_applied:
+        note += " | IV_CRUSH_ADJ"
+    if _macro_cal is not None:
+        _cal_src = _macro_cal.get("calibration_source", "default")
+        _cal_n = _macro_cal.get("n_events", 0)
+        note += f" | MACRO_CAL({_macro_type},{_cal_src},n={_cal_n})"
 
     result.update({
         "MC_CVaR":                      round(cvar, 2),
@@ -578,11 +716,10 @@ def compute_vince_f_star(
     }
 
     try:
-        import duckdb
-        from pathlib import Path
+        from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
         _owns_conn = conn is None
         if _owns_conn:
-            conn = duckdb.connect(str(Path(db_path)), read_only=True)
+            conn = get_domain_connection(DbDomain.MANAGEMENT, read_only=True)
 
         # --- Attempt 1: closed_trades P&L series ---------------------------------
         rows = conn.execute("""
@@ -789,13 +926,22 @@ def run_mc_sizing(
 
     skipped = 0
     for idx, row in df.iterrows():
-        mc = mc_size_row(
-            row=row,
-            account_balance=account_balance,
-            max_risk_pct=max_risk_pct,
-            n_paths=n_paths,
-            rng=rng,
-        )
+        try:
+            mc = mc_size_row(
+                row=row,
+                account_balance=account_balance,
+                max_risk_pct=max_risk_pct,
+                n_paths=n_paths,
+                rng=rng,
+            )
+        except Exception as _row_err:
+            logger.debug(f"MC row {row.get('Ticker','?')} failed: {_row_err}")
+            mc = {
+                "MC_P10_Loss": np.nan, "MC_P50_Outcome": np.nan, "MC_P90_Gain": np.nan,
+                "MC_Win_Probability": np.nan, "MC_Assign_Prob": np.nan,
+                "MC_Max_Contracts": 1, "MC_Sizing_Note": f"MC_ERROR: {_row_err}",
+                "MC_Paths_Used": 0, "Sizing_Method_Used": "FIXED",
+            }
         for col, val in mc.items():
             if col in df.columns or col in mc_cols:
                 df.at[idx, col] = val

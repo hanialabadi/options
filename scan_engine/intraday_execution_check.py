@@ -461,6 +461,18 @@ def evaluate_intraday_readiness(
 
         # Composite score
         score = compute_composite_score(vwap_signal, momentum, spread_grade, iv_spike_signal)
+
+        # Calendar risk adjustment — Friday/holiday theta awareness, DTE-scaled
+        _cal_flag = str(row.get('Calendar_Risk_Flag', '') or '').upper()
+        if _cal_flag in ('HIGH_BLEED', 'ELEVATED_BLEED', 'PRE_HOLIDAY_EDGE', 'ADVANTAGEOUS'):
+            _cal_dte = float(row.get('Actual_DTE', 0) or 0)
+            _cal_theta_f = min(1.0, 45.0 / _cal_dte) if _cal_dte > 0 else 1.0
+            _cal_adj = {
+                'HIGH_BLEED': -25, 'ELEVATED_BLEED': -20,
+                'PRE_HOLIDAY_EDGE': 20, 'ADVANTAGEOUS': 15,
+            }[_cal_flag]
+            score = max(0, min(100, score + int(round(_cal_adj * _cal_theta_f))))
+
         readiness = classify_readiness(score)
 
         # Write results

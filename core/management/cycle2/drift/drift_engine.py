@@ -49,132 +49,33 @@ class DriftEngine:
           DEGRADED  — one or more metrics approaching threshold (monitor)
           VIOLATED  — one or more metrics exceeded threshold (action required)
 
-        Signed ROC thresholds (thesis-aware):
-          PCS_Drift > 15                     → DEGRADED;  > 25       → VIOLATED
-          Delta_1D_DriftTail abs > 0.20      → DEGRADED  (tail event: direction matters less)
-          Delta_ROC_3D  < -0.15              → DEGRADED  (delta falling = deterioration for longs)
-          Delta_ROC_3D  < -0.30              → VIOLATED
-          Vega_ROC_3D   < -0.20              → DEGRADED  (IV crush hurts long vol)
-          Vega_ROC_3D   >  0.20              → DEGRADED  (IV spike hurts short vol)  [abs symmetric]
-          Gamma_ROC_3D  > +0.25 (short-gamma, DTE>30) → DEGRADED  (gamma accelerating against short)
-          Gamma_ROC_3D  > +0.50 (short-gamma, DTE>30) → VIOLATED
-          Gamma_ROC_3D  < -0.25 (long-gamma,  DTE>30) → DEGRADED  (convexity eroding)
-          Gamma_ROC_3D  < -0.50 (long-gamma,  DTE>30) → VIOLATED
-          DTE ≤ 30: Gamma ROC signal suppressed — mechanical expiry spike, not structural
-          IV_ROC_3D     < -0.15              → DEGRADED  (IV crush — primary long-vol deterioration)
-          IV_ROC_3D     < -0.30              → VIOLATED
-          ROC_Persist_3D >= 2 required       → prevents single-day noise from firing
+        Architecture:
+          Tier 1 (PCS drift) and Tier 2 (Delta_1D_DriftTail) are blanket rules —
+          they apply uniformly regardless of strategy.
 
-        Persistence gate: ROC escalation requires at least 2 consecutive confirmed
-        snapshots (ROC_Persist_3D column from compute_windowed_drift). If the column
-        is absent, persistence is assumed satisfied to avoid silent failures.
+          Tier 3 (Greek ROC: Delta, Vega, Gamma, IV) is profile-driven via
+          signal_profiles.py. Each strategy family declares how each Greek ROC
+          should be interpreted (signed long/short, exempt, far-OTM income guard).
+          Adding a new strategy = adding a profile entry, not touching the engine.
+
+        Thresholds: config/indicator_settings.py → SIGNAL_DRIFT_THRESHOLDS
+        Profiles:   core/management/cycle2/drift/signal_profiles.py
         """
+        from core.management.cycle2.drift.signal_profiles import apply_signal_profiles
+
         df['Signal_State'] = 'VALID'
 
-        # --- Tier 1: PCS drift (position score degradation — always signed, higher = worse) ---
-        if 'PCS_Drift' in df.columns:
-            df.loc[df['PCS_Drift'] > 15, 'Signal_State'] = 'DEGRADED'
-            df.loc[df['PCS_Drift'] > 25, 'Signal_State'] = 'VIOLATED'
+        # NOTE: Tier 1 (PCS_Drift) and Tier 2 (Delta_1D_DriftTail) were removed —
+        # these columns are never computed by any upstream module. The code was dead
+        # (guarded by `if col in df.columns` which never evaluated True). If PCS_Drift
+        # or Delta_1D_DriftTail are implemented in the future, they should be added as
+        # profile-aware rules in signal_profiles.py, not blanket thresholds here.
 
-        # --- Tier 2: Single-day delta tail (extreme overnight move — abs, direction less relevant) ---
-        if 'Delta_1D_DriftTail' in df.columns:
-            df.loc[df['Delta_1D_DriftTail'].abs() > 0.20, 'Signal_State'] = 'DEGRADED'
-
-        # --- Tier 3: Greek ROC — thesis-aware signed thresholds + persistence gate ---
-        # Persistence gate: ROC_Persist_3D >= 2 means the ROC was negative/violated
-        # on at least 2 consecutive snapshots (not just one noisy day).
-        # If persistence column is missing, default to True (don't silently suppress).
-        if 'ROC_Persist_3D' in df.columns:
-            _persist_ok = df['ROC_Persist_3D'].fillna(0) >= 2
-        else:
-            _persist_ok = pd.Series(True, index=df.index)
-
-        def _escalate(mask: pd.Series, target_state: str) -> None:
-            """Escalate only; never downgrade. VIOLATED always beats DEGRADED."""
-            _already = df['Signal_State'] == 'VIOLATED'
-            if target_state == 'DEGRADED':
-                df.loc[mask & _persist_ok & ~_already, 'Signal_State'] = 'DEGRADED'
-            elif target_state == 'VIOLATED':
-                # Persistence threshold halved for VIOLATED — two days is enough to act.
-                if 'ROC_Persist_3D' in df.columns:
-                    _persist_vio = df['ROC_Persist_3D'].fillna(0) >= 1
-                else:
-                    _persist_vio = pd.Series(True, index=df.index)
-                df.loc[mask & _persist_vio, 'Signal_State'] = 'VIOLATED'
-
-        # Delta ROC: thesis-aware — sign convention differs for puts vs calls.
-        # LONG_CALL / BUY_CALL / LEAPS_CALL: delta should be rising (positive ROC).
-        #   Negative Delta_ROC_3D = delta falling = losing sensitivity = thesis eroding.
-        #   → escalate on _d < -0.15 (deterioration).
-        #
-        # LONG_PUT / BUY_PUT / LEAPS_PUT: delta is negative and should be growing MORE negative
-        #   (e.g. -0.45 → -0.58) as stock falls toward strike. Delta_ROC_3D = -0.16 for
-        #   TSLA put where stock has moved $6 bearish = the put IS working.
-        #   Applying _d < -0.15 to a put fires DEGRADED when the thesis is succeeding.
-        #   → for puts, escalate on _d > +0.15 (delta recovering toward zero = thesis eroding).
-        #   → for puts, _d < -0.15 means direction IS working — do NOT escalate.
-        #
-        # Doctrine: Passarelli Ch.2: "Greek drift must be evaluated relative to thesis
-        #   direction — a falling delta on a put means the stock is moving against you,
-        #   not toward you." McMillan Ch.4: "Direction alignment is the primary signal."
-        if 'Delta_ROC_3D' in df.columns and 'Strategy' in df.columns:
-            _d = df['Delta_ROC_3D']
-            _strat_d = df['Strategy'].fillna('').str.upper()
-            _is_put_d = _strat_d.isin({'LONG_PUT', 'BUY_PUT', 'LEAPS_PUT'})
-            _is_call_d = _strat_d.isin({'LONG_CALL', 'BUY_CALL', 'LEAPS_CALL'})
-
-            # Long calls: negative delta ROC = deterioration (delta falling)
-            _escalate(_is_call_d & (_d < -0.15), 'DEGRADED')
-            _escalate(_is_call_d & (_d < -0.30), 'VIOLATED')
-
-            # Long puts: POSITIVE delta ROC = deterioration (delta recovering toward zero)
-            # i.e. put losing sensitivity — stock moving away from strike
-            _escalate(_is_put_d & (_d > 0.15), 'DEGRADED')
-            _escalate(_is_put_d & (_d > 0.30), 'VIOLATED')
-
-            # All other strategies (CSP, BW, CC, straddle, etc.): apply original unsigned logic
-            _is_other_d = ~(_is_put_d | _is_call_d)
-            _escalate(_is_other_d & (_d < -0.15), 'DEGRADED')
-            _escalate(_is_other_d & (_d < -0.30), 'VIOLATED')
-
-        # Vega ROC: negative = IV crush (long vol deterioration); positive = IV spike (short vol risk).
-        # Both directions are risks depending on position — treat symmetrically.
-        if 'Vega_ROC_3D' in df.columns:
-            _v = df['Vega_ROC_3D']
-            _escalate(_v < -0.20, 'DEGRADED')
-            _escalate(_v >  0.20, 'DEGRADED')
-
-        # Gamma ROC: direction-aware, DTE-gated.
-        # Rising gamma on a short-gamma position (BUY_WRITE/CC) = acceleration against you.
-        # Falling gamma on a long-gamma position (long call/put/LEAP) = losing convexity.
-        # DTE gate: exclude mechanical expiry gamma spike (DTE <= 30).
-        # Symmetric abs() is wrong here — same logic as Delta/Vega.
-        if 'Gamma_ROC_3D' in df.columns and 'DTE' in df.columns:
-            _g     = df['Gamma_ROC_3D']
-            _dte   = pd.to_numeric(df['DTE'], errors='coerce').fillna(0)
-            _strat = df['Strategy'].fillna('') if 'Strategy' in df.columns else pd.Series('', index=df.index)
-
-            # Only meaningful when option is not approaching mechanical expiry
-            _dte_ok = _dte > 30
-
-            # Short-gamma structures: BUY_WRITE, COVERED_CALL — rising gamma is bad
-            _short_gamma = _strat.str.upper().isin({'BUY_WRITE', 'COVERED_CALL', 'CSP'})
-            _escalate(_short_gamma & _dte_ok & (_g >  0.25), 'DEGRADED')
-            _escalate(_short_gamma & _dte_ok & (_g >  0.50), 'VIOLATED')
-
-            # Long-gamma structures: long calls, puts, LEAPs — falling gamma is bad
-            _long_gamma = _strat.str.upper().isin({
-                'LONG_CALL', 'BUY_CALL', 'LONG_PUT', 'BUY_PUT',
-                'LEAPS_CALL', 'LEAPS_PUT',
-            })
-            _escalate(_long_gamma & _dte_ok & (_g < -0.25), 'DEGRADED')
-            _escalate(_long_gamma & _dte_ok & (_g < -0.50), 'VIOLATED')
-
-        # IV ROC: signed — negative = IV crush (primary deterioration for long vol positions).
-        if 'IV_ROC_3D' in df.columns:
-            _iv = df['IV_ROC_3D']
-            _escalate(_iv < -0.15, 'DEGRADED')
-            _escalate(_iv < -0.30, 'VIOLATED')
+        # --- Tier 3: Greek ROC — profile-driven, strategy-aware ---
+        # Delegates to signal_profiles.apply_signal_profiles() which loops over
+        # strategy family profiles. Each profile declares sign conventions,
+        # far-OTM exemptions, DTE gates, and thresholds per Greek ROC.
+        df = apply_signal_profiles(df)
 
         return df
 
@@ -378,16 +279,15 @@ class DriftEngine:
 
         # 5. Lifecycle Phase — only write if compute_basic_drift didn't produce it
         if 'Lifecycle_Phase' not in df.columns or df['Lifecycle_Phase'].isna().all():
-            if 'Days_In_Trade' in df.columns and 'Entry_DTE' in df.columns:
-                def get_phase(row):
-                    if pd.isna(row['Days_In_Trade']) or pd.isna(row['Entry_DTE']) or row['Entry_DTE'] == 0: return 'Mid'
-                    progress = row['Days_In_Trade'] / row['Entry_DTE']
-                    if progress < 0.25: return 'Early'
-                    if progress > 0.75: return 'Late'
-                    return 'Mid'
-                df['Lifecycle_Phase'] = df.apply(get_phase, axis=1)
+            if 'DTE' in df.columns:
+                df['Lifecycle_Phase'] = 'ACTIVE'
+                df.loc[df['DTE'] > 45, 'Lifecycle_Phase'] = 'ACTIVE'
+                df.loc[(df['DTE'] >= 14) & (df['DTE'] <= 45), 'Lifecycle_Phase'] = 'INCOME_WINDOW'
+                df.loc[df['DTE'] < 14, 'Lifecycle_Phase'] = 'TERMINAL'
+                if 'Days_In_Trade' in df.columns:
+                    df.loc[(df['Days_In_Trade'] <= 3) & (df['DTE'] > 45), 'Lifecycle_Phase'] = 'ENTRY'
             else:
-                df['Lifecycle_Phase'] = 'Mid'
+                df['Lifecycle_Phase'] = 'ACTIVE'
 
         return df
 
@@ -412,7 +312,7 @@ class DriftEngine:
             
         # 5. Data Stale or Signal Degraded or Regime Stressed
         if row['Data_State'] == 'STALE' or row['Signal_State'] == 'DEGRADED' or row['Regime_State'] == 'STRESSED':
-            return 'REVALIDATE'
+            return 'REVIEW'
             
         # 6. Portfolio Over Limit
         if row['Portfolio_State'] == 'OVER_LIMIT':
@@ -443,17 +343,62 @@ class DriftEngine:
             # Drift Overrides (Authoritative)
             if drift == 'FORCE_EXIT': return 'EXIT'
             if drift == 'HARD_HALT': return 'WAIT'
-            if drift == 'QUARANTINE': return 'REVALIDATE'
-            if drift == 'EXIT': return 'EXIT'
+            if drift == 'QUARANTINE': return 'REVIEW'
+            if drift == 'EXIT':
+                # ASSIGN, EXIT, and BUYBACK are all risk-reducing (closing the
+                # position). Respect the doctrine's EV-based choice among them
+                # rather than forcing EXIT unconditionally.
+                # E.g., ASSIGN (+$293 EV) beats EXIT when stock is above net cost
+                # and the call expires worthless — overriding to EXIT destroys the
+                # better outcome and creates decision instability.
+                _RISK_REDUCING = ('EXIT', 'BUYBACK', 'LET_EXPIRE',
+                                  'ACCEPT_CALL_AWAY', 'ACCEPT_SHARE_ASSIGNMENT')
+                if rec in _RISK_REDUCING:
+                    return rec  # already risk-reducing — preserve doctrine choice
+
+                # Recovery doctrine guard: when doctrine has determined the position
+                # is in a recovery state (RECOVERY_PREMIUM for BW, RECOVERY_LADDER
+                # for CSP/BW/CC), the doctrine already evaluated EXIT as an option
+                # and chose recovery based on EV comparison. Drift EXIT here would
+                # force realization of the full loss, destroying the recovery path.
+                # The position is already below cost basis — that's WHY it's in
+                # recovery mode. Premium collection is the rational repair strategy.
+                # (Jabbour Ch.4; Passarelli Ch.1: wheel conversion)
+                _RECOVERY_ACTIONS = ('ROLL_UP_OUT', 'WRITE_NOW',
+                                     'HOLD_STOCK_WAIT', 'PAUSE_WRITING',
+                                     'HOLD', 'ROLL')
+                _doctrine_state = str(row.get('Doctrine_State', '')).upper()
+                if _doctrine_state in ('RECOVERY_PREMIUM', 'RECOVERY_LADDER') and rec in _RECOVERY_ACTIONS:
+                    return rec  # recovery doctrine is authoritative — preserve recovery path
+
+                # Income structure guard: for BW/CC with a far-OTM near-expiry
+                # short call, doctrine HOLD = "let call expire worthless" which is
+                # functionally LET_EXPIRE. This is MORE risk-reducing than active
+                # EXIT (no spread to cross, no slippage, full premium captured).
+                # The EV comparator already evaluated EXIT vs HOLD and chose HOLD.
+                # Overriding to EXIT here destroys the income-optimal outcome.
+                # (McMillan Ch.3: near-expiry far-OTM short call is pure income)
+                if rec in ('HOLD', 'ROLL'):
+                    _strat = str(row.get('Strategy', row.get('Strategy_Name', ''))).upper()
+                    _is_income = any(s in _strat for s in ('BUY_WRITE', 'COVERED_CALL', 'CC', 'BW'))
+                    _delta = pd.to_numeric(row.get('Short_Call_Delta', row.get('Delta', None)),
+                                           errors='coerce')
+                    _dte = pd.to_numeric(row.get('DTE', None), errors='coerce')
+                    if (_is_income
+                            and _delta is not None and not np.isnan(_delta) and _delta < 0.30
+                            and _dte is not None and not np.isnan(_dte) and _dte <= 14):
+                        return rec  # income-optimal: far-OTM call expiring, doctrine is authoritative
+
+                return 'EXIT'
             
             # Risk Reduction Only
-            if drift == 'REVALIDATE':
-                if rec in ['HOLD', 'ENTER']: return 'REVALIDATE'
+            if drift == 'REVIEW':
+                if rec in ['HOLD', 'ENTER']: return 'REVIEW'
                 return rec
                 
             if drift == 'TRIM_ONLY':
                 if rec in ['HOLD', 'ENTER']: return 'TRIM'
-                return rec # EXIT or REVALIDATE are already risk-reducing
+                return rec # EXIT or REVIEW are already risk-reducing
                 
             return rec
 

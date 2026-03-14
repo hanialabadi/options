@@ -13,6 +13,7 @@ from .state_extractors.greek_dominance import compute_greek_dominance
 from .state_extractors.assignment_risk import compute_assignment_risk
 from .state_extractors.regime_stability import compute_regime_stability
 from .state_extractors.recovery_quality import compute_recovery_quality
+from .state_extractors.wave_phase import compute_wave_phase
 
 logger = logging.getLogger(__name__)
 
@@ -94,5 +95,33 @@ def compute_chart_state(df: pd.DataFrame, client=None) -> pd.DataFrame:
             df[f"{name}_Resolution_Reason"] = "ENGINE_ERROR"
             if name == "PriceStructure":
                 df["Structural_Data_Complete"] = False
-        
+
+    # ── WavePhase: runs AFTER all other extractors (reads their _State columns) ──
+    try:
+        if "Strategy" in df.columns:
+            _wp_mask = df["Strategy"] != STRATEGY_STOCK
+        else:
+            _wp_mask = pd.Series(True, index=df.index)
+
+        _wp_results = pd.Series([None] * len(df), index=df.index)
+        if _wp_mask.any():
+            _wp_results.loc[_wp_mask] = df.loc[_wp_mask].apply(compute_wave_phase, axis=1)
+
+        class _WPSkipped:
+            def __init__(self):
+                self.state = "NOT_APPLICABLE"
+                self.raw_metrics = {}
+                self.resolution_reason = "STRATEGY_STOCK_SKIPPED"
+
+        _wp_results.loc[~_wp_mask] = [_WPSkipped() for _ in range((~_wp_mask).sum())]
+
+        df["WavePhase_State"] = _wp_results.apply(lambda x: x.state)
+        df["WavePhase_Raw"] = _wp_results.apply(lambda x: json.dumps(x.raw_metrics))
+        df["WavePhase_Resolution_Reason"] = _wp_results.apply(lambda x: x.resolution_reason)
+    except Exception as e:
+        logger.error(f"Error computing WavePhase: {e}")
+        df["WavePhase_State"] = "UNKNOWN"
+        df["WavePhase_Raw"] = "{}"
+        df["WavePhase_Resolution_Reason"] = "ENGINE_ERROR"
+
     return df

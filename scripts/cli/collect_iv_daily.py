@@ -50,6 +50,11 @@ project_root = Path(__file__).resolve().parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+# Load .env BEFORE any Schwab imports — override=True ensures .env values
+# win over launchd EnvironmentVariables (which may have stale or quoted creds).
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=project_root / '.env', override=True)
+
 from scan_engine.loaders.schwab_api_client import SchwabClient
 from scan_engine.iv_collector.rest_collector import IVRestCollector, iv_collected_today
 from core.shared.data_contracts.config import TICKER_UNIVERSE_PATH, DATA_DIR
@@ -69,40 +74,8 @@ logger = logging.getLogger(__name__)
 IV_STATUS_PATH = DATA_DIR / "iv_collection_status.json"
 
 # ── NYSE Holiday Calendar ─────────────────────────────────────────────────────
-# launchd fires Mon–Fri regardless of holidays; this guard exits cleanly on
-# market holidays so no spurious "collection failed" status is written.
-# Update annually — NYSE publishes the full schedule each November.
-_NYSE_HOLIDAYS: set[date] = {
-    # 2025
-    date(2025, 1, 1),   # New Year's Day
-    date(2025, 1, 20),  # MLK Day
-    date(2025, 2, 17),  # Presidents' Day
-    date(2025, 4, 18),  # Good Friday
-    date(2025, 5, 26),  # Memorial Day
-    date(2025, 6, 19),  # Juneteenth
-    date(2025, 7, 4),   # Independence Day
-    date(2025, 9, 1),   # Labor Day
-    date(2025, 11, 27), # Thanksgiving
-    date(2025, 12, 25), # Christmas
-    # 2026
-    date(2026, 1, 1),   # New Year's Day
-    date(2026, 1, 19),  # MLK Day
-    date(2026, 2, 16),  # Presidents' Day
-    date(2026, 4, 3),   # Good Friday
-    date(2026, 5, 25),  # Memorial Day
-    date(2026, 6, 19),  # Juneteenth
-    date(2026, 7, 3),   # Independence Day (observed)
-    date(2026, 9, 7),   # Labor Day
-    date(2026, 11, 26), # Thanksgiving
-    date(2026, 12, 25), # Christmas
-    # 2027 — add when NYSE publishes schedule
-}
-
-
-def is_trading_day(d: date | None = None) -> bool:
-    """Return True if d (default: today) is a NYSE trading day."""
-    d = d or date.today()
-    return d.weekday() < 5 and d not in _NYSE_HOLIDAYS
+# Shared module — single source of truth for all collection scripts.
+from core.shared.calendar.trading_calendar import NYSE_HOLIDAYS as _NYSE_HOLIDAYS, is_trading_day
 
 
 def _write_status(ok: bool, message: str, tickers_ok: int = 0, tickers_total: int = 0,

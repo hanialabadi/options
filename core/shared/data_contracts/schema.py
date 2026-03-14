@@ -47,13 +47,16 @@ MANAGEMENT_UI_COLUMNS = [
     "Account", "Entry_Structure",
     # Doctrine output
     "Action", "Decision_State", "Urgency", "Rationale", "Doctrine_Source",
+    # Proposal-based resolution metadata (v2 doctrine)
+    "Doctrine_State", "Resolution_Method", "Winning_Gate",
+    "Proposals_Considered", "Proposals_Summary",
     # P&L
     "PnL_Total", "PnL_Unexplained", "PnL_Attribution_Quality",
     "$ Total G/L", "Total_GL_Decimal",
     # Position fields (Cycle 1 broker-reported)
     "Quantity", "Last", "Bid", "Ask",
     "UL Last", "Basis", "Strike", "Call/Put", "Expiration",
-    "Earnings Date",
+    "Earnings_Date",
     "Underlying_Price_Entry", "Premium_Entry",
     # Greeks
     "Delta", "Gamma", "Vega", "Theta", "Rho",
@@ -65,6 +68,11 @@ MANAGEMENT_UI_COLUMNS = [
     "IV_Rank",              # percentile of IV_Underlying_30D in history (= IV_Percentile)
     # Legacy names (still populated — will be removed in Phase 3)
     "IV_30D", "IV_Entry", "HV_20D", "HV_20D_Source", "HV_20D_Age_Days",
+    # Sigma-normalized z-scores (direction-adverse gate — Natenberg Ch.5 / Hull Ch.2)
+    # ROC5_Z:     roc5 / (daily_sigma * sqrt(5)), None when HV unavailable (raw fallback)
+    # Drift_Z:    Price_Drift_Pct / daily_sigma, None when HV unavailable
+    # Sigma_Mode: True when z-score normalization active, False when raw % fallback
+    "ROC5_Z", "Drift_Z", "Sigma_Mode",
     # Drift metrics
     "DTE", "Price_Drift_Pct", "Price_Drift_Abs",
     "Drift_Direction", "Dominant_Pressure", "Drift_Persistence",
@@ -151,6 +159,14 @@ MANAGEMENT_UI_COLUMNS = [
     # Daily_Margin_Cost: $ interest per day on this position's market value (silent P&L drain)
     # Margin_Coverage_Days: short premium only — theta income ÷ daily margin cost (>1.0 = covering carry)
     "Daily_Margin_Cost", "Margin_Coverage_Days",
+    # Cumulative carry cost (MarginCarryCalculator — McMillan Ch.3 / Passarelli Ch.6)
+    # Is_Retirement: True for Roth/IRA/401K — no margin interest applies
+    "Is_Retirement",
+    "Cumulative_Margin_Carry", "Carry_Adjusted_GL", "Carry_Adjusted_GL_Pct",
+    "Carry_Theta_Ratio", "Carry_Classification",
+    # BW/CC Efficiency Scorecard (BWEfficiencyCalculator)
+    "Net_Yield_Annual_Pct", "Premium_vs_Carry_Ratio",
+    "Days_Until_Carry_Eats_GL", "Carry_Efficiency_Grade",
     # Portfolio-level Greeks (from DriftEngine)
     "Portfolio_Net_Delta", "Portfolio_Net_Vega", "Portfolio_Net_Gamma", "Portfolio_Net_Theta",
     "Portfolio_Delta_Utilization_Pct", "Portfolio_Vega_Utilization_Pct",
@@ -161,13 +177,19 @@ MANAGEMENT_UI_COLUMNS = [
     "Sector_Bucket",
     # ETF detection flag (from config/sector_benchmarks.py — macro-vol context for CC)
     "Is_ETF",
+    # Macro event proximity (from config/macro_calendar.py — static Fed/BLS/BEA schedule)
+    "Days_To_Macro", "Macro_Next_Event", "Macro_Next_Type",
+    "Macro_Next_Date", "Is_Macro_Week", "Macro_Density", "Macro_Strip",
     # Correlation risk (from analyze_correlation_risk in phase5_portfolio_limits.py)
     "Positions_On_Underlying", "Underlying_Concentration_Risk",
     "Strategy_Concentration", "Strategy_Correlation_Risk",
     # Smart price refresh (Feature B)
-    "Price_Source",
+    "Price_Source", "Price_TS",
     # Live Greeks (Schwab chain refresh — market hours; transient, not frozen in anchors)
-    "IV_Now", "Delta_Live", "Gamma_Live", "Vega_Live", "Theta_Live", "Greeks_Source",
+    "IV_Now", "Delta_Live", "Gamma_Live", "Vega_Live", "Theta_Live",
+    "Greeks_Source", "Greeks_TS",
+    # Pre-doctrine data integrity gate
+    "Pre_Doctrine_Flag", "Pre_Doctrine_Detail",
     # Directional thesis price target — frozen at entry (Natenberg Ch.11: Thesis Satisfaction)
     # Price_Target_Entry: 1-sigma IV-implied target price for LONG_PUT (downside) or LONG_CALL (upside)
     # Formula: UL_Entry × (1 ∓ IV_Entry × √(DTE_Entry/252)) — frozen once, never re-computed
@@ -234,6 +256,10 @@ MANAGEMENT_UI_COLUMNS = [
     # Action streak (Cycle 2.955 — auto-resolve persistent REVALIDATE / stale EXIT)
     # Prior_Action_Streak: consecutive calendar days where the most recent Action repeated
     "Prior_Action_Streak",
+    # Signal coherence (Cycle 3 — Natenberg Ch.7: adjustment frequency / Passarelli Ch.5: deliberate timing)
+    # Days_Since_Last_Roll: calendar days since current option leg was opened (from premium_ledger.opened_at)
+    # Signal_Stability_Warning: intraday annotation when same-day run produced a different action
+    "Days_Since_Last_Roll", "Signal_Stability_Warning",
     # Run metadata
     "run_id", "Snapshot_TS", "Schema_Hash", "ingest_context",
     # Capital architecture (Cycle 3 — regime gate + bucket classification)
@@ -278,6 +304,12 @@ MANAGEMENT_UI_COLUMNS = [
     # Exit Optimal Window (Phase 2 — intraday execution timing for EXIT HIGH/CRITICAL)
     # Reuses Intraday_Advisory_JSON for display. These columns classify the window state.
     "Exit_Window_State", "Exit_Window_Reason",
+    # Cross-Leg Direction Reversal Gate (Natenberg Ch.11 / Passarelli Ch.6)
+    # Detects when executing EXIT on one leg flips the combined underlying delta direction.
+    # Direction_Reversal_Warning: human-readable warning text (empty if no reversal)
+    # Post_Exit_Net_Delta: combined net delta AFTER executing all EXITs on this underlying
+    # Direction_Shift: e.g. "Neutral → Bullish" — direction label change
+    "Direction_Reversal_Warning", "Post_Exit_Net_Delta", "Direction_Shift",
     # CC Opportunity Engine (Cycle 3 — idle stock positions)
     # Evaluates whether writing covered calls is currently favorable for each uncovered
     # stock position.  Written by cc_opportunity_engine.evaluate_cc_opportunities().
@@ -307,6 +339,58 @@ MANAGEMENT_UI_COLUMNS = [
     "CC_Ladder_Total_Lots", "CC_Ladder_Covered_Lots",
     "CC_Ladder_Tier_A_Lots", "CC_Ladder_Tier_B_Lots", "CC_Ladder_Tier_C_Lots",
     "CC_Ladder_Monthly_Est", "CC_Ladder_Income_Gap_Ratio", "CC_Ladder_Recovery_Months",
+    # Decision Ledger (Cycle 3 — continuous trade memory)
+    # Tracks execution confirmation and decision stability across the life of a position.
+    # Execution_Pending:        True when a ROLL/EXIT has been executed but broker data not yet refreshed
+    # Last_Execution_Action:    most recent executed action (ROLL/EXIT/TRIM)
+    # Last_Execution_TS:        timestamp of the execution mark
+    # Decision_Flip_Count_5D:   number of action changes in the last 5 calendar days (≥3 = instability)
+    "Execution_Pending", "Last_Execution_Action", "Last_Execution_TS", "Decision_Flip_Count_5D",
+    # Earnings history analytics (from earnings_stats table — DuckDB read-only, no live API)
+    # Populated by run_all.py Earnings History Enrichment section
+    "Earnings_Beat_Rate",              # float 0-1: fraction of BEAT quarters
+    "Earnings_Avg_IV_Crush_Pct",       # float: mean IV crush across events (negative = crush)
+    "Earnings_Avg_IV_Ramp_Pct",        # float: mean pre-earnings IV buildup
+    "Earnings_Avg_Expected_Move_Pct",  # float: mean straddle-implied move
+    "Earnings_Avg_Actual_Move_Pct",    # float: mean realized move
+    "Earnings_Avg_Move_Ratio",         # float: actual/expected (>1=underpriced, <1=overpriced)
+    "Earnings_Avg_Gap_Pct",            # float: mean |gap| on earnings day
+    "Earnings_Last_Surprise_Pct",      # float: most recent EPS surprise %
+    "Earnings_Track_Quarters",         # int: number of quarters with data
+
+    # Earnings formation detection (Phase 1→2→3 analysis — DuckDB read-only)
+    # Populated by run_all.py Earnings Formation Enrichment section
+    "Earnings_Phase2_Start_Day",       # float: avg D-X when positioning begins (negative)
+    "Earnings_Drift_Predicted_Gap_Rate",  # float 0-1: fraction of events where drift predicted gap
+    "Earnings_Formation_Quality",      # str: COMPLETE/PARTIAL/INSUFFICIENT
+    "Earnings_Current_Phase",          # str: QUIET/EARLY_POSITIONING/LATE_POSITIONING/IMMINENT
+
+    # Execution Readiness (Phase 2 — calendar-aware timing from execution_readiness.py)
+    # EXECUTE_NOW | STAGE_AND_RECHECK | WAIT_FOR_WINDOW | NOT_APPLICABLE
+    "Execution_Readiness", "Execution_Readiness_Reason",
+
+    # Monte Carlo Verdicts (Phase 3 — MC-informed wait/hold/assignment signals)
+    "MC_Wait_Verdict", "MC_Wait_Reason", "MC_Wait_Note",
+    "MC_Hold_Verdict",
+    "MC_Assign_P_Expiry", "MC_Assign_P_Touch", "MC_Assign_Urgency", "MC_Assign_Note",
+
+    # MC Optimal Exit Timing (mc_optimal_exit.py — day-by-day GBM peak EV)
+    "MC_Optimal_Exit_DTE", "MC_Exit_Peak_EV", "MC_Exit_Terminal_EV",
+    "MC_Exit_Theta_Crossover", "MC_Exit_Note",
+
+    # Recovery Reconciler (Cycle 2.347 — ticker-level share coverage analysis)
+    "Recovery_Total_Shares", "Recovery_Covered_Shares", "Recovery_Idle_Shares",
+    "Recovery_Gap_Per_Share", "Recovery_Income_Baseline_Mo", "Recovery_Income_Full_Mo",
+    "Recovery_Months_Baseline", "Recovery_Months_Full", "Recovery_Acceleration_Pct",
+    "Recovery_Cover_Idle_Recommended", "Recovery_IV_HV_OK", "Recovery_CC_Favorable",
+
+    # Doctrine diagnostics (orchestrator.py — visible in dashboard for debugging)
+    "Uncertainty_Reasons", "Missing_Data_Fields", "Scan_Conflict",
+
+    # Macro catalyst protection flag (long_option.py — extended macro window)
+    # True when doctrine cleared prior EXIT due to imminent HIGH-impact macro event.
+    # Used by MC EXIT_NOW guard in run_all.py to suppress hard override.
+    "Macro_Catalyst_Protected",
 ]
 
 def enforce_management_schema(df: pd.DataFrame) -> pd.DataFrame:
@@ -321,9 +405,19 @@ def enforce_management_schema(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             logger.warning(f"⚠️ Schema Violation: Missing column '{col}'. Filling with default.")
             # Determine default based on expected type (simplified for common numeric/string)
-            if "PnL_" in col or "Delta" in col or "Gamma" in col or "Vega" in col or "Theta" in col or "IV_" in col or "HV_" in col or "Price_" in col or "Total_GL_Decimal" in col or "Basis" in col or "UL Last" in col or "Margin_" in col or "Daily_Margin" in col or "Recovery_" in col or col in ("Open_Int", "Intrinsic_Val", "Scan_DQS_Score", "Expected_Move_10D", "Required_Move_Breakeven", "Required_Move_50pct", "EV_Feasibility_Ratio", "EV_50pct_Feasibility_Ratio", "Theta_Bleed_Daily_Pct", "Theta_Opportunity_Cost_Pct", "Delta_Deterioration_Streak", "Conviction_Fade_Days", "Price_Target_Entry", "DTE_Entry", "Gross_Premium_Collected", "Total_Close_Cost", "Roll_Net_Credit", "Roll_Prior_Credit", "_cycle_count"):
+            if "PnL_" in col or "Delta" in col or "Gamma" in col or "Vega" in col or "Theta" in col or "IV_" in col or "HV_" in col or "Price_" in col or "Total_GL_Decimal" in col or "Basis" in col or "UL Last" in col or "Margin_" in col or "Daily_Margin" in col or "Recovery_" in col or col in ("Open_Int", "Intrinsic_Val", "Scan_DQS_Score", "Expected_Move_10D", "Required_Move_Breakeven", "Required_Move_50pct", "EV_Feasibility_Ratio", "EV_50pct_Feasibility_Ratio", "Theta_Bleed_Daily_Pct", "Theta_Opportunity_Cost_Pct", "Delta_Deterioration_Streak", "Conviction_Fade_Days", "Price_Target_Entry", "DTE_Entry", "Gross_Premium_Collected", "Total_Close_Cost", "Roll_Net_Credit", "Roll_Prior_Credit", "_cycle_count", "Decision_Flip_Count_5D"):
                 df[col] = np.nan  # Numeric columns
-            elif col in ("Has_Debit_Rolls", "Wheel_Ready", "Wheel_IV_Ok", "Wheel_Chart_Ok", "Wheel_Capital_Ok", "CC_Ladder_Eligible", "Is_ETF"):
+            elif col in ("Days_To_Macro", "Macro_Density", "Days_Since_Last_Roll"):
+                df[col] = np.nan  # Numeric macro proximity / signal coherence
+            elif col in ("MC_Optimal_Exit_DTE", "MC_Exit_Peak_EV", "MC_Exit_Terminal_EV",
+                         "MC_Exit_Theta_Crossover"):
+                df[col] = np.nan  # Numeric MC optimal exit columns
+            elif col in ("MC_Exit_Note",):
+                df[col] = ""      # MC exit note — string
+            elif col in ("Macro_Next_Event", "Macro_Next_Type", "Macro_Next_Date", "Macro_Strip",
+                         "Signal_Stability_Warning"):
+                df[col] = ""      # String macro context / signal coherence
+            elif col in ("Has_Debit_Rolls", "Wheel_Ready", "Wheel_IV_Ok", "Wheel_Chart_Ok", "Wheel_Capital_Ok", "CC_Ladder_Eligible", "Is_ETF", "Is_Macro_Week", "Execution_Pending", "Macro_Catalyst_Protected"):
                 df[col] = False   # Boolean default
             elif col in ("Wheel_Note",):
                 df[col] = ""      # Wheel note: empty string default
@@ -339,10 +433,17 @@ def enforce_management_schema(df: pd.DataFrame) -> pd.DataFrame:
                 df[col] = np.nan  # Numeric — NaN when not computed
             elif col.startswith("CC_Ladder_") and col not in ("CC_Ladder_Eligible", "CC_Ladder_JSON"):
                 df[col] = np.nan  # Numeric ladder columns
-            elif col in ("Exit_Sequence",):
-                df[col] = np.nan  # Numeric sequence (NaN when not coordinated)
+            elif col in ("Exit_Sequence", "Post_Exit_Net_Delta"):
+                df[col] = np.nan  # Numeric sequence / delta (NaN when not computed)
+            elif col in ("Direction_Reversal_Warning", "Direction_Shift"):
+                df[col] = ""      # String, empty when no reversal detected
             elif col in ("Circuit_Breaker_State",):
                 df[col] = "OPEN"  # Default breaker state
+            elif col in ("Doctrine_State", "Resolution_Method", "Winning_Gate",
+                         "Proposals_Summary"):
+                df[col] = ""      # Proposal resolution metadata — empty when v1 path
+            elif col in ("Proposals_Considered",):
+                df[col] = np.nan  # Integer — NaN when v1 path
             elif col in ("Portfolio_Risk_Flags", "Sector_Bucket"):
                 df[col] = ""      # Empty string default
             elif col in ("Portfolio_State",):
@@ -354,6 +455,23 @@ def enforce_management_schema(df: pd.DataFrame) -> pd.DataFrame:
                 df[col] = np.nan  # Numeric
             elif col in ("EMA9", "SMA20", "SMA50", "LowerBand_20", "UpperBand_20"):
                 df[col] = 0.0    # Price levels — 0 means unavailable
+            elif col in ("Earnings_Beat_Rate", "Earnings_Avg_IV_Crush_Pct",
+                         "Earnings_Avg_IV_Ramp_Pct", "Earnings_Avg_Expected_Move_Pct",
+                         "Earnings_Avg_Actual_Move_Pct", "Earnings_Avg_Move_Ratio",
+                         "Earnings_Avg_Gap_Pct", "Earnings_Last_Surprise_Pct"):
+                df[col] = np.nan  # Numeric earnings analytics
+            elif col == "Earnings_Track_Quarters":
+                df[col] = 0       # Integer — 0 means no data
+            elif col in ("Earnings_Phase2_Start_Day", "Earnings_Drift_Predicted_Gap_Rate"):
+                df[col] = np.nan  # Numeric formation analytics
+            elif col in ("Earnings_Formation_Quality", "Earnings_Current_Phase"):
+                df[col] = ""      # String — empty when no formation data
+            elif col in ("ROC5_Z", "Drift_Z"):
+                df[col] = np.nan  # Numeric z-scores — NaN for non-long-option strategies
+            elif col in ("Sigma_Mode",):
+                df[col] = False   # Boolean — False when z-score normalization not applicable
+            elif col.startswith("Roll_Candidate_") or col == "Roll_Split_Suggestion":
+                df[col] = None    # JSON columns — None (not "N/A") so DB IS NULL works
             else:
                 df[col] = "N/A"   # String/categorical columns
             

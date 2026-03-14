@@ -5,10 +5,11 @@ import re
 from typing import Optional, Dict, Any
 from core.shared.data_layer.price_history_loader import load_price_history, ChartDataStatus
 
-logger = logging.getLogger(__name__)
+from core.shared.data_layer.duckdb_utils import (
+    get_domain_connection, DbDomain,
+)
 
-_PIPELINE_DB_PATH = "data/pipeline.duckdb"
-_IV_HISTORY_DB_PATH = "data/iv_history.duckdb"
+logger = logging.getLogger(__name__)
 
 
 def _enrich_from_scan_engine(df: pd.DataFrame, tickers: list) -> pd.DataFrame:
@@ -18,6 +19,10 @@ def _enrich_from_scan_engine(df: pd.DataFrame, tickers: list) -> pd.DataFrame:
 
     Overwrites: adx_14 (was hardcoded 25.0)
     Adds:       rsi_14, macd, macd_signal, slow_k_5_3, slow_d_5_3
+    Signal Hub v2: Market_Structure, OBV_Slope, Volume_Ratio, RSI_Divergence,
+                   MACD_Divergence, Weekly_Trend_Bias, Keltner_Squeeze_On,
+                   Keltner_Squeeze_Fired, RS_vs_SPY_20d, Chart_Regime,
+                   BB_Position, ATR_Rank, MACD_Histogram, Trend_Slope
 
     Architecture: scan engine is the producer; management engine is the consumer.
     Separation is preserved — no scan engine code is imported, only DuckDB read.
@@ -25,13 +30,21 @@ def _enrich_from_scan_engine(df: pd.DataFrame, tickers: list) -> pd.DataFrame:
     if not tickers:
         return df
     try:
-        import duckdb
-        con = duckdb.connect(_PIPELINE_DB_PATH, read_only=True)
         placeholders = ", ".join(f"'{t}'" for t in tickers)
+        con = get_domain_connection(DbDomain.CHART, read_only=True)
         rows = con.execute(f"""
-            SELECT Ticker, RSI_14, ADX_14, MACD, MACD_Signal, SlowK_5_3, SlowD_5_3
+            SELECT Ticker, RSI_14, ADX_14, SMA_20, SMA_50, EMA_9, EMA_21, ATR_14,
+                   MACD, MACD_Signal, UpperBand_20, MiddleBand_20, LowerBand_20,
+                   SlowK_5_3, SlowD_5_3, IV_Rank_30D,
+                   Computed_TS, Signal_Version,
+                   Market_Structure, OBV_Slope, Volume_Ratio,
+                   RSI_Divergence, MACD_Divergence, Weekly_Trend_Bias,
+                   Keltner_Squeeze_On, Keltner_Squeeze_Fired, RS_vs_SPY_20d,
+                   Chart_Regime, BB_Position, ATR_Rank, MACD_Histogram, Trend_Slope
             FROM technical_indicators
             WHERE Ticker IN ({placeholders})
+              AND Signal_Version >= 2
+              AND Computed_TS >= CURRENT_TIMESTAMP - INTERVAL '4' HOUR
             QUALIFY ROW_NUMBER() OVER (PARTITION BY Ticker ORDER BY Snapshot_TS DESC) = 1
         """).df()
         con.close()
@@ -39,15 +52,45 @@ def _enrich_from_scan_engine(df: pd.DataFrame, tickers: list) -> pd.DataFrame:
         logger.warning(f"⚠️ scan engine enrichment skipped (non-fatal): {e}")
         return df
 
+    # If v2 query returned nothing, try v1 fallback (original 6 columns only)
+    if rows.empty:
+        try:
+            con = get_domain_connection(DbDomain.CHART, read_only=True)
+            rows = con.execute(f"""
+                SELECT Ticker, RSI_14, ADX_14, MACD, MACD_Signal, SlowK_5_3, SlowD_5_3
+                FROM technical_indicators
+                WHERE Ticker IN ({placeholders})
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY Ticker ORDER BY Snapshot_TS DESC) = 1
+            """).df()
+            con.close()
+            if not rows.empty:
+                logger.info(f"⚠️ Scan signals stale or v1 — using legacy enrichment ({rows['Ticker'].nunique()} tickers)")
+        except Exception:
+            return df
+
     if rows.empty:
         return df
 
     source_col = "Underlying_Ticker" if "Underlying_Ticker" in df.columns else "Ticker"
 
-    # Ensure new columns exist
+    # Ensure columns exist for v1 indicators
     for col in ("rsi_14", "macd", "macd_signal", "slow_k_5_3", "slow_d_5_3"):
         if col not in df.columns:
             df[col] = np.nan
+
+    # Signal Hub v2 columns — preserve PascalCase (doctrine reads these directly)
+    _v2_signal_cols = [
+        "Market_Structure", "OBV_Slope", "Volume_Ratio",
+        "RSI_Divergence", "MACD_Divergence", "Weekly_Trend_Bias",
+        "Keltner_Squeeze_On", "Keltner_Squeeze_Fired", "RS_vs_SPY_20d",
+        "Chart_Regime", "BB_Position", "ATR_Rank", "MACD_Histogram", "Trend_Slope",
+    ]
+    for col in _v2_signal_cols:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    has_v2 = "Signal_Version" in rows.columns
+    v2_count = 0
 
     for _, row in rows.iterrows():
         ticker = row["Ticker"]
@@ -59,21 +102,37 @@ def _enrich_from_scan_engine(df: pd.DataFrame, tickers: list) -> pd.DataFrame:
         if pd.notna(adx):
             df.loc[mask, "adx_14"] = float(adx)
 
+        # v1 indicators + core TA (avoid redundant local recomputation)
         for src, dst in [
             ("RSI_14",      "rsi_14"),
             ("MACD",        "macd"),
             ("MACD_Signal", "macd_signal"),
             ("SlowK_5_3",   "slow_k_5_3"),
             ("SlowD_5_3",   "slow_d_5_3"),
+            ("SMA_20",      "SMA20"),
+            ("SMA_50",      "SMA50"),
+            ("EMA_9",       "EMA9"),
+            ("ATR_14",      "atr_14"),
+            ("UpperBand_20", "UpperBand_20"),
+            ("LowerBand_20", "LowerBand_20"),
         ]:
             val = row.get(src)
             if pd.notna(val):
                 df.loc[mask, dst] = float(val)
 
-        logger.debug(f"scan-engine enrichment applied for {ticker}: ADX={adx:.1f}" if pd.notna(adx) else f"scan-engine enrichment: no ADX for {ticker}")
+        # v2 Signal Hub columns (identity mapping — same name on both sides)
+        if has_v2:
+            for col in _v2_signal_cols:
+                val = row.get(col)
+                if pd.notna(val):
+                    df.loc[mask, col] = val
+            v2_count += 1
 
     enriched_count = rows["Ticker"].nunique()
-    logger.info(f"✅ Scan-engine enrichment: {enriched_count}/{len(tickers)} tickers had real ADX/RSI/MACD data")
+    if has_v2 and v2_count > 0:
+        logger.info(f"✅ Signal Hub enrichment: {v2_count}/{len(tickers)} tickers (v2, fresh signals)")
+    else:
+        logger.info(f"✅ Scan-engine enrichment: {enriched_count}/{len(tickers)} tickers (v1 legacy)")
     return df
 
 
@@ -107,9 +166,8 @@ def _enrich_iv_term_structure(df: pd.DataFrame, tickers: list) -> pd.DataFrame:
 
     # Primary: iv_history.duckdb (REST collected, fresher)
     try:
-        import duckdb
         placeholders = ", ".join(f"'{t}'" for t in tickers)
-        con = duckdb.connect(_IV_HISTORY_DB_PATH, read_only=True)
+        con = get_domain_connection(DbDomain.IV_HISTORY, read_only=True)
         rows = con.execute(f"""
             SELECT ticker AS Ticker, iv_30d, iv_60d, iv_90d, iv_180d
             FROM iv_term_history
@@ -126,8 +184,7 @@ def _enrich_iv_term_structure(df: pd.DataFrame, tickers: list) -> pd.DataFrame:
     # Fallback: fidelity_iv_long_term_history (call-side, wider tenor range)
     if rows.empty:
         try:
-            con = duckdb.connect(_PIPELINE_DB_PATH, read_only=True)
-            placeholders = ", ".join(f"'{t}'" for t in tickers)
+            con = get_domain_connection(DbDomain.PIPELINE, read_only=True)
             fid = con.execute(f"""
                 SELECT Ticker AS Ticker,
                        IV_30_D_Call AS iv_30d,
@@ -210,36 +267,91 @@ def compute_chart_primitives(df: pd.DataFrame, client=None) -> pd.DataFrame:
         raise RuntimeError(f"OCC SYMBOLS IN CHART PRIMITIVES: {bad}")
     
     primitive_data = {}
-    
-    for ticker in tickers:
-        try:
-            # Fetch 180 days of history for robust lookbacks (ADX, SMA50, Swings)
-            hist, source = load_price_history(ticker, days=180, client=client)
-            
-            mask = (df['Underlying_Ticker'] == ticker) if 'Underlying_Ticker' in df.columns else (df['Ticker'] == ticker)
+    failed_tickers = {}  # ticker → resolution_reason
 
-            # RAG: Smart Resolution Tracking. Surface the specific reason for missing data.
+    # Pre-load all OHLC from chart.duckdb (domain-split DB) in the main thread.
+    # chart.duckdb is isolated from pipeline.duckdb writes — no lock contention.
+    # _open_with_retry inside get_domain_connection handles transient locks.
+    _ohlc_cache: Dict[str, pd.DataFrame] = {}
+    from core.shared.data_layer.price_history_loader import _load_from_duckdb_cache
+    try:
+        _cache_con = get_domain_connection(DbDomain.CHART, read_only=True)
+        for t in tickers:
+            cached = _load_from_duckdb_cache(t, days=180, con=_cache_con)
+            if cached is not None and not cached.empty and len(cached) >= 50:
+                _ohlc_cache[t] = cached
+        _cache_con.close()
+        logger.info(f"📊 Pre-loaded OHLC cache: {len(_ohlc_cache)}/{len(tickers)} tickers from chart.duckdb")
+    except Exception as e:
+        logger.warning(f"⚠️ DuckDB OHLC pre-load failed (non-fatal): {e}")
+
+    # For tickers not in DuckDB cache, fetch from Schwab sequentially in the main
+    # thread (safe for DuckDB writes). This avoids the parallel worker connection
+    # conflict while populating the cache for future runs.
+    _missing = [t for t in tickers if t not in _ohlc_cache]
+    if _missing and client:
+        logger.info(f"📡 Fetching OHLC for {len(_missing)} uncached tickers from Schwab...")
+        for t in _missing:
+            try:
+                hist, source = load_price_history(t, days=180, client=client)
+                if hist is not None and len(hist) >= 50:
+                    _ohlc_cache[t] = hist
+            except Exception as e:
+                logger.debug(f"⚠️ Schwab fetch for {t} failed in main thread: {e}")
+        logger.info(f"📊 OHLC cache after Schwab fill: {len(_ohlc_cache)}/{len(tickers)} tickers")
+
+    def _fetch_and_compute(ticker: str):
+        """Fetch price history + compute primitives for a single ticker."""
+        try:
+            # Use pre-loaded DuckDB cache first (no DuckDB access needed)
+            hist = _ohlc_cache.get(ticker)
+            if hist is not None and len(hist) >= 50:
+                primitives = _calculate_primitives_for_ticker(hist)
+                return (ticker, primitives, None)
+
+            # Fallback: full load_price_history (Schwab → DuckDB → yfinance)
+            hist, source = load_price_history(ticker, days=180, client=client)
+
             if source == ChartDataStatus.BLOCKED_RATE_LIMIT:
-                df.loc[mask, 'Resolution_Reason'] = "DATA_SOURCE_BACKOFF_ACTIVE"
-                continue
+                return (ticker, None, "DATA_SOURCE_BACKOFF_ACTIVE")
             elif source == ChartDataStatus.NO_HISTORY:
-                df.loc[mask, 'Resolution_Reason'] = "NO_HISTORY_RETURNED"
-                continue
+                return (ticker, None, "NO_HISTORY_RETURNED")
             elif source == ChartDataStatus.FAILED:
-                df.loc[mask, 'Resolution_Reason'] = "DATA_FETCH_FAILED"
-                continue
+                return (ticker, None, "DATA_FETCH_FAILED")
 
             if hist is None or len(hist) < 50:
-                logger.warning(f"Insufficient history for {ticker} ({len(hist) if hist is not None else 0} bars) Source: {source}")
-                df.loc[mask, 'Resolution_Reason'] = f"INSUFFICIENT_HISTORY_{len(hist) if hist is not None else 0}"
-                continue
-                
+                n = len(hist) if hist is not None else 0
+                logger.warning(f"Insufficient history for {ticker} ({n} bars) Source: {source}")
+                return (ticker, None, f"INSUFFICIENT_HISTORY_{n}")
+
             primitives = _calculate_primitives_for_ticker(hist)
-            primitive_data[ticker] = primitives
-            
+            return (ticker, primitives, None)
         except Exception as e:
             logger.error(f"Failed to compute primitives for {ticker}: {e}")
+            return (ticker, None, "DATA_FETCH_FAILED")
+
+    # Parallel execution: 6 workers, 10 req/sec (Schwab safe limit)
+    if len(tickers) > 1:
+        try:
+            from scan_engine.throttled_executor import ThrottledExecutor
+            executor = ThrottledExecutor(max_workers=6, requests_per_second=10.0, timeout_seconds=30.0)
+            results = executor.map_parallel(_fetch_and_compute, tickers, desc="Chart primitives", show_progress=False)
+        except ImportError:
+            results = [_fetch_and_compute(t) for t in tickers]
+    else:
+        results = [_fetch_and_compute(t) for t in tickers]
+
+    for ticker, primitives, reason in results:
+        if primitives is not None:
+            primitive_data[ticker] = primitives
+        elif reason:
+            failed_tickers[ticker] = reason
             
+    # Map failed tickers' resolution reasons
+    for ticker, reason in failed_tickers.items():
+        mask = (df['Underlying_Ticker'] == ticker) if 'Underlying_Ticker' in df.columns else (df['Ticker'] == ticker)
+        df.loc[mask, 'Resolution_Reason'] = reason
+
     # Map primitives back to the main dataframe
     # RAG: Correct Mapping. Ensure all tickers are enriched, even if columns already exist.
     for ticker, data in primitive_data.items():

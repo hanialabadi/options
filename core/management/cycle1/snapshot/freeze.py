@@ -68,7 +68,22 @@ def freeze_entry_data(df: pd.DataFrame, new_trade_ids: list = None, new_leg_ids:
             df[col] = pd.Series(dtype='float64', index=df.index)
     if 'Regime_Entry' not in df.columns:
         df['Regime_Entry'] = pd.Series(dtype='string', index=df.index)
-    
+
+    # Signal Hub entry freeze columns (institutional scan signals — Murphy/Raschke/Bulkowski)
+    scan_signal_string_cols = [
+        'Entry_Market_Structure', 'Entry_Weekly_Trend_Bias',
+        'Entry_RSI_Divergence',
+    ]
+    for col in scan_signal_string_cols:
+        if col not in df.columns:
+            df[col] = pd.Series(dtype='string', index=df.index)
+    scan_signal_float_cols = ['Entry_OBV_Slope', 'Entry_RS_vs_SPY_20d']
+    for col in scan_signal_float_cols:
+        if col not in df.columns:
+            df[col] = pd.Series(dtype='float64', index=df.index)
+    if 'Entry_Keltner_Squeeze_On' not in df.columns:
+        df['Entry_Keltner_Squeeze_On'] = pd.Series(dtype='object', index=df.index)
+
     new_trade_ids = new_trade_ids or []
     
     # Initialize freeze_mask to an empty Series to prevent UnboundLocalError
@@ -121,7 +136,10 @@ def freeze_entry_data(df: pd.DataFrame, new_trade_ids: list = None, new_leg_ids:
 
     # Freeze Entry Chart States
     df = _freeze_entry_chart_states(df, freeze_mask)
-    
+
+    # Freeze Entry Scan Signals (Signal Hub — institutional signals at entry)
+    df = _freeze_entry_scan_signals(df, freeze_mask)
+
     # Set entry timestamp
     # RAG: Recovery-Aware Freezing. Only populate if not already recovered from history.
     ts_target = freeze_mask & df['Entry_Timestamp'].isna()
@@ -156,7 +174,8 @@ def _freeze_entry_greeks(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
 
 def _normalize_iv(series: pd.Series) -> pd.Series:
     """Normalize IV to decimal form. Brokers often report as percent (22.27 → 0.2227)."""
-    return series.apply(lambda x: x / 100.0 if pd.notna(x) and x > 2.0 else x)
+    from core.shared.finance_utils import normalize_iv_series
+    return normalize_iv_series(series)
 
 
 def _freeze_entry_iv(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
@@ -165,7 +184,7 @@ def _freeze_entry_iv(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
     Fallback: Use live Schwab IV (IV_Now) if Fidelity IV is missing.
     RAG Authority: Natenberg (Neutrality / No Lookahead Bias)
 
-    CRITICAL: Always normalize to decimal (0.0–2.0 range).
+    CRITICAL: Always normalize to decimal (threshold 10.0; high-IV stocks can exceed 2.0).
     Fidelity Broker Truth reports IV as percent (e.g. 22.27 = 22.27%).
     """
     df = df.copy()
@@ -383,6 +402,54 @@ def _freeze_entry_chart_states(df: pd.DataFrame, mask: pd.Series) -> pd.DataFram
             freeze_target = mask & df[entry_col].isna()
             if freeze_target.any():
                 df.loc[freeze_target, entry_col] = df.loc[freeze_target, current_col]
+    return df
+
+
+def _freeze_entry_scan_signals(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
+    """
+    Freeze institutional scan signals at entry for thesis comparison.
+
+    Signal Hub surfaces these from scan engine via DuckDB.  Freezing at entry
+    lets doctrine detect structural regime shifts:
+      Market_Structure: Uptrend → Downtrend = thesis broken
+      Weekly_Trend_Bias: ALIGNED → CONFLICTING = multi-TF lost
+      Keltner_Squeeze_On: squeeze → fired = breakout validation
+      OBV_Slope: +15 → -10 = accumulation reversal
+      RSI_Divergence: divergence present at entry
+      RS_vs_SPY_20d: relative strength at entry
+
+    RAG Authority: Murphy (0.704) / Raschke (0.694) / Bulkowski
+    """
+    df = df.copy()
+    string_mappings = [
+        ('Market_Structure', 'Entry_Market_Structure'),
+        ('Weekly_Trend_Bias', 'Entry_Weekly_Trend_Bias'),
+        ('RSI_Divergence', 'Entry_RSI_Divergence'),
+    ]
+    for current_col, entry_col in string_mappings:
+        if current_col in df.columns:
+            freeze_target = mask & df[entry_col].isna()
+            if freeze_target.any():
+                df.loc[freeze_target, entry_col] = df.loc[freeze_target, current_col].astype(str)
+
+    float_mappings = [
+        ('OBV_Slope', 'Entry_OBV_Slope'),
+        ('RS_vs_SPY_20d', 'Entry_RS_vs_SPY_20d'),
+    ]
+    for current_col, entry_col in float_mappings:
+        if current_col in df.columns:
+            freeze_target = mask & df[entry_col].isna()
+            if freeze_target.any():
+                df.loc[freeze_target, entry_col] = pd.to_numeric(
+                    df.loc[freeze_target, current_col], errors='coerce'
+                )
+
+    # Boolean mapping: Keltner_Squeeze_On
+    if 'Keltner_Squeeze_On' in df.columns:
+        freeze_target = mask & df['Entry_Keltner_Squeeze_On'].isna()
+        if freeze_target.any():
+            df.loc[freeze_target, 'Entry_Keltner_Squeeze_On'] = df.loc[freeze_target, 'Keltner_Squeeze_On']
+
     return df
 
 

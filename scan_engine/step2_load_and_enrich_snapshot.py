@@ -468,11 +468,11 @@ def enrich_volatility_metrics(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
         df["Step2_Warning"] = df.apply(lambda row: f"{row['Step2_Warning']}; iv_history.duckdb not found, derived IV metrics not computed" if "Step2_Warning" in row and pd.notna(row["Step2_Warning"]) else "iv_history.duckdb not found, derived IV metrics not computed", axis=1)
         return df
 
-    # Always open iv_history.duckdb directly — iv_term_history lives there, not in pipeline.duckdb
+    # Always open iv_history.duckdb via domain connection
     owns_connection = True
     try:
-        import duckdb as _duckdb
-        _con = _duckdb.connect(str(db_path), read_only=True)
+        from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
+        _con = get_domain_connection(DbDomain.IV_HISTORY, read_only=True)
     except Exception as e:
         logger.warning(f"⚠️ Could not open iv_history.duckdb for derived IV metrics computation: {e}")
         df["Step2_Warning"] = df.apply(lambda row: f"{row['Step2_Warning']}; DuckDB connection failed for derived IV metrics: {e}" if "Step2_Warning" in row and pd.notna(row["Step2_Warning"]) else f"DuckDB connection failed for derived IV metrics: {e}", axis=1)
@@ -680,6 +680,19 @@ def enrich_volatility_metrics(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
         df.loc[_unknown_mask & (_rank < 20), 'Regime'] = 'Low Vol'
         df.loc[_unknown_mask & (_rank > 80), 'Regime'] = 'High Vol'
         df.loc[_unknown_mask & (_rank >= 20) & (_rank <= 80), 'Regime'] = 'Compression'
+
+    # Canonical IV_Rank: coalesce from ranked columns for downstream consumers.
+    # Pipeline uses IV_Rank_30D as primary (30-day rolling percentile), falling back
+    # to IV_Rank_20D for tickers with <30 days of IV history.
+    if 'IV_Rank' not in df.columns or df['IV_Rank'].isna().all():
+        if 'IV_Rank_30D' in df.columns and 'IV_Rank_20D' in df.columns:
+            df['IV_Rank'] = df['IV_Rank_30D'].fillna(df['IV_Rank_20D'])
+        elif 'IV_Rank_30D' in df.columns:
+            df['IV_Rank'] = df['IV_Rank_30D']
+        elif 'IV_Rank_20D' in df.columns:
+            df['IV_Rank'] = df['IV_Rank_20D']
+        else:
+            df['IV_Rank'] = np.nan
 
     # Ensure IV_Trend_7D and HV_Accel_Proxy are present (may not be set if no historical data)
     if 'IV_Trend_7D' not in df.columns:
@@ -954,9 +967,18 @@ def enrich_technical_indicators(df: pd.DataFrame, id_col: str, snapshot_ts: date
     n_batch_hits = sum(1 for t in df[id_col] if t.upper() in ohlc_cache)
     logger.info(f"⏱️ Step 2C (Murphy): {time.time() - t_murphy:.1f}s ({n_batch_hits} batch hits, {len(df) - n_batch_hits} fallback)")
 
-    # RV/IV Ratio
-    if 'RV_10D' in df.columns and 'IV_30_D_Call' in df.columns:
-        df['RV_IV_Ratio'] = np.where((df['RV_10D'].notna()) & (df['IV_30_D_Call'] > 0), df['RV_10D'] / df['IV_30_D_Call'], np.nan)
+    # RV/IV Ratio — use matching 30D windows (HV_30D vs IV_30D)
+    # Prefer averaged iv_30d (call+put) over Call-only for unbiased comparison
+    _hv_col = 'hv_30' if 'hv_30' in df.columns else ('HV_30_D_Cur' if 'HV_30_D_Cur' in df.columns else None)
+    _iv_col = 'iv_30d' if 'iv_30d' in df.columns else ('IV_30_D_Call' if 'IV_30_D_Call' in df.columns else None)
+    if _hv_col and _iv_col:
+        _hv_num = pd.to_numeric(df[_hv_col], errors='coerce')
+        _iv_num = pd.to_numeric(df[_iv_col], errors='coerce')
+        df['RV_IV_Ratio'] = np.where(
+            (_hv_num.notna()) & (_iv_num > 0),
+            _hv_num / _iv_num,
+            np.nan
+        )
 
     # OHLC Availability Check (before pattern detection)
     if not skip_patterns:
@@ -1074,9 +1096,9 @@ def enrich_technical_indicators(df: pd.DataFrame, id_col: str, snapshot_ts: date
     return df
 
 
-def enrich_market_context(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
+def enrich_market_context(df: pd.DataFrame, id_col: str, con=None) -> pd.DataFrame:
     """
-    Step 2D: Entry quality and Earnings proximity.
+    Step 2D: Entry quality, Earnings proximity, and Formation phase enrichment.
     """
     # Entry Quality
     try:
@@ -1095,6 +1117,90 @@ def enrich_market_context(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
         logger.warning(f"⚠️ Earnings proximity failed: {e}")
         df['earnings_proximity_flag'] = False
         df["Step2_Warning"] = df.apply(lambda row: f"{row['Step2_Warning']}; Earnings proximity failed: {e}" if "Step2_Warning" in row and pd.notna(row["Step2_Warning"]) else f"Earnings proximity failed: {e}", axis=1)
+
+    # Earnings Formation Phase — enriches tickers near earnings with positioning detection.
+    # Uses detect_current_phase() from formation module + batch move_ratio from earnings_stats.
+    # Non-blocking: missing formation data → columns default to empty/NaN.
+    df['Earnings_Formation_Phase'] = ''
+    df['Earnings_IV_Velocity'] = np.nan
+    df['Earnings_Move_Ratio'] = np.nan
+    df['Earnings_Beat_Rate'] = np.nan
+    df['Earnings_Avg_IV_Crush'] = np.nan
+    df['Earnings_Consecutive_Beats'] = np.nan
+    df['Earnings_Consecutive_Misses'] = np.nan
+
+    try:
+        from core.shared.data_layer.earnings_formation import detect_current_phase
+        from core.shared.data_layer.earnings_history import get_all_earnings_stats
+        from core.shared.data_contracts.config import IV_HISTORY_DB_PATH
+        from datetime import date as _ef_date
+        import duckdb as _ef_duckdb
+
+        _today = _ef_date.today()
+
+        # Batch-read earnings_stats for all tickers (move_ratio, beat_rate, crush, streaks)
+        _all_tickers = df[id_col].dropna().unique().tolist()
+        _move_ratio_map = {}
+        _estats = pd.DataFrame()
+        if con is not None and _all_tickers:
+            try:
+                _estats = get_all_earnings_stats(con, _all_tickers)
+                if not _estats.empty and 'avg_move_ratio' in _estats.columns:
+                    _move_ratio_map = dict(zip(_estats['ticker'], _estats['avg_move_ratio']))
+            except Exception:
+                pass  # Table may not exist
+
+        # Phase detection for tickers with earnings within 45 days
+        _near_earn = df[
+            df['days_to_earnings'].notna() &
+            (df['days_to_earnings'] >= 0) &
+            (df['days_to_earnings'] <= 45)
+        ][id_col].unique() if 'days_to_earnings' in df.columns else []
+
+        if len(_near_earn) > 0 and con is not None:
+            from core.shared.data_layer.duckdb_utils import get_domain_connection as _gdc, DbDomain as _DbD
+            _iv_con = _gdc(_DbD.IV_HISTORY, read_only=True)
+            try:
+                _phase_map = {}
+                _velocity_map = {}
+                for _tk in _near_earn:
+                    try:
+                        _ph = detect_current_phase(con, _iv_con, _tk, _today)
+                        if _ph:
+                            _phase_map[_tk] = _ph.get('phase', '')
+                            _velocity_map[_tk] = _ph.get('iv_velocity')
+                    except Exception:
+                        pass
+
+                if _phase_map:
+                    df['Earnings_Formation_Phase'] = df[id_col].map(_phase_map).fillna('')
+                    df['Earnings_IV_Velocity'] = df[id_col].map(_velocity_map)
+            finally:
+                _iv_con.close()
+
+        # Map earnings_stats columns for all tickers (not just near-earnings)
+        if _move_ratio_map:
+            df['Earnings_Move_Ratio'] = df[id_col].map(_move_ratio_map)
+        if not _estats.empty:
+            if 'beat_rate' in _estats.columns:
+                _br_map = dict(zip(_estats['ticker'], _estats['beat_rate'] * 100))  # to %
+                df['Earnings_Beat_Rate'] = df[id_col].map(_br_map)
+            if 'avg_iv_crush_pct' in _estats.columns:
+                _crush_map = dict(zip(_estats['ticker'], _estats['avg_iv_crush_pct']))
+                df['Earnings_Avg_IV_Crush'] = df[id_col].map(_crush_map)
+            if 'consecutive_beats' in _estats.columns:
+                _cb_map = dict(zip(_estats['ticker'], _estats['consecutive_beats']))
+                df['Earnings_Consecutive_Beats'] = df[id_col].map(_cb_map)
+            if 'consecutive_misses' in _estats.columns:
+                _cm_map = dict(zip(_estats['ticker'], _estats['consecutive_misses']))
+                df['Earnings_Consecutive_Misses'] = df[id_col].map(_cm_map)
+
+        _enriched = (df['Earnings_Formation_Phase'] != '').sum()
+        if _enriched > 0:
+            logger.info(f"[EarningsFormation] Enriched {_enriched} tickers with formation phase")
+
+    except Exception as _ef_err:
+        logger.warning(f"⚠️ Earnings formation enrichment failed (non-fatal): {_ef_err}")
 
     return df
 
@@ -1135,12 +1241,17 @@ def load_ivhv_snapshot(
         snapshot_ts_for_tech = df['timestamp'].iloc[0]
         df = enrich_technical_indicators(df, id_col, snapshot_ts=snapshot_ts_for_tech, con=con, schwab_client=schwab_client)
         
-        # 2D: Context
-        df = enrich_market_context(df, id_col)
+        # 2D: Context (pass con for formation DuckDB reads)
+        df = enrich_market_context(df, id_col, con=con)
         
-        # Step 7 Compatibility
-        if 'IV_30_D_Call' in df.columns and 'HV_30_D_Cur' in df.columns:
-            df['IVHV_gap_30D'] = df['IV_30_D_Call'] - df['HV_30_D_Cur']
+        # Step 7 Compatibility — prefer averaged iv_30d (call+put from step0),
+        # fall back to IV_30_D_Call only when average unavailable
+        _hv_gap_col = 'HV_30_D_Cur' if 'HV_30_D_Cur' in df.columns else ('hv_30' if 'hv_30' in df.columns else None)
+        if _hv_gap_col:
+            if 'iv_30d' in df.columns:
+                df['IVHV_gap_30D'] = pd.to_numeric(df['iv_30d'], errors='coerce') - pd.to_numeric(df[_hv_gap_col], errors='coerce')
+            elif 'IV_30_D_Call' in df.columns:
+                df['IVHV_gap_30D'] = pd.to_numeric(df['IV_30_D_Call'], errors='coerce') - pd.to_numeric(df[_hv_gap_col], errors='coerce')
 
         # Centralized Universe Restriction (Controlled by DEBUG_TICKER_MODE)
         debug_manager = get_debug_manager()

@@ -41,21 +41,34 @@ import logging
 from pathlib import Path
 from typing import Optional, Dict, Tuple
 
+from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
+
 logger = logging.getLogger(__name__)
 
-# Only adjust when bucket has at least this many closed trades
-_MIN_SAMPLE = 15
+# Staged sample thresholds for feedback calibration.
+# With 41 closed trades across 17 buckets, most buckets have 3-6 trades.
+# Waiting for 15 per bucket means months of no calibration.
+# Staged approach: partial signal at 5, full signal at 15.
+_MIN_SAMPLE_PARTIAL = 5    # enough for directional signal (dampened)
+_MIN_SAMPLE_FULL = 15      # full confidence — original threshold
 
-# DQS multipliers by suggested_action
-_MULTIPLIERS: Dict[str, float] = {
+# DQS multipliers by suggested_action — FULL power (15+ trades)
+_MULTIPLIERS_FULL: Dict[str, float] = {
     "TIGHTEN":             0.80,
     "HOLD":                1.00,
     "REINFORCE":           1.10,
     "INSUFFICIENT_SAMPLE": 1.00,
 }
 
-# Pipeline DB path — relative to project root
-_DB_PATH = Path(__file__).parents[1] / "data" / "pipeline.duckdb"
+# DQS multipliers — PARTIAL power (5-14 trades)
+# Dampened: TIGHTEN 0.90 instead of 0.80, REINFORCE 1.05 instead of 1.10.
+# Small samples show direction but aren't definitive (Sinclair/Kahneman).
+_MULTIPLIERS_PARTIAL: Dict[str, float] = {
+    "TIGHTEN":             0.90,
+    "HOLD":                1.00,
+    "REINFORCE":           1.05,
+    "INSUFFICIENT_SAMPLE": 1.00,
+}
 
 # Module-level cache: loaded once per process, refreshed if stale
 _feedback_cache: Optional[Dict[str, dict]] = None
@@ -71,8 +84,7 @@ def _load_feedback_cache() -> Dict[str, dict]:
         return _feedback_cache
 
     try:
-        import duckdb
-        con = duckdb.connect(str(_DB_PATH), read_only=True)
+        con = get_domain_connection(DbDomain.MANAGEMENT, read_only=True)
         rows = con.execute("""
             SELECT
                 condition_key,
@@ -176,18 +188,22 @@ def get_feedback_calibration(
         win_rate  = bucket["win_rate"]
         avg_pnl   = bucket["avg_pnl_pct"]
 
-        # Only apply adjustment when sample is sufficient
-        if n < _MIN_SAMPLE or suggested == "INSUFFICIENT_SAMPLE":
+        # Staged sample check: partial signal at 5, full at 15
+        if n < _MIN_SAMPLE_PARTIAL or suggested == "INSUFFICIENT_SAMPLE":
             neutral["win_rate"]         = win_rate
             neutral["sample_n"]         = n
             neutral["suggested_action"] = "INSUFFICIENT_SAMPLE"
             neutral["note"]             = (
                 f"Feedback: {n} trades recorded in {key} bucket "
-                f"(need {_MIN_SAMPLE} for calibration)."
+                f"(need {_MIN_SAMPLE_PARTIAL} for partial calibration)."
             )
             return 1.0, neutral
 
-        multiplier = _MULTIPLIERS.get(suggested, 1.0)
+        if n >= _MIN_SAMPLE_FULL:
+            multiplier = _MULTIPLIERS_FULL.get(suggested, 1.0)
+        else:
+            # Partial: 5-14 trades — dampened multipliers
+            multiplier = _MULTIPLIERS_PARTIAL.get(suggested, 1.0)
 
         # Confidence adjustment:
         #   TIGHTEN → cap confidence at MEDIUM (even if IV/DQS gates say HIGH)
@@ -202,8 +218,9 @@ def get_feedback_calibration(
         direction = "📉 underperforming" if suggested == "TIGHTEN" else (
             "📈 outperforming" if suggested == "REINFORCE" else "➡️ neutral"
         )
+        _stage = "full" if n >= _MIN_SAMPLE_FULL else "partial"
         note = (
-            f"Feedback ({n} trades, {key}): "
+            f"Feedback ({n} trades, {key}, {_stage}): "
             f"{win_rate:.0%} win rate, avg P&L {avg_pnl:+.0%} — "
             f"{direction}. DQS ×{multiplier:.2f}."
         )

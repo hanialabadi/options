@@ -100,7 +100,8 @@ def _compute_structural_drift(df: pd.DataFrame) -> pd.DataFrame:
     # RAG: Use IV_Now (transient) vs IV_Entry (anchor)
     if 'IV_Now' in df.columns and 'IV_Entry' in df.columns:
         # Normalize IV_Entry to Decimal Vol if it's in percent (Cycle 1 legacy)
-        iv_entry_val = df['IV_Entry'].apply(lambda x: x / 100.0 if pd.notna(x) and x > 2.0 else x)
+        from core.shared.finance_utils import normalize_iv_series
+        iv_entry_val = normalize_iv_series(pd.to_numeric(df['IV_Entry'], errors='coerce'))
         df['IV_Drift_Structural'] = df['IV_Now'] - iv_entry_val
         df.loc[df['AssetType'] == 'STOCK', 'IV_Drift_Structural'] = np.nan
     else:

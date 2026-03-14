@@ -40,6 +40,7 @@ class WaitListPersistence:
                 entry_price, entry_iv_30d, entry_hv_30, entry_chart_signal, entry_pcs_score,
                 current_price, current_iv_30d, current_chart_signal, price_change_pct,
                 invalidation_price, max_sessions_wait, max_days_wait,
+                contract_quality,
                 status, rejection_reason
             ) VALUES (
                 ?, ?, ?, ?,
@@ -49,9 +50,12 @@ class WaitListPersistence:
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?,
+                ?,
                 ?, ?
             )
         """
+
+        _cq = json.dumps(entry.contract_quality) if hasattr(entry, 'contract_quality') and entry.contract_quality else None
 
         params = (
             entry.wait_id, entry.ticker, entry.strategy_name, entry.strategy_type,
@@ -63,6 +67,7 @@ class WaitListPersistence:
             entry.entry_price, entry.entry_iv_30d, entry.entry_hv_30, entry.entry_chart_signal, entry.entry_pcs_score,
             entry.current_price, entry.current_iv_30d, entry.current_chart_signal, entry.price_change_pct,
             entry.invalidation_price, entry.max_sessions_wait, entry.max_days_wait,
+            _cq,
             entry.status.value, entry.rejection_reason
         )
 
@@ -76,8 +81,12 @@ class WaitListPersistence:
         self.con.execute(query, params)
         self.con.commit()
 
-        # Log to history
-        self._log_history(entry.wait_id, "CREATED", entry.conditions_met, entry.wait_progress, entry.status.value)
+        # Log to history — include ticker/strategy + original blocking conditions
+        _wc_json = json.dumps([c.to_dict() for c in entry.wait_conditions]) if entry.wait_conditions else None
+        self._log_history(
+            entry.wait_id, "CREATED", entry.conditions_met, entry.wait_progress, entry.status.value,
+            ticker=entry.ticker, strategy_name=entry.strategy_name, wait_conditions_json=_wc_json,
+        )
 
         logger.info(f"[WAIT_PERSIST] Saved wait entry: {entry.wait_id} ({entry.ticker} - {entry.strategy_name})")
         return entry.wait_id
@@ -98,7 +107,7 @@ class WaitListPersistence:
                 entry_price, entry_iv_30d, entry_hv_30, entry_chart_signal, entry_pcs_score,
                 current_price, current_iv_30d, current_chart_signal, price_change_pct,
                 invalidation_price, max_sessions_wait, max_days_wait,
-                status, rejection_reason
+                status, rejection_reason, contract_quality
             FROM wait_list
             WHERE status = 'ACTIVE'
             ORDER BY wait_started_at ASC
@@ -136,7 +145,8 @@ class WaitListPersistence:
                 "max_sessions_wait": row[24],
                 "max_days_wait": row[25],
                 "status": row[26],
-                "rejection_reason": row[27]
+                "rejection_reason": row[27],
+                "contract_quality": json.loads(row[28]) if row[28] else None,
             }
             entries.append(entry)
 
@@ -255,6 +265,53 @@ class WaitListPersistence:
 
         logger.info(f"[WAIT_PERSIST] Rejected wait entry: {wait_id} ({status.value}: {reason})")
 
+    def refresh_contract(
+        self,
+        wait_id: str,
+        proposed_strike: Optional[float],
+        proposed_expiration: Optional[str],
+        contract_symbol: Optional[str],
+        contract_quality: Optional[dict],
+        reasons: list[str],
+    ):
+        """
+        Refresh the attached contract on an existing wait entry.
+
+        Preserves: wait_started_at, evaluation_count, conditions, progress, status.
+        Updates: proposed_strike, proposed_expiration, contract_symbol,
+                 contract_quality, updated_at.
+        Logs: CONTRACT_REFRESHED event to history with reasons.
+        """
+        query = """
+            UPDATE wait_list
+            SET
+                proposed_strike = ?,
+                proposed_expiration = ?,
+                contract_symbol = ?,
+                contract_quality = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE wait_id = ?
+        """
+
+        self.con.execute(query, (
+            proposed_strike,
+            proposed_expiration,
+            contract_symbol,
+            json.dumps(contract_quality) if contract_quality else None,
+            wait_id,
+        ))
+        self.con.commit()
+
+        # Log to history
+        _reason_str = '; '.join(reasons) if reasons else 'contract refresh'
+        self._log_history(
+            wait_id, "CONTRACT_REFRESHED", None, None, "ACTIVE",
+            notes=f"Contract refreshed: {_reason_str}",
+        )
+
+        logger.info(
+            f"[WAIT_PERSIST] Contract refreshed: {wait_id} — {_reason_str}")
+
     def get_wait_entry(self, wait_id: str) -> Optional[Dict[str, Any]]:
         """
         Get a single wait entry by ID.
@@ -274,7 +331,7 @@ class WaitListPersistence:
                 entry_price, entry_iv_30d, entry_hv_30, entry_chart_signal, entry_pcs_score,
                 current_price, current_iv_30d, current_chart_signal, price_change_pct,
                 invalidation_price, max_sessions_wait, max_days_wait,
-                status, rejection_reason
+                status, rejection_reason, contract_quality
             FROM wait_list
             WHERE wait_id = ?
         """
@@ -311,7 +368,8 @@ class WaitListPersistence:
             "max_sessions_wait": result[24],
             "max_days_wait": result[25],
             "status": result[26],
-            "rejection_reason": result[27]
+            "rejection_reason": result[27],
+            "contract_quality": json.loads(result[28]) if result[28] else None,
         }
 
     def _log_history(
@@ -321,7 +379,10 @@ class WaitListPersistence:
         conditions_met: Optional[List[str]],
         wait_progress: Optional[float],
         status: str,
-        notes: Optional[str] = None
+        notes: Optional[str] = None,
+        ticker: Optional[str] = None,
+        strategy_name: Optional[str] = None,
+        wait_conditions_json: Optional[str] = None,
     ):
         """
         Log event to wait_list_history for audit trail.
@@ -333,20 +394,39 @@ class WaitListPersistence:
             wait_progress: Progress at time of event
             status: Status at time of event
             notes: Additional notes
+            ticker: Denormalized ticker (looked up if not provided)
+            strategy_name: Denormalized strategy (looked up if not provided)
+            wait_conditions_json: Original blocking conditions JSON (CREATED events)
         """
+        # Resolve ticker/strategy from wait_list if not provided
+        if ticker is None or strategy_name is None:
+            try:
+                row = self.con.execute(
+                    "SELECT ticker, strategy_name FROM wait_list WHERE wait_id = ?",
+                    (wait_id,)
+                ).fetchone()
+                if row:
+                    ticker = ticker or row[0]
+                    strategy_name = strategy_name or row[1]
+            except Exception:
+                pass  # best-effort
+
         history_id = str(uuid.uuid4())
         query = """
             INSERT INTO wait_list_history (
-                history_id, wait_id, event_type,
-                conditions_met, wait_progress, status, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                history_id, wait_id, ticker, strategy_name, event_type,
+                conditions_met, wait_conditions_json, wait_progress, status, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
 
         params = (
             history_id,
             wait_id,
+            ticker,
+            strategy_name,
             event_type,
             json.dumps(conditions_met) if conditions_met else None,
+            wait_conditions_json,
             wait_progress,
             status,
             notes
@@ -383,6 +463,23 @@ def update_wait_progress(
     persistence.update_wait_progress(
         wait_id, conditions_met, wait_progress,
         current_price, current_iv_30d, current_chart_signal
+    )
+
+
+def refresh_contract(
+    con: duckdb.DuckDBPyConnection,
+    wait_id: str,
+    proposed_strike: Optional[float],
+    proposed_expiration: Optional[str],
+    contract_symbol: Optional[str],
+    contract_quality: Optional[dict],
+    reasons: list,
+):
+    """Refresh contract on existing wait entry (convenience function)"""
+    persistence = WaitListPersistence(con)
+    persistence.refresh_contract(
+        wait_id, proposed_strike, proposed_expiration,
+        contract_symbol, contract_quality, reasons,
     )
 
 

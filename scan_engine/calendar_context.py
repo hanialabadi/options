@@ -41,56 +41,8 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── US Market Holidays (NYSE observed) ────────────────────────────────────────
-# Hardcoded for 2024-2027. Add years as needed.
-# Source: NYSE holiday schedule (https://www.nyse.com/markets/hours-calendars)
-_US_MARKET_HOLIDAYS: set[date] = {
-    # 2024
-    date(2024, 1, 1),   # New Year's Day
-    date(2024, 1, 15),  # MLK Day
-    date(2024, 2, 19),  # Presidents' Day
-    date(2024, 3, 29),  # Good Friday
-    date(2024, 5, 27),  # Memorial Day
-    date(2024, 6, 19),  # Juneteenth
-    date(2024, 7, 4),   # Independence Day
-    date(2024, 9, 2),   # Labor Day
-    date(2024, 11, 28), # Thanksgiving
-    date(2024, 12, 25), # Christmas
-    # 2025
-    date(2025, 1, 1),   # New Year's Day
-    date(2025, 1, 9),   # National Day of Mourning (Carter)
-    date(2025, 1, 20),  # MLK Day
-    date(2025, 2, 17),  # Presidents' Day
-    date(2025, 4, 18),  # Good Friday
-    date(2025, 5, 26),  # Memorial Day
-    date(2025, 6, 19),  # Juneteenth
-    date(2025, 7, 4),   # Independence Day
-    date(2025, 9, 1),   # Labor Day
-    date(2025, 11, 27), # Thanksgiving
-    date(2025, 12, 25), # Christmas
-    # 2026
-    date(2026, 1, 1),   # New Year's Day
-    date(2026, 1, 19),  # MLK Day
-    date(2026, 2, 16),  # Presidents' Day
-    date(2026, 4, 3),   # Good Friday
-    date(2026, 5, 25),  # Memorial Day
-    date(2026, 6, 19),  # Juneteenth
-    date(2026, 7, 3),   # Independence Day (observed, Friday)
-    date(2026, 9, 7),   # Labor Day
-    date(2026, 11, 26), # Thanksgiving
-    date(2026, 12, 25), # Christmas
-    # 2027
-    date(2027, 1, 1),   # New Year's Day
-    date(2027, 1, 18),  # MLK Day
-    date(2027, 2, 15),  # Presidents' Day
-    date(2027, 3, 26),  # Good Friday
-    date(2027, 5, 31),  # Memorial Day
-    date(2027, 6, 18),  # Juneteenth (observed, Friday)
-    date(2027, 7, 5),   # Independence Day (observed, Monday)
-    date(2027, 9, 6),   # Labor Day
-    date(2027, 11, 25), # Thanksgiving
-    date(2027, 12, 24), # Christmas (observed, Friday)
-}
+# ── US Market Holidays — imported from shared SSOT ────────────────────────────
+from core.shared.calendar.trading_calendar import NYSE_HOLIDAYS as _US_MARKET_HOLIDAYS
 
 
 def _to_date(dt: datetime | date | None) -> date:
@@ -224,8 +176,10 @@ def calendar_risk_flag(
     ctx = get_calendar_context(dt)
     strat = str(strategy or '').upper().strip()
 
-    is_long  = any(s in strat for s in _LONG_PREMIUM)
-    is_short = any(s in strat for s in _SHORT_PREMIUM)
+    # Normalize: "Long Call LEAP" → "LONG_CALL_LEAP", "Cash-Secured Put" → "CASH_SECURED_PUT"
+    strat_norm = strat.replace(' ', '_').replace('-', '_')
+    is_long  = any(s in strat_norm for s in _LONG_PREMIUM)
+    is_short = any(s in strat_norm for s in _SHORT_PREMIUM)
 
     # Nothing to say for mid-week normal days
     if not ctx.is_friday and not ctx.is_pre_long_weekend:

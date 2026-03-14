@@ -283,10 +283,15 @@ def _calculate_dte_range_by_strategy(
             return (45, 75, 'Medium', 
                    f"Volatility ({strategy_name}) with neutral IV ({iv_rank:.0f}): 45-75 DTE for volatility play")
     
+    # PMCC: short-call DTE window (LEAP leg selected separately in step10)
+    elif strategy_name == 'PMCC':
+        return (30, 50, 'Short',
+               f"PMCC short-call leg: 30-50 DTE for income (LEAP 270+ DTE selected in step10)")
+
     # INCOME STRATEGIES (CSP, Covered Call, Buy-Write)
     elif strategy_name in ['Cash-Secured Put', 'Covered Call', 'Buy-Write']:
         # Relaxed DTE for testing: 20-60 DTE
-        return (20, 60, 'Short', 
+        return (20, 60, 'Short',
                f"Income ({strategy_name}): 20-60 DTE for premium collection efficiency")
     
     # CREDIT SPREADS (Iron Condor, Put Credit Spread, Call Credit Spread)

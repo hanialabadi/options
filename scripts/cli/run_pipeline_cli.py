@@ -102,8 +102,17 @@ if __name__ == "__main__":
     parser.add_argument('--full', action='store_true', help="Run the complete pipeline")
     parser.add_argument('--account-balance', type=float, default=100000.0, help="Account balance (default: 100000)")
     parser.add_argument('--max-portfolio-risk', type=float, default=0.20, help="Max portfolio risk (default: 0.20)")
+    parser.add_argument('--use-cached-chains', action='store_true',
+                        help="Use cached chain data (extend quote TTL to 72h). "
+                             "For off-hours auditing — uses cache when available, "
+                             "fetches from Schwab only on cache miss.")
 
     args = parser.parse_args()
+
+    if args.use_cached_chains:
+        from scan_engine.step10_fetch_contracts_schwab import _CHAIN_CACHE
+        _CHAIN_CACHE.QUOTE_TTL_HOURS = 72.0
+        logger.info("🔒 Audit mode: chain quote TTL extended to 72h (cache-first, fetch on miss)")
 
     if args.full:
         run_full_scan(explicit_path=args.path, account_balance=args.account_balance, max_portfolio_risk=args.max_portfolio_risk)

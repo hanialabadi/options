@@ -59,7 +59,7 @@ def main():
                 if 'data_source' in df.columns:
                     display_cols.append('data_source')
                 
-                st.dataframe(df[display_cols].head(10), use_container_width=True)
+                st.dataframe(df[display_cols].head(10), width="stretch")
                 
                 # Show volatility regime distribution
                 if 'volatility_regime' in df.columns:

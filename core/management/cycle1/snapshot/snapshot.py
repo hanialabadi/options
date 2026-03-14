@@ -81,8 +81,8 @@ CYCLE1_ALLOWLIST = [
     # Economic Anchors (Broker Truth)
     "$ Total G/L",
     "% Total G/L",
-    "Earnings Date",
-    "Open Int",
+    "Earnings_Date",
+    "Open_Int",
     "Volume",
     "% of Acct",
     # Temporal Anchor (System Derived at Ingest)
@@ -220,8 +220,19 @@ def _pandas_dtype_to_duckdb(dtype, column_name: str = "") -> str:
     dtype_str = str(dtype)
     dtype_lower = dtype_str.lower()
 
-    # Hard Override: Chart States are always VARCHAR (categorical)
-    if "Chart_State" in column_name:
+    # Hard Override: Categorical columns are always VARCHAR — these may initially
+    # be all-NaN (pandas float64) but contain string values once data arrives.
+    # Without this override, DuckDB creates the column as DOUBLE from the first
+    # NaN-only batch, then fails on INSERT when real strings appear.
+    _CATEGORICAL_COLUMNS = {
+        "Chart_State", "Market_Structure", "RSI_Divergence", "MACD_Divergence",
+        "Weekly_Trend_Bias", "Chart_Regime", "Chart_EMA_Signal", "Chart_Signal_Type",
+        "Chart_Source", "Signal_Type", "Regime", "Regime_Original", "Regime_Adjusted",
+        "IV_Maturity_State", "IV_Trend_7D", "HV_Accel_Proxy", "HV_Trend_30D",
+        "Trend_State", "Volume_Trend", "Trend_Strength", "iv_surface_shape",
+        "Resolution_Reason", "OBV_Slope",
+    }
+    if column_name in _CATEGORICAL_COLUMNS or "Chart_State" in column_name:
         return 'VARCHAR'
 
     # Temporal Types (Highest Priority)
@@ -806,11 +817,27 @@ def save_clean_snapshot(
                             df_cols = list(df_snapshot_clean.columns)
                             existing_db_cols = set(db_cols.keys())
                             missing_in_db = [col for col in df_cols if col not in existing_db_cols]
-                            
+
                             if missing_in_db:
                                 for col in missing_in_db:
                                     duckdb_type = _pandas_dtype_to_duckdb(df_snapshot_clean[col].dtype, column_name=col)
                                     con.execute(f'ALTER TABLE {target_table} ADD COLUMN "{col}" {duckdb_type}')
+
+                            # Detect and repair type mismatches: columns created as DOUBLE
+                            # from initial NaN-only data that now contain string values.
+                            # DuckDB supports ALTER COLUMN TYPE — DOUBLE→VARCHAR is safe
+                            # (existing numeric values become their string representation).
+                            for col in df_cols:
+                                if col not in existing_db_cols:
+                                    continue
+                                expected_type = _pandas_dtype_to_duckdb(df_snapshot_clean[col].dtype, column_name=col)
+                                actual_type = db_cols[col].upper()
+                                if actual_type == "DOUBLE" and expected_type == "VARCHAR":
+                                    logger.warning(
+                                        f"Schema repair: {target_table}.{col} is DOUBLE in DB "
+                                        f"but VARCHAR in DataFrame — converting to VARCHAR"
+                                    )
+                                    con.execute(f'ALTER TABLE {target_table} ALTER COLUMN "{col}" TYPE VARCHAR')
                         else:
                             col_definitions = []
                             for col in df_snapshot_clean.columns:

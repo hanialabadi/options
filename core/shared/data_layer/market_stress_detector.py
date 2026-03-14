@@ -35,25 +35,70 @@ from config.indicator_settings import (
 
 logger = logging.getLogger(__name__)
 
+def _try_composite_classifier() -> Optional[Tuple[str, float, str]]:
+    """
+    Attempt to classify market stress using the composite regime classifier.
+
+    Returns (stress_level, regime_score, 'COMPOSITE') if market context data
+    exists with confidence ≥ 0.5, otherwise None (caller should fall back to SPY ATR).
+    """
+    try:
+        from core.shared.data_layer.market_context import get_latest_market_context
+        from core.shared.data_layer.market_regime_classifier import classify_market_regime
+
+        ctx = get_latest_market_context()
+        if ctx is None:
+            return None
+
+        regime = classify_market_regime(ctx)
+        if regime.confidence < 0.5:
+            logger.info(
+                "[MarketStress] Composite confidence %.2f < 0.5 — falling back to SPY ATR",
+                regime.confidence,
+            )
+            return None
+
+        logger.info(
+            "[MarketStress] Using COMPOSITE classifier: regime=%s score=%.1f conf=%.2f",
+            regime.regime, regime.score, regime.confidence,
+        )
+        return regime.stress_level, regime.score, "COMPOSITE"
+    except Exception as e:
+        logger.debug("[MarketStress] Composite classifier unavailable: %s", e)
+        return None
+
+
 def classify_market_stress(
     market_ticker: str = "SPY",
     days_history: int = 60,
     client=None
 ) -> Tuple[str, float, str]:
     """
-    Classifies the overall market stress level using market-level proxies (e.g., SPY).
-    
+    Classifies the overall market stress level.
+
+    Strategy:
+        1. Try composite regime classifier (market_context_daily data).
+           If available and confidence ≥ 0.5 → use it.
+        2. Fall back to SPY ATR-based classification (original logic).
+
     Args:
         market_ticker: The ticker symbol for the market proxy (e.g., 'SPY', 'QQQ').
         days_history: Number of days of historical data to fetch.
         client: SchwabClient instance for fetching data.
-        
+
     Returns:
         Tuple of (stress_level, primary_metric_value, stress_basis):
             stress_level: 'LOW', 'NORMAL', 'ELEVATED', 'CRISIS'
-            primary_metric_value: The value of the primary metric used for classification (e.g., SPY ATR %).
-            stress_basis: A string indicating the primary metric used (e.g., 'SPY_ATR_PCT').
+            primary_metric_value: The value of the primary metric used for classification.
+            stress_basis: 'COMPOSITE' or 'SPY_ATR_PCT'.
     """
+    # ── Try composite classifier first ───────────────────────────────────────
+    composite = _try_composite_classifier()
+    if composite is not None:
+        return composite
+
+    # ── Fall back to SPY ATR logic ───────────────────────────────────────────
+    logger.info("[MarketStress] Using SPY_ATR_FALLBACK for market stress classification")
     try:
         hist, source = load_price_history(market_ticker, days=days_history, client=client)
         

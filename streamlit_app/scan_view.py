@@ -7,21 +7,21 @@ import sys
 import logging
 from pathlib import Path
 
+from streamlit_app.formatters import (
+    safe_get as _g_module,
+    fmt_price as _fmt_price_module,
+    fmt_pct as _fmt_pct_module,
+    fmt_float as _fmt_float_module,
+    conviction_score as _conviction_score_module,
+    expected_move_pct as _expected_move_pct_module,
+    iv_edge_score as _iv_edge_score_module,
+)
+from streamlit_app.copy_card import build_copy_card_text as _build_copy_card_text
 
-# US market holidays (NYSE) — static list, update annually
-_NYSE_HOLIDAYS = {
-    date(2025, 1, 1), date(2025, 1, 20), date(2025, 2, 17), date(2025, 4, 18),
-    date(2025, 5, 26), date(2025, 6, 19), date(2025, 7, 4), date(2025, 9, 1),
-    date(2025, 11, 27), date(2025, 12, 25),
-    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
-    date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
-    date(2026, 11, 26), date(2026, 12, 25),
-}
 
-
-def _is_trading_day(d: date) -> bool:
-    """Return True if d is a NYSE trading day (Mon–Fri, not a holiday)."""
-    return d.weekday() < 5 and d not in _NYSE_HOLIDAYS
+# US market holidays — imported from shared SSOT
+from core.shared.calendar.trading_calendar import NYSE_HOLIDAYS as _NYSE_HOLIDAYS
+from core.shared.calendar.trading_calendar import is_trading_day as _is_trading_day
 
 
 def _snapshot_is_stale(snapshot_ts: datetime) -> tuple[bool, str]:
@@ -66,15 +66,460 @@ def _snapshot_is_stale(snapshot_ts: datetime) -> tuple[bool, str]:
 
 logger = logging.getLogger(__name__)
 
-try:
-    from core.shared.data_layer.duckdb_utils import connect_read_only as _connect_ro
-except ImportError:
-    import duckdb as _duckdb
-    def _connect_ro(path): return _duckdb.connect(str(path), read_only=True)
+from core.shared.data_layer.duckdb_utils import (
+    connect_read_only as _connect_ro,
+    get_domain_connection,
+    DbDomain,
+)
 
 def _resolve_pipeline_db_path(debug_mode: bool) -> Path:
     from core.shared.data_contracts.config import PIPELINE_DB_PATH, DEBUG_PIPELINE_DB_PATH
     return DEBUG_PIPELINE_DB_PATH if debug_mode else PIPELINE_DB_PATH
+
+
+# ── Live Pulse Check Infrastructure ─────────────────────────────────────────
+
+_LIQUIDITY_GRADE_ORDER = {'Excellent': 4, 'Good': 3, 'Acceptable': 2, 'Thin': 1, 'Illiquid': 0}
+_PULSE_CACHE_TTL_S = 60  # seconds
+
+
+def _get_schwab_client():
+    """Get or create cached SchwabClient in session state."""
+    if 'schwab_client' not in st.session_state or st.session_state.schwab_client is None:
+        try:
+            from scan_engine.loaders.schwab_api_client import SchwabClient
+            client = SchwabClient()
+            client.ensure_valid_token()
+            st.session_state.schwab_client = client
+        except Exception as e:
+            logger.error(f"Failed to create SchwabClient: {e}")
+            return None
+    return st.session_state.schwab_client
+
+
+def _get_cached_chain(ticker: str, expiration: str):
+    """Get chain from cache or fetch fresh. Returns (chain_data, from_cache)."""
+    cache_key = (ticker, expiration)
+    cache = st.session_state.get('pulse_cache', {})
+
+    # Check TTL
+    if cache_key in cache:
+        entry = cache[cache_key]
+        age = (datetime.now() - entry['ts']).total_seconds()
+        if age < _PULSE_CACHE_TTL_S:
+            return entry['data'], True
+
+    # Fetch fresh
+    client = _get_schwab_client()
+    if client is None:
+        return None, False
+
+    try:
+        chain_data = client.get_chains(
+            symbol=ticker, strikeCount=30, range="SAB", strategy="SINGLE"
+        )
+    except Exception as e:
+        logger.error(f"Chain fetch failed for {ticker}: {e}")
+        return None, False
+
+    # Update cache
+    if 'pulse_cache' not in st.session_state:
+        st.session_state.pulse_cache = {}
+    st.session_state.pulse_cache[cache_key] = {'data': chain_data, 'ts': datetime.now()}
+    return chain_data, False
+
+
+def _find_contract_in_chain(chain_data: dict, expiration: str, strike: float, put_call: str) -> dict:
+    """Find a specific contract in chain response. put_call: 'CALL' or 'PUT'."""
+    exp_map_key = f'{put_call.lower()}ExpDateMap'
+    exp_map = chain_data.get(exp_map_key, {})
+
+    # Find matching expiration key (format: "2026-05-15:69")
+    for key in exp_map:
+        if key.startswith(expiration):
+            strikes = exp_map[key]
+            strike_str = str(strike)
+            # Try exact match and nearby
+            for sk, contracts in strikes.items():
+                if abs(float(sk) - strike) < 0.01 and contracts:
+                    return contracts[0]
+    return {}
+
+
+def _compute_verdict(changes: list) -> str:
+    """Compute IMPROVED / DETERIORATED / UNCHANGED from list of changes."""
+    improved = sum(1 for c in changes if c['direction'] == 'improved')
+    deteriorated = sum(1 for c in changes if c['direction'] == 'deteriorated')
+
+    if improved > 0 and deteriorated == 0:
+        return 'IMPROVED'
+    if deteriorated > 0 and improved == 0:
+        return 'DETERIORATED'
+    if improved > 0 and deteriorated > 0:
+        return 'MIXED'
+    return 'UNCHANGED'
+
+
+def _live_pulse_check(ticker: str, expiration: str, strike: float,
+                      option_type: str, contract_symbols: str, scan_row) -> dict:
+    """
+    Full pulse check: fetch live chain, re-evaluate all execution-critical signals.
+
+    Args:
+        ticker: e.g. "INTU"
+        expiration: e.g. "2026-05-15"
+        strike: e.g. 470.0
+        option_type: e.g. "call", "put", "straddle", "strangle"
+        contract_symbols: JSON string of contract symbols (may be list for multi-leg)
+        scan_row: pd.Series with scan-time values for comparison
+
+    Returns:
+        dict with 'legs', 'combined', 'verdict', 'changes', 'summary', 'underlying_price'
+    """
+    from scan_engine.step10_fetch_contracts_schwab import grade_liquidity
+
+    chain_data, from_cache = _get_cached_chain(ticker, expiration)
+    if chain_data is None:
+        return {'error': 'Failed to fetch chain data. Check Schwab token.'}
+
+    underlying_price = chain_data.get('underlyingPrice', 0)
+
+    # Determine legs to fetch
+    is_multi_leg = option_type.lower() in ('straddle', 'strangle')
+    if is_multi_leg:
+        legs_to_fetch = [('CALL', strike), ('PUT', strike)]
+    else:
+        pc = 'CALL' if 'call' in option_type.lower() else 'PUT'
+        legs_to_fetch = [(pc, strike)]
+
+    legs = []
+    for pc, stk in legs_to_fetch:
+        contract = _find_contract_in_chain(chain_data, expiration, stk, pc)
+        if not contract:
+            legs.append({'put_call': pc, 'strike': stk, 'error': f'Contract not found ({pc} ${stk})'})
+            continue
+
+        bid = float(contract.get('bid', 0))
+        ask = float(contract.get('ask', 0))
+        mid = (bid + ask) / 2 if (bid + ask) > 0 else 0
+        oi = int(contract.get('openInterest', 0))
+        volume = int(contract.get('totalVolume', 0))
+        bid_size = int(contract.get('bidSize', 0))
+        ask_size = int(contract.get('askSize', 0))
+
+        spread_pct = ((ask - bid) / mid * 100) if mid > 0 else 0.0
+
+        grade, score, reason = grade_liquidity(bid, ask, mid, oi, volume)
+
+        legs.append({
+            'put_call': pc,
+            'strike': stk,
+            'bid': bid,
+            'ask': ask,
+            'mid': mid,
+            'bid_size': bid_size,
+            'ask_size': ask_size,
+            'spread_pct': spread_pct,
+            'oi': oi,
+            'volume': volume,
+            'delta': float(contract.get('delta', 0)),
+            'gamma': float(contract.get('gamma', 0)),
+            'vega': float(contract.get('vega', 0)),
+            'theta': float(contract.get('theta', 0)),
+            'grade': grade,
+            'score': score,
+            'reason': reason,
+        })
+
+    # Compute combined for multi-leg
+    valid_legs = [l for l in legs if 'error' not in l]
+    if is_multi_leg and len(valid_legs) == 2:
+        combined = {
+            'bid': sum(l['bid'] for l in valid_legs),
+            'ask': sum(l['ask'] for l in valid_legs),
+            'mid': sum(l['mid'] for l in valid_legs),
+            'bid_size': min(l['bid_size'] for l in valid_legs),
+            'ask_size': min(l['ask_size'] for l in valid_legs),
+            'oi': min(l['oi'] for l in valid_legs),
+            'volume': sum(l['volume'] for l in valid_legs),
+            'delta': sum(l['delta'] for l in valid_legs),
+            'gamma': sum(l['gamma'] for l in valid_legs),
+            'vega': sum(l['vega'] for l in valid_legs),
+            'theta': sum(l['theta'] for l in valid_legs),
+        }
+        combined_mid = combined['mid']
+        combined['spread_pct'] = ((combined['ask'] - combined['bid']) / combined_mid * 100) if combined_mid > 0 else 0
+        # Grade combined
+        cg, cs, cr = grade_liquidity(combined['bid'], combined['ask'], combined_mid,
+                                     combined['oi'], combined['volume'])
+        combined['grade'] = cg
+        combined['score'] = cs
+        combined['reason'] = cr
+    elif len(valid_legs) == 1:
+        combined = valid_legs[0].copy()
+    else:
+        combined = {}
+
+    # Compare vs scan-time values and compute changes
+    changes = []
+
+    def _cmp(field, scan_val, live_val, lower_is_better=True):
+        try:
+            sv = float(scan_val) if scan_val is not None and str(scan_val) not in ('nan', 'None', '') else None
+            lv = float(live_val) if live_val is not None else None
+            if sv is None or lv is None:
+                return
+            if abs(sv - lv) < 0.001:
+                changes.append({'field': field, 'scan': sv, 'live': lv, 'direction': 'unchanged'})
+                return
+            if lower_is_better:
+                direction = 'improved' if lv < sv else 'deteriorated'
+            else:
+                direction = 'improved' if lv > sv else 'deteriorated'
+            changes.append({'field': field, 'scan': sv, 'live': lv, 'direction': direction})
+        except (ValueError, TypeError):
+            pass
+
+    if combined:
+        _cmp('Spread', scan_row.get('Bid_Ask_Spread_Pct'), combined.get('spread_pct'), lower_is_better=True)
+        # OI: higher is better — use explicit None check (0 is valid, not falsy)
+        _scan_oi = scan_row.get('OI')
+        if _scan_oi is None or (isinstance(_scan_oi, float) and pd.isna(_scan_oi)):
+            _scan_oi = scan_row.get('openInterest')
+        if _scan_oi is None or (isinstance(_scan_oi, float) and pd.isna(_scan_oi)):
+            _scan_oi = scan_row.get('Open_Interest')
+        _cmp('OI', _scan_oi, combined.get('oi'), lower_is_better=False)
+        # Volume: skip comparison — scan-time Volume is stock volume, live is option contract volume
+        # These are different metrics; comparing them produces false deterioration signals.
+        _cmp('Delta', scan_row.get('Delta'), combined.get('delta'), lower_is_better=None)
+        _cmp('Gamma', scan_row.get('Gamma'), combined.get('gamma'), lower_is_better=None)
+        _cmp('Vega', scan_row.get('Vega'), combined.get('vega'), lower_is_better=None)
+        _cmp('Theta', scan_row.get('Theta'), combined.get('theta'), lower_is_better=None)
+
+        # Liquidity grade comparison
+        scan_grade = str(scan_row.get('Liquidity_Grade') or '')
+        live_grade = combined.get('grade', '')
+        if scan_grade and live_grade:
+            sg_ord = _LIQUIDITY_GRADE_ORDER.get(scan_grade, -1)
+            lg_ord = _LIQUIDITY_GRADE_ORDER.get(live_grade, -1)
+            if lg_ord > sg_ord:
+                changes.append({'field': 'Grade', 'scan': scan_grade, 'live': live_grade, 'direction': 'improved'})
+            elif lg_ord < sg_ord:
+                changes.append({'field': 'Grade', 'scan': scan_grade, 'live': live_grade, 'direction': 'deteriorated'})
+            else:
+                changes.append({'field': 'Grade', 'scan': scan_grade, 'live': live_grade, 'direction': 'unchanged'})
+
+    verdict = _compute_verdict(changes)
+
+    # Build summary string
+    improved_items = [c for c in changes if c['direction'] == 'improved']
+    deteriorated_items = [c for c in changes if c['direction'] == 'deteriorated']
+    summary_parts = []
+    for c in improved_items:
+        if c['field'] == 'Spread':
+            summary_parts.append(f"Spread {c['scan']:.1f}% -> {c['live']:.1f}%")
+        elif c['field'] == 'Grade':
+            summary_parts.append(f"Grade {c['scan']} -> {c['live']}")
+        elif c['field'] == 'OI':
+            summary_parts.append(f"OI {int(c['scan'])} -> {int(c['live'])}")
+    for c in deteriorated_items:
+        if c['field'] == 'Spread':
+            summary_parts.append(f"Spread widened {c['scan']:.1f}% -> {c['live']:.1f}%")
+        elif c['field'] == 'Grade':
+            summary_parts.append(f"Grade dropped {c['scan']} -> {c['live']}")
+        elif c['field'] == 'OI':
+            summary_parts.append(f"OI dropped {int(c['scan'])} -> {int(c['live'])}")
+
+    # Market status detection (ET)
+    try:
+        import pytz
+        et = pytz.timezone('America/New_York')
+        now_et = datetime.now(et)
+        _is_weekday = now_et.weekday() < 5
+        _h, _m = now_et.hour, now_et.minute
+        _market_open = _is_weekday and (_h > 9 or (_h == 9 and _m >= 30)) and _h < 16
+    except Exception:
+        _market_open = None  # unknown
+
+    # Scan timestamp (from quote_time or timestamp column)
+    _scan_ts = None
+    for _ts_col in ('quote_time', 'timestamp', 'trade_time'):
+        _v = scan_row.get(_ts_col)
+        if _v is not None and str(_v) not in ('', 'nan', 'NaT', 'None'):
+            _scan_ts = str(_v)
+            break
+
+    return {
+        'legs': legs,
+        'combined': combined,
+        'verdict': verdict,
+        'changes': changes,
+        'summary': ', '.join(summary_parts) if summary_parts else 'No significant changes',
+        'underlying_price': underlying_price,
+        'from_cache': from_cache,
+        'pulse_ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'scan_ts': _scan_ts,
+        'market_open': _market_open,
+    }
+
+
+def _render_pulse_result(result: dict, scan_row, key_prefix: str):
+    """Render pulse check results inside a Streamlit card."""
+    if 'error' in result:
+        st.error(f"Pulse check failed: {result['error']}")
+        return
+
+    verdict = result['verdict']
+    verdict_icons = {'IMPROVED': '\\u2705', 'DETERIORATED': '\\U0001f534', 'MIXED': '\\U0001f7e1', 'UNCHANGED': '\\u26aa'}
+    verdict_colors = {'IMPROVED': 'green', 'DETERIORATED': 'red', 'MIXED': 'orange', 'UNCHANGED': 'gray'}
+    v_icon = verdict_icons.get(verdict, '')
+    v_color = verdict_colors.get(verdict, 'gray')
+
+    # Market status + timestamps
+    _mkt_open = result.get('market_open')
+    if _mkt_open is True:
+        _mkt_badge = "<span style='color:#0a0; font-weight:bold;'>MARKET OPEN</span>"
+    elif _mkt_open is False:
+        _mkt_badge = "<span style='color:#c00; font-weight:bold;'>MARKET CLOSED</span>"
+    else:
+        _mkt_badge = ""
+
+    _pulse_ts = result.get('pulse_ts', '')
+    _scan_ts = result.get('scan_ts', '')
+    _ts_info = ''
+    if _scan_ts:
+        _ts_info = f" | Scan: {_scan_ts}"
+    if _pulse_ts:
+        _ts_info += f" | Pulse: {_pulse_ts}"
+
+    st.markdown(
+        f"<div style='padding:8px 12px; border-radius:6px; "
+        f"border-left:4px solid {v_color}; background:rgba(0,0,0,0.03); margin:8px 0;'>"
+        f"<b>Execution Status: {verdict}</b> {v_icon}"
+        f"&nbsp;&nbsp;<span style='color:#888; font-size:0.85em;'>"
+        f"{'(cached)' if result.get('from_cache') else '(live)'}"
+        f" | Stock: ${result.get('underlying_price', 0):.2f}"
+        f" | {_mkt_badge}{_ts_info}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # When market is closed, explain identical values
+    if _mkt_open is False:
+        st.info(
+            "Market is closed — Schwab returns end-of-day data. "
+            "Values may be identical to scan-time. Run pulse check during market hours for live spread updates.",
+            icon="🕓",
+        )
+
+    if result.get('summary'):
+        st.caption(result['summary'])
+
+    combined = result.get('combined', {})
+    legs = result.get('legs', [])
+    is_multi_leg = len(legs) > 1
+
+    # Build comparison table
+    def _arrow(change_entry):
+        if change_entry is None:
+            return ''
+        d = change_entry['direction']
+        if d == 'improved':
+            return ' :green[improved]'
+        elif d == 'deteriorated':
+            return ' :red[deteriorated]'
+        return ''
+
+    changes_by_field = {c['field']: c for c in result.get('changes', [])}
+
+    # Multi-leg: per-leg table first
+    if is_multi_leg and len([l for l in legs if 'error' not in l]) == 2:
+        leg_rows = []
+        for leg in legs:
+            if 'error' in leg:
+                continue
+            leg_rows.append({
+                'Leg': f"{leg['put_call']} ${leg['strike']:.0f}",
+                'Bid': f"${leg['bid']:.2f}",
+                'Ask': f"${leg['ask']:.2f}",
+                'Spread': f"{leg['spread_pct']:.1f}%",
+                'bidSize': leg['bid_size'],
+                'askSize': leg['ask_size'],
+                'OI': leg['oi'],
+                'Vol': leg['volume'],
+                'Delta': f"{leg['delta']:.3f}",
+                'Grade': leg['grade'],
+            })
+        if combined:
+            leg_rows.append({
+                'Leg': 'Combined',
+                'Bid': f"${combined['bid']:.2f}",
+                'Ask': f"${combined['ask']:.2f}",
+                'Spread': f"{combined['spread_pct']:.1f}%",
+                'bidSize': combined.get('bid_size', ''),
+                'askSize': combined.get('ask_size', ''),
+                'OI': combined.get('oi', ''),
+                'Vol': combined.get('volume', ''),
+                'Delta': f"{combined['delta']:.3f}",
+                'Grade': combined.get('grade', ''),
+            })
+        st.dataframe(pd.DataFrame(leg_rows), hide_index=True, use_container_width=True)
+
+    # Main comparison table (scan vs live)
+    if combined:
+        scan_bid = scan_row.get('Bid')
+        scan_ask = scan_row.get('Ask')
+        # OI: explicit None check (0 is valid, not falsy)
+        _r_scan_oi = scan_row.get('OI')
+        if _r_scan_oi is None or (isinstance(_r_scan_oi, float) and pd.isna(_r_scan_oi)):
+            _r_scan_oi = scan_row.get('openInterest')
+        if _r_scan_oi is None or (isinstance(_r_scan_oi, float) and pd.isna(_r_scan_oi)):
+            _r_scan_oi = scan_row.get('Open_Interest')
+
+        comparison_rows = [
+            {'Signal': 'Bid / Ask',
+             'Scan': f"${float(scan_bid or 0):.2f} / ${float(scan_ask or 0):.2f}",
+             'Live': f"${combined['bid']:.2f} / ${combined['ask']:.2f}",
+             'Change': ''},
+            {'Signal': 'Spread %',
+             'Scan': f"{float(scan_row.get('Bid_Ask_Spread_Pct') or 0):.1f}%",
+             'Live': f"{combined['spread_pct']:.1f}%",
+             'Change': _arrow(changes_by_field.get('Spread'))},
+            {'Signal': 'bidSize / askSize',
+             'Scan': '-',
+             'Live': f"{combined.get('bid_size', 0)} / {combined.get('ask_size', 0)}",
+             'Change': ''},
+            {'Signal': 'OI',
+             'Scan': str(int(float(_r_scan_oi if _r_scan_oi is not None else 0))),
+             'Live': str(combined.get('oi', 0)),
+             'Change': _arrow(changes_by_field.get('OI'))},
+            {'Signal': 'Option Vol',
+             'Scan': '-',
+             'Live': str(combined.get('volume', 0)),
+             'Change': ''},
+            {'Signal': 'Delta',
+             'Scan': f"{float(scan_row.get('Delta') or 0):.3f}",
+             'Live': f"{combined.get('delta', 0):.3f}",
+             'Change': ''},
+            {'Signal': 'Gamma',
+             'Scan': f"{float(scan_row.get('Gamma') or 0):.4f}",
+             'Live': f"{combined.get('gamma', 0):.4f}",
+             'Change': ''},
+            {'Signal': 'Vega',
+             'Scan': f"{float(scan_row.get('Vega') or 0):.3f}",
+             'Live': f"{combined.get('vega', 0):.3f}",
+             'Change': ''},
+            {'Signal': 'Theta',
+             'Scan': f"{float(scan_row.get('Theta') or 0):.3f}",
+             'Live': f"{combined.get('theta', 0):.3f}",
+             'Change': ''},
+            {'Signal': 'Grade',
+             'Scan': str(scan_row.get('Liquidity_Grade') or '-'),
+             'Live': combined.get('grade', '-'),
+             'Change': _arrow(changes_by_field.get('Grade'))},
+        ]
+        st.dataframe(pd.DataFrame(comparison_rows), hide_index=True, use_container_width=True)
+
 
 def get_latest_step8_artifact(scan_output_dir):
     """
@@ -277,14 +722,7 @@ def get_iv_maturity_distribution():
     Tiers (IVEngine contract): MATURE=120+d, PARTIAL=60-119d, IMMATURE=20-59d, EARLY=1-19d, MISSING=0d
     """
     try:
-        from core.shared.data_layer.iv_term_history import get_iv_history_db_path
-        import duckdb
-
-        db_path = get_iv_history_db_path()
-        if not db_path.exists():
-            return None
-
-        con = duckdb.connect(str(db_path), read_only=True)
+        con = get_domain_connection(DbDomain.IV_HISTORY, read_only=True)
         rows = con.execute("""
             SELECT ticker, COUNT(*) AS days_count
             FROM iv_term_history
@@ -357,28 +795,20 @@ def get_snapshot_info(path, core_project_root):
         # Calculate IV History (Authoritative: Query DuckDB iv_term_history)
         # Phase 4: DuckDB is single source of truth for IV history
         try:
-            from core.shared.data_layer.iv_term_history import get_iv_history_db_path, get_history_summary
-            import duckdb
+            from core.shared.data_layer.iv_term_history import get_history_summary
 
-            db_path = get_iv_history_db_path()
-            logger.info(f"📊 Checking IV history database: {db_path}")
+            con = get_domain_connection(DbDomain.IV_HISTORY, read_only=True)
+            summary = get_history_summary(con)
+            con.close()
 
-            if db_path.exists():
-                con = duckdb.connect(str(db_path), read_only=True)
-                summary = get_history_summary(con)
-                con.close()
+            # Use median depth as representative IV history
+            median_depth = summary.get('median_depth', 0)
+            total_tickers = summary.get('total_tickers', 0)
+            iv_history = int(median_depth) if median_depth is not None else 0
 
-                # Use median depth as representative IV history
-                median_depth = summary.get('median_depth', 0)
-                total_tickers = summary.get('total_tickers', 0)
-                iv_history = int(median_depth) if median_depth is not None else 0
-
-                logger.info(f"✅ IV history loaded: {iv_history} days median, {total_tickers} tickers")
-            else:
-                iv_history = 0
-                logger.warning(f"⚠️ IV history database not found at {db_path} - run bootstrap or daily collection")
+            logger.info(f"IV history loaded: {iv_history} days median, {total_tickers} tickers")
         except Exception as e:
-            logger.error(f"❌ Failed to query IV history: {e}", exc_info=True)
+            logger.error(f"Failed to query IV history: {e}", exc_info=True)
             iv_history = 0
 
         return {
@@ -395,52 +825,28 @@ def get_snapshot_info(path, core_project_root):
 
 def render_waitlist_table(df_waitlist):
     """
-    Render WAITLIST (AWAIT_CONFIRMATION) strategies with wait conditions and TTL.
-
-    Matches CLI output_formatter.py semantics.
+    Render WAITLIST (AWAIT_CONFIRMATION) strategies as expandable cards with
+    filters, wait conditions, scan-time metrics, and live Pulse Check button.
     """
     if df_waitlist.empty:
-        st.success("🟢 No trades in WAITLIST — all clear.")
+        st.success("No trades in WAITLIST — all clear.")
         return
 
-    st.info("""
-    🟡 **WAITLIST** — Trades waiting on specific conditions to be satisfied.
-    These strategies are valid but require confirmation (e.g., liquidity improvement, IV maturity, data refresh).
-    """)
-
-    # Normalize column names (handle both lowercase and uppercase from different sources)
+    # Normalize column names
     df_waitlist = df_waitlist.copy()
-
-    # Create column mapping for common variations
     col_mapping = {
-        'ticker': 'Ticker',
-        'strategy_name': 'Strategy_Name',
-        'strategy_type': 'Strategy_Type'
+        'ticker': 'Ticker', 'strategy_name': 'Strategy_Name',
+        'strategy_type': 'Strategy_Type', 'gate_reason': 'Gate_Reason',
+        'block_reason': 'Gate_Reason', 'strategy_family': 'Strategy_Family',
     }
-
     for old_col, new_col in col_mapping.items():
         if old_col in df_waitlist.columns and new_col not in df_waitlist.columns:
             df_waitlist[new_col] = df_waitlist[old_col]
 
-    # Core columns for display
-    display_cols = [
-        "Ticker",
-        "Strategy_Name",
-        "Strategy_Type",
-        "wait_progress",
-        "conditions_met_count",
-        "total_conditions",
-        "wait_expires_at",
-        "evaluation_count"
-    ]
-
-    # Use available columns
-    existing_cols = [c for c in display_cols if c in df_waitlist.columns]
-
     import json as _json
+    import re as _re
 
     def _parse_json_field(val):
-        """Parse a field that may be a list already or a JSON string."""
         if isinstance(val, list):
             return val
         if isinstance(val, str):
@@ -450,47 +856,203 @@ def render_waitlist_table(df_waitlist):
                 return []
         return []
 
-    # Calculate derived fields if not present
+    # Calculate derived fields
     if 'conditions_met_count' not in df_waitlist.columns and 'conditions_met' in df_waitlist.columns:
         df_waitlist['conditions_met_count'] = df_waitlist['conditions_met'].apply(
             lambda x: len(_parse_json_field(x))
         )
-
     if 'total_conditions' not in df_waitlist.columns and 'wait_conditions' in df_waitlist.columns:
         df_waitlist['total_conditions'] = df_waitlist['wait_conditions'].apply(
             lambda x: len(_parse_json_field(x))
         )
 
-    st.dataframe(df_waitlist[existing_cols], width="stretch")
+    ticker_col = 'Ticker' if 'Ticker' in df_waitlist.columns else 'ticker'
+    strategy_col = 'Strategy_Name' if 'Strategy_Name' in df_waitlist.columns else 'strategy_name'
 
-    # Show wait conditions detail for selected entry
-    if not df_waitlist.empty and 'wait_conditions' in df_waitlist.columns:
-        st.divider()
-        st.subheader("📋 Wait Conditions Detail")
+    # ── Header + count ─────────────────────────────────────────────────
+    st.markdown(f"### {len(df_waitlist)} Trade{'s' if len(df_waitlist) != 1 else ''} Awaiting Confirmation")
+    st.caption(
+        "Valid strategies waiting on conditions (liquidity, IV maturity, data refresh). "
+        "Use **Pulse Check** on any card to fetch live chain data."
+    )
 
-        ticker_col = 'Ticker' if 'Ticker' in df_waitlist.columns else 'ticker'
-        strategy_col = 'Strategy_Name' if 'Strategy_Name' in df_waitlist.columns else 'strategy_name'
+    # ── Filters ────────────────────────────────────────────────────────
+    with st.expander("Filter Waitlist", expanded=False):
+        _wf1, _wf2, _wf3, _wf4 = st.columns(4)
 
-        selected_idx = st.selectbox(
-            "Select trade to view conditions:",
-            range(len(df_waitlist)),
-            format_func=lambda x: f"{df_waitlist.iloc[x][ticker_col]} - {df_waitlist.iloc[x][strategy_col]}"
-        )
+        # Strategy filter
+        with _wf1:
+            _wl_strats_avail = sorted(df_waitlist[strategy_col].dropna().unique().tolist()) if strategy_col in df_waitlist.columns else []
+            _wl_strat_filter = st.multiselect(
+                "Strategy",
+                options=_wl_strats_avail,
+                default=_wl_strats_avail,
+                key="wl_filter_strategy",
+            )
 
-        selected_row = df_waitlist.iloc[selected_idx]
-        wait_conditions = _parse_json_field(selected_row.get('wait_conditions', []))
-        conditions_met = _parse_json_field(selected_row.get('conditions_met', []))
+        # Strategy Family filter
+        with _wf2:
+            _family_col = 'Strategy_Family' if 'Strategy_Family' in df_waitlist.columns else 'Strategy_Type'
+            _wl_families_avail = sorted(df_waitlist[_family_col].dropna().unique().tolist()) if _family_col in df_waitlist.columns else []
+            _wl_family_filter = st.multiselect(
+                "Family",
+                options=_wl_families_avail,
+                default=_wl_families_avail,
+                key="wl_filter_family",
+            )
 
-        st.write(f"**Progress:** {selected_row.get('wait_progress', 0):.0%}")
-        st.write(f"**Conditions:** {len(conditions_met)}/{len(wait_conditions)} satisfied")
+        # Max spread filter
+        with _wf3:
+            _wl_max_spread = st.number_input(
+                "Max Spread %",
+                min_value=0.0, max_value=50.0, value=50.0, step=1.0,
+                key="wl_filter_max_spread",
+            )
 
-        for condition in wait_conditions:
-            if isinstance(condition, dict):
-                condition_id = condition.get('condition_id', '')
-                description = condition.get('description', 'No description')
-                is_met = condition_id in conditions_met
-                status_icon = "✅" if is_met else "⏳"
-                st.markdown(f"{status_icon} {description}")
+        # Ticker search
+        with _wf4:
+            _wl_ticker_search = st.text_input(
+                "Ticker",
+                value="",
+                key="wl_filter_ticker",
+                placeholder="e.g. AAPL",
+            )
+
+    # Apply filters
+    _wl_filtered = df_waitlist
+    if _wl_strat_filter and strategy_col in _wl_filtered.columns:
+        _wl_filtered = _wl_filtered[_wl_filtered[strategy_col].isin(_wl_strat_filter)]
+    if _wl_family_filter and _family_col in _wl_filtered.columns:
+        _wl_filtered = _wl_filtered[_wl_filtered[_family_col].isin(_wl_family_filter)]
+    if _wl_max_spread < 50.0 and 'Bid_Ask_Spread_Pct' in _wl_filtered.columns:
+        _wl_filtered = _wl_filtered[_wl_filtered['Bid_Ask_Spread_Pct'].fillna(0).astype(float) <= _wl_max_spread]
+    if _wl_ticker_search.strip():
+        _wl_filtered = _wl_filtered[_wl_filtered[ticker_col].str.upper().str.contains(_wl_ticker_search.strip().upper(), na=False)]
+
+    if len(_wl_filtered) < len(df_waitlist):
+        st.info(f"Showing **{len(_wl_filtered)}** of {len(df_waitlist)} waitlist entries")
+
+    if _wl_filtered.empty:
+        st.info("No entries match the current filters.")
+        return
+
+    # ── Cards ──────────────────────────────────────────────────────────
+    for wl_idx, (_, wl_row) in enumerate(_wl_filtered.iterrows()):
+        _wl_ticker = str(wl_row.get(ticker_col, '?'))
+        _wl_strat = str(wl_row.get(strategy_col, 'Unknown'))
+
+        # Gate reason summary (truncated for header)
+        _wl_gate = str(wl_row.get('Gate_Reason', '') or '')
+        _wl_gate_short = _re.sub(r'^(AWAIT_CONFIRMATION:\s*)', '', _wl_gate)[:80]
+
+        # TTL
+        _wl_expires = wl_row.get('wait_expires_at', '')
+        _wl_ttl_str = ''
+        if _wl_expires and str(_wl_expires) not in ('nan', 'None', 'NaT', ''):
+            try:
+                _exp_dt = pd.to_datetime(_wl_expires)
+                _wl_ttl_str = f" | TTL: {_exp_dt.strftime('%b %d %H:%M')}"
+            except Exception:
+                _wl_ttl_str = f" | TTL: {_wl_expires}"
+
+        # Pulse verdict badge on header (if previously checked)
+        _wl_pulse_result_key = f"pulse_result_wl_{_wl_ticker}_{_wl_strat}_{wl_idx}"
+        _wl_prev_result = st.session_state.get('pulse_results', {}).get(_wl_pulse_result_key)
+        _wl_verdict_badge = ''
+        if _wl_prev_result and 'verdict' in _wl_prev_result:
+            _v = _wl_prev_result['verdict']
+            _badge_map = {'IMPROVED': ' | IMPROVED', 'DETERIORATED': ' | DETERIORATED', 'MIXED': ' | MIXED', 'UNCHANGED': ' | UNCHANGED'}
+            _wl_verdict_badge = _badge_map.get(_v, '')
+
+        _wl_label = f"**{_wl_ticker}** — {_wl_strat} | {_wl_gate_short}{_wl_ttl_str}{_wl_verdict_badge}"
+
+        with st.expander(_wl_label, expanded=(wl_idx == 0)):
+            # Full gate reason
+            if _wl_gate:
+                st.caption(f"Gate: {_wl_gate}")
+
+            # Scan-time contract metrics
+            _wl_metrics_cols = st.columns(4)
+            with _wl_metrics_cols[0]:
+                _wl_bid = wl_row.get('Bid')
+                _wl_ask = wl_row.get('Ask')
+                if _wl_bid is not None and _wl_ask is not None:
+                    try:
+                        st.metric("Bid / Ask", f"${float(_wl_bid):.2f} / ${float(_wl_ask):.2f}")
+                    except (ValueError, TypeError):
+                        pass
+            with _wl_metrics_cols[1]:
+                _wl_spread = wl_row.get('Bid_Ask_Spread_Pct')
+                if _wl_spread is not None:
+                    try:
+                        st.metric("Spread %", f"{float(_wl_spread):.1f}%")
+                    except (ValueError, TypeError):
+                        pass
+            with _wl_metrics_cols[2]:
+                _wl_oi = wl_row.get('OI')
+                if _wl_oi is None or (isinstance(_wl_oi, float) and pd.isna(_wl_oi)):
+                    _wl_oi = wl_row.get('openInterest') or wl_row.get('Open_Interest')
+                if _wl_oi is not None:
+                    try:
+                        st.metric("OI", f"{int(float(_wl_oi))}")
+                    except (ValueError, TypeError):
+                        pass
+            with _wl_metrics_cols[3]:
+                _wl_grade = wl_row.get('Liquidity_Grade')
+                if _wl_grade:
+                    st.metric("Grade", str(_wl_grade))
+
+            # Wait conditions
+            if 'wait_conditions' in wl_row.index:
+                wait_conditions = _parse_json_field(wl_row.get('wait_conditions', []))
+                conditions_met = _parse_json_field(wl_row.get('conditions_met', []))
+                if wait_conditions:
+                    progress = wl_row.get('wait_progress', 0)
+                    try:
+                        st.progress(float(progress), text=f"{len(conditions_met)}/{len(wait_conditions)} conditions met")
+                    except Exception:
+                        pass
+                    for condition in wait_conditions:
+                        if isinstance(condition, dict):
+                            cid = condition.get('condition_id', '')
+                            desc = condition.get('description', 'No description')
+                            is_met = cid in conditions_met
+                            st.markdown(f"{'**:green[PASS]**' if is_met else ':orange[PENDING]'} {desc}")
+
+            # Pulse Check button
+            st.divider()
+            _wl_pulse_key = f"pulse_wl_{_wl_ticker}_{_wl_strat}_{wl_idx}"
+
+            if st.button("Pulse Check", key=_wl_pulse_key, type="secondary"):
+                with st.spinner(f"Fetching live chain for {_wl_ticker}..."):
+                    _wlp_expiration = str(wl_row.get('Selected_Expiration', '') or '')
+                    _wlp_strike = 0.0
+                    try:
+                        _wlp_strike = float(wl_row.get('Selected_Strike') or wl_row.get('Strike') or 0)
+                    except (ValueError, TypeError):
+                        pass
+                    _wlp_option_type = str(wl_row.get('Option_Type', 'call') or 'call')
+                    _wlp_contract_sym = str(wl_row.get('Contract_Symbol', '') or '')
+
+                    _wlp_result = _live_pulse_check(
+                        ticker=_wl_ticker,
+                        expiration=_wlp_expiration,
+                        strike=_wlp_strike,
+                        option_type=_wlp_option_type,
+                        contract_symbols=_wlp_contract_sym,
+                        scan_row=wl_row,
+                    )
+                    if 'pulse_results' not in st.session_state:
+                        st.session_state.pulse_results = {}
+                    st.session_state.pulse_results[_wl_pulse_result_key] = _wlp_result
+
+            # Show persisted result
+            if st.session_state.get('pulse_results', {}).get(_wl_pulse_result_key):
+                _render_pulse_result(
+                    st.session_state.pulse_results[_wl_pulse_result_key],
+                    scan_row=wl_row,
+                    key_prefix=_wl_pulse_key,
+                )
 
 def start_fetch_job():
     """
@@ -709,11 +1271,36 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
 
     _init_scan_view_session_state()
 
-    # Auto-load latest scan artifacts into session state if not already present.
-    # This ensures CLI-run scans are visible in the funnel without needing a UI-triggered run.
-    if 'pipeline_results' not in st.session_state:
+    # Auto-load latest scan artifacts into session state.
+    # Reloads when: (a) no cached results, or (b) artifact on disk is newer than cached version.
+    # This ensures CLI-run scans and fresh pipeline runs are always reflected in cards.
+    _should_load_artifacts = 'pipeline_results' not in st.session_state
+    _preloaded_artifacts = None  # reuse peek result to avoid double-loading
+    if not _should_load_artifacts:
+        # Check if disk artifact is newer than what's cached
+        _cached_ts = st.session_state.get('pipeline_results', {}).get('artifact_timestamp')
+        if _cached_ts is not None:
+            try:
+                _preloaded_artifacts = get_latest_step8_artifact(scan_output_dir)
+                _peek_mod = _preloaded_artifacts[1]
+                if _peek_mod is not None:
+                    _cached_dt = pd.to_datetime(_cached_ts)
+                    _disk_dt = pd.to_datetime(_peek_mod)
+                    if _disk_dt > _cached_dt:
+                        logger.info(
+                            "🔄 Scan artifacts on disk (%s) are newer than cached (%s) — reloading.",
+                            _disk_dt, _cached_dt,
+                        )
+                        _should_load_artifacts = True
+            except Exception:
+                pass
+
+    if _should_load_artifacts:
         try:
-            _df_auto, _mod_auto, _forensic_auto = get_latest_step8_artifact(scan_output_dir)
+            if _preloaded_artifacts is not None:
+                _df_auto, _mod_auto, _forensic_auto = _preloaded_artifacts
+            else:
+                _df_auto, _mod_auto, _forensic_auto = get_latest_step8_artifact(scan_output_dir)
             if _df_auto is not None:
                 _auto_results = {
                     'acceptance_ready': _forensic_auto.get('acceptance_ready', pd.DataFrame()),
@@ -780,6 +1367,27 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
 
     st.title("🔍 Market Scan - Full Pipeline Orchestration")
     st.markdown("Execute the complete pipeline to discover and evaluate trade opportunities.")
+
+    # ── Market Regime Badge ──────────────────────────────────────────────────
+    try:
+        from core.shared.data_layer.market_context import get_latest_market_context
+        from core.shared.data_layer.market_regime_classifier import classify_market_regime
+        _mkt_ctx = get_latest_market_context()
+        if _mkt_ctx is not None:
+            _mkt_r = classify_market_regime(_mkt_ctx)
+            _badge_colors = {
+                "RISK_ON": "green", "NORMAL": "blue", "CAUTIOUS": "orange",
+                "RISK_OFF": "red", "CRISIS": "red",
+            }
+            _bc = _badge_colors.get(_mkt_r.regime, "gray")
+            _vix = _mkt_ctx.get("vix")
+            _vix_str = f"VIX {_vix:.1f} | " if _vix is not None else ""
+            st.caption(
+                f"{_vix_str}Regime: :{_bc}[**{_mkt_r.regime}**] "
+                f"(score: {_mkt_r.score:.0f}, conf: {_mkt_r.confidence:.0%})"
+            )
+    except Exception:
+        pass
 
     # === HELP & GLOSSARY ===
     with st.expander("📖 Quick Reference Guide", expanded=False):
@@ -1252,21 +1860,17 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                 # but raises IOException when DuckDB's file is corrupt/missing entirely.
                 # The subprocess pipeline will acquire the write lock itself; we must NOT
                 # hold a write-mode connection here or we block the subprocess immediately.
-                from core.shared.data_contracts.config import PIPELINE_DB_PATH, DEBUG_PIPELINE_DB_PATH
-                import duckdb as _duckdb
-                _db_path = DEBUG_PIPELINE_DB_PATH if st.session_state.debug_mode else PIPELINE_DB_PATH
-                if _db_path.exists():
-                    try:
-                        _test = _duckdb.connect(str(_db_path), read_only=True)
-                        _test.close()
-                    except Exception as _lock_err:
-                        if "Conflicting lock" in str(_lock_err):
-                            st.session_state.pipeline_run_metadata.update({
-                                "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "status": "failed",
-                                "error": "Another scan is already running. Wait for it to finish, then try again."
-                            })
-                            st.rerun()
+                try:
+                    _test = get_domain_connection(DbDomain.PIPELINE, read_only=True)
+                    _test.close()
+                except Exception as _lock_err:
+                    if "Conflicting lock" in str(_lock_err):
+                        st.session_state.pipeline_run_metadata.update({
+                            "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "status": "failed",
+                            "error": "Another scan is already running. Wait for it to finish, then try again."
+                        })
+                        st.rerun()
 
                 ret_code = runner.run_scan_pipeline(
                     snapshot_path,
@@ -1575,34 +2179,11 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                 acceptance_ready_df = results.get('acceptance_ready', pd.DataFrame())
 
                 if not acceptance_ready_df.empty:
-                    def _g(row, *keys, default=None):
-                        """Safe getter — tries multiple column name variants."""
-                        for k in keys:
-                            v = row.get(k)
-                            if v is not None and str(v) not in ('nan', 'None', ''):
-                                try:
-                                    return v
-                                except Exception:
-                                    pass
-                        return default
-
-                    def _fmt_price(v, decimals=2):
-                        try:
-                            return f"${float(v):.{decimals}f}"
-                        except Exception:
-                            return "—"
-
-                    def _fmt_pct(v, decimals=1):
-                        try:
-                            return f"{float(v):.{decimals}f}%"
-                        except Exception:
-                            return "—"
-
-                    def _fmt_float(v, decimals=3):
-                        try:
-                            return f"{float(v):.{decimals}f}"
-                        except Exception:
-                            return "—"
+                    # Formatting helpers — delegated to streamlit_app/formatters.py
+                    _g = _g_module
+                    _fmt_price = _fmt_price_module
+                    _fmt_pct = _fmt_pct_module
+                    _fmt_float = _fmt_float_module
 
                     # ── PRIORITY SORT + CAPITAL FILTER ─────────────────────────
                     # Conviction = quality of structural edge only.
@@ -1621,26 +2202,7 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                     #
                     # No capital tiebreaker — equal-conviction trades stay in DQS order.
                     # Liquidity is visible in the summary table but does not affect rank.
-                    def _conviction_score(r) -> float:
-                        try:
-                            dqs = float(r.get('DQS_Score') or 75)
-
-                            _bias_raw = str(r.get('directional_bias') or '').upper()
-                            bias = (
-                                100 if 'STRONG' in _bias_raw else
-                                60  if 'MODERATE' in _bias_raw else
-                                20
-                            )
-
-                            mat = {1: 0, 2: 20, 3: 50, 4: 80, 5: 100}.get(
-                                int(float(r.get('IV_Maturity_Level') or 1)), 0)
-
-                            cband = {'HIGH': 100, 'MEDIUM': 60, 'LOW': 20}.get(
-                                str(r.get('confidence_band') or 'LOW').upper(), 20)
-
-                            return dqs * 0.50 + bias * 0.25 + mat * 0.15 + cband * 0.10
-                        except Exception:
-                            return 0.0
+                    _conviction_score = _conviction_score_module
 
                     acceptance_ready_df = acceptance_ready_df.copy()
                     acceptance_ready_df['_conviction'] = acceptance_ready_df.apply(_conviction_score, axis=1)
@@ -1648,16 +2210,7 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                     # ── Compute Expected Move % (1σ) inline ─────────────────
                     # Formula: IV × √(DTE / 365) — how far stock is expected
                     # to travel during the option's life (1 standard deviation).
-                    import math as _math
-                    def _expected_move_pct(r):
-                        try:
-                            iv  = float(r.get('Implied_Volatility') or 0)
-                            dte = float(r.get('Actual_DTE') or 0)
-                            if iv > 0 and dte > 0:
-                                return iv * _math.sqrt(dte / 365.0)
-                            return float('nan')
-                        except Exception:
-                            return float('nan')
+                    _expected_move_pct = _expected_move_pct_module
                     acceptance_ready_df['_Expected_Move_Pct'] = acceptance_ready_df.apply(_expected_move_pct, axis=1)
 
                     # Sort mode selector
@@ -1666,6 +2219,7 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                         _sort_mode = st.selectbox(
                             "📊 Sort cards by",
                             options=[
+                                "Action Priority (edge × timing)",
                                 "Conviction (structural edge)",
                                 "DQS only",
                                 "DQS × TQS (structure + timing)",
@@ -1676,6 +2230,10 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                         )
                     with _sort_col2:
                         _sort_captions = {
+                            "Action Priority (edge × timing)":
+                                "**Two-axis ranking:** Trade Edge (70%) × Execution Timing (30%) with "
+                                "floor protection (great trades can't collapse from bad timing) and "
+                                "convex boost (exceptional edge amplified). Best for deciding *what to do right now*.",
                             "Conviction (structural edge)":
                                 "DQS×50% + signal strength×25% + IV data reliability×15% + confidence×10%. "
                                 "Pure structural edge — best for research and position sizing.",
@@ -1694,25 +2252,13 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                         }
                         st.caption(_sort_captions.get(_sort_mode, ""))
 
-                    def _iv_edge_score(r) -> float:
-                        """
-                        IV edge aligned to strategy type.
-                        Buyers (long calls/puts/LEAPs) benefit from cheap vol (IV < HV → negative gap).
-                        Sellers (covered calls, CSPs, income) benefit from rich vol (IV > HV → positive gap).
-                        Returns 0-100: 100 = maximum edge for this strategy type.
-                        """
-                        try:
-                            gap = float(r.get('IVHV_gap_30D') or 0)
-                            strat = str(r.get('Strategy_Name') or '').lower()
-                            is_seller = any(k in strat for k in ('covered call', 'buy-write', 'cash-secured put', 'csp'))
-                            # Sellers want positive gap (IV > HV), buyers want negative gap (IV < HV)
-                            edge_gap = gap if is_seller else -gap
-                            # Normalise: 0% gap → 50pts, +20% → 100pts, −20% → 0pts (clamped)
-                            return max(0.0, min(100.0, 50.0 + edge_gap * 2.5))
-                        except Exception:
-                            return 50.0  # neutral when missing
+                    _iv_edge_score = _iv_edge_score_module
 
-                    if _sort_mode == "DQS only":
+                    if _sort_mode == "Action Priority (edge × timing)":
+                        acceptance_ready_df['_sort_val'] = acceptance_ready_df.apply(
+                            lambda r: float(r.get('Trade_Edge_Score') or 0), axis=1)
+
+                    elif _sort_mode == "DQS only":
                         acceptance_ready_df['_sort_val'] = acceptance_ready_df.apply(
                             lambda r: float(r.get('DQS_Score') or 0), axis=1)
 
@@ -1779,6 +2325,161 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                         acceptance_ready_df = acceptance_ready_df[
                             acceptance_ready_df['Capital_Requirement'].fillna(0).astype(float) <= _cap_limit
                         ]
+
+                    # ── "Executable Today" quick filter ─────────────────────────────
+                    # Surfaces only candidates the calendar system says are safe to
+                    # execute now, ranked by priority.  Income strategies on Friday
+                    # get boosted; long premium on Friday gets filtered out (unless LEAP
+                    # with negligible theta).
+                    _exec_today_col1, _exec_today_col2 = st.columns([2, 3])
+                    with _exec_today_col1:
+                        _exec_today = st.toggle(
+                            "🟢 Executable Today",
+                            value=False,
+                            key="scan_exec_today_toggle",
+                        )
+                    with _exec_today_col2:
+                        if _exec_today:
+                            st.caption(
+                                "Showing high-conviction candidates safe to execute today — "
+                                "calendar-safe + not overextended + weekly aligned + TQS ≥ 65. "
+                                "Income prioritized, then by confidence and capital efficiency."
+                            )
+                        else:
+                            st.caption("Toggle to see only today's actionable candidates, hiding calendar-blocked entries.")
+
+                    if _exec_today and 'Calendar_Risk_Flag' in acceptance_ready_df.columns:
+                        _cal_flags = acceptance_ready_df['Calendar_Risk_Flag'].fillna('').astype(str).str.upper()
+                        _theta_factors = acceptance_ready_df.get('Calendar_Theta_Factor', pd.Series(1.0, index=acceptance_ready_df.index)).fillna(1.0).astype(float)
+
+                        # Layer 1: Calendar safety — keep theta-safe entries
+                        _exec_mask = (
+                            _cal_flags.isin(['ADVANTAGEOUS', 'PRE_HOLIDAY_EDGE', ''])
+                            | ((_cal_flags == 'ELEVATED_BLEED') & (_theta_factors < 0.3))
+                            | ((_cal_flags == 'HIGH_BLEED') & (_theta_factors < 0.3))
+                        )
+                        _cal_blocked = (~_exec_mask).sum()
+                        acceptance_ready_df = acceptance_ready_df[_exec_mask].copy()
+
+                        # Layer 2: Conviction filter — remove low-conviction entries
+                        # Income strategies: only require HIGH or MEDIUM confidence
+                        # Directional: require not-Overextended + not-CONFLICTING weekly + TQS >= 65
+                        _is_income = acceptance_ready_df.get(
+                            'Strategy_Type', pd.Series('', index=acceptance_ready_df.index)
+                        ).fillna('').astype(str).str.upper().isin(['INCOME'])
+                        _conf = acceptance_ready_df.get(
+                            'confidence_band', pd.Series('', index=acceptance_ready_df.index)
+                        ).fillna('').astype(str).str.upper()
+                        _chart_regime = acceptance_ready_df.get(
+                            'Chart_Regime', pd.Series('', index=acceptance_ready_df.index)
+                        ).fillna('').astype(str)
+                        _weekly = acceptance_ready_df.get(
+                            'Weekly_Trend_Bias', pd.Series('', index=acceptance_ready_df.index)
+                        ).fillna('').astype(str).str.upper()
+                        _tqs = pd.to_numeric(
+                            acceptance_ready_df.get('TQS_Score', pd.Series(dtype=float)), errors='coerce'
+                        ).fillna(100.0)  # default pass if TQS missing (income has no TQS)
+                        _sma20_dist = pd.to_numeric(
+                            acceptance_ready_df.get('Price_vs_SMA20', pd.Series(dtype=float)), errors='coerce'
+                        ).fillna(0.0).abs()
+
+                        _conviction_mask = (
+                            _is_income  # income always passes conviction
+                            | (
+                                (_conf != 'LOW')                        # not LOW confidence
+                                & (_chart_regime != 'Overextended')     # not overextended
+                                & (_weekly != 'CONFLICTING')            # weekly agrees
+                                & (_tqs >= 65)                          # timing acceptable
+                                & (_sma20_dist <= 10.0)                 # not >10% from SMA20
+                            )
+                        )
+                        _conv_blocked = _exec_mask.sum() - _conviction_mask.sum()  # from calendar-passed set
+                        _conv_blocked = max(0, (~_conviction_mask).sum())
+                        acceptance_ready_df = acceptance_ready_df[_conviction_mask].copy()
+
+                        # Sort: income first (theta edge), then HIGH > MEDIUM conf,
+                        # then Capital_Efficiency_Score desc (risk-adjusted capital use)
+                        acceptance_ready_df['_exec_priority'] = acceptance_ready_df.apply(
+                            lambda r: (
+                                0 if str(r.get('Strategy_Type', '')).upper() == 'INCOME' else
+                                1 if str(r.get('confidence_band', '')).upper() == 'HIGH' else 2
+                            ), axis=1
+                        )
+                        _rank_col = (
+                            'Capital_Efficiency_Score'
+                            if 'Capital_Efficiency_Score' in acceptance_ready_df.columns
+                            else 'DQS_Score'
+                            if 'DQS_Score' in acceptance_ready_df.columns
+                            else None
+                        )
+                        if _rank_col:
+                            acceptance_ready_df = acceptance_ready_df.sort_values(
+                                ['_exec_priority', _rank_col], ascending=[True, False]
+                            )
+                        acceptance_ready_df = acceptance_ready_df.drop(columns=['_exec_priority'], errors='ignore')
+
+                        _total_blocked = _cal_blocked + _conv_blocked
+                        _parts = []
+                        if _cal_blocked:
+                            _parts.append(f"{_cal_blocked} calendar-deferred (theta bleed)")
+                        if _conv_blocked:
+                            _parts.append(f"{_conv_blocked} conviction-deferred (overextended/conflicting/low confidence)")
+                        if _parts:
+                            st.info(f"📅 {' + '.join(_parts)} — {_total_blocked} total filtered")
+
+                    # ── FORMING WAVES — CONDITIONAL candidates gaining momentum ──
+                    # Shows tickers not yet READY but showing early trend signals
+                    # (TREND_FORMING, EARLY_BREAKOUT, IMPROVING trajectory).
+                    if 'acceptance_all' in results:
+                        _df_all_waves = results['acceptance_all']
+                        if (
+                            'Execution_Status' in _df_all_waves.columns
+                            and 'Signal_Trajectory' in _df_all_waves.columns
+                        ):
+                            _wave_statuses = {'CONDITIONAL', 'AWAIT_CONFIRMATION'}
+                            _wave_trajectories = {'TREND_FORMING', 'EARLY_BREAKOUT', 'IMPROVING'}
+                            _df_waves = _df_all_waves[
+                                (_df_all_waves['Execution_Status'].isin(_wave_statuses))
+                                & (_df_all_waves['Signal_Trajectory'].isin(_wave_trajectories))
+                            ].copy()
+                            if not _df_waves.empty:
+                                _df_waves = _df_waves.sort_values(
+                                    'Score_Acceleration' if 'Score_Acceleration' in _df_waves.columns else 'DQS_Score',
+                                    ascending=False,
+                                )
+                                with st.expander(f"Forming Waves — {len(_df_waves)} candidates building momentum", expanded=False):
+                                    _wave_rows = []
+                                    for _, _wr in _df_waves.head(10).iterrows():
+                                        _w_ticker = _wr.get('Ticker', '')
+                                        _w_traj = _wr.get('Signal_Trajectory', 'STABLE')
+                                        _w_accel = _wr.get('Score_Acceleration', 0)
+                                        _w_dqs = _wr.get('DQS_Score', 0)
+                                        _w_strat = _wr.get('Strategy_Type', '')
+                                        _w_regime = _wr.get('Chart_Regime', '')
+                                        _w_why = _wr.get('Wait_Reason', _wr.get('Block_Reason', ''))
+                                        _traj_icon = {
+                                            'TREND_FORMING': 'building',
+                                            'EARLY_BREAKOUT': 'launching',
+                                            'IMPROVING': 'strengthening',
+                                        }.get(_w_traj, '')
+                                        _wave_rows.append({
+                                            'Ticker': _w_ticker,
+                                            'Signal': f"{_w_traj} ({_traj_icon})",
+                                            'Accel': f"{_w_accel:+.1f}/day",
+                                            'DQS': f"{_w_dqs:.0f}" if pd.notna(_w_dqs) else '-',
+                                            'Strategy': _w_strat,
+                                            'Regime': _w_regime,
+                                            'Waiting For': str(_w_why)[:60] if _w_why else '-',
+                                        })
+                                    st.dataframe(
+                                        pd.DataFrame(_wave_rows),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                    )
+                                    st.caption(
+                                        "These candidates are not yet READY but show early trend formation signals. "
+                                        "Monitor for promotion to READY on subsequent scans."
+                                    )
 
                     # ── FILTER CARD (user-controlled lens — engine stays neutral) ──
                     _pre_filter_count = len(acceptance_ready_df)
@@ -1922,7 +2623,21 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                     # ── SUMMARY TABLE (scannable overview before cards) ──────────
                     n = len(acceptance_ready_df)
                     st.markdown(f"### ✅ {n} Trade{'s' if n != 1 else ''} Ready to Execute")
-                    st.caption("Sorted by conviction. Expand any card for full execution detail.")
+
+                    # ── Execution Verdict Summary ─────────────────────────────
+                    if 'Execution_Verdict' in acceptance_ready_df.columns:
+                        _v_counts = acceptance_ready_df['Execution_Verdict'].value_counts()
+                        _n_exec = int(_v_counts.get('EXECUTE', 0))
+                        _n_skip = int(_v_counts.get('SKIP', 0))
+                        _n_alt  = int(_v_counts.get('ALTERNATIVE', 0))
+                        _verdict_parts = []
+                        if _n_exec: _verdict_parts.append(f"**{_n_exec} EXECUTE**")
+                        if _n_skip: _verdict_parts.append(f"{_n_skip} skip")
+                        if _n_alt:  _verdict_parts.append(f"{_n_alt} alternative")
+                        if _verdict_parts:
+                            st.caption(f"Verdict: {' · '.join(_verdict_parts)} — sorted by conviction, filtered by conflict/signal/vol checks.")
+                    else:
+                        st.caption("Sorted by conviction. Expand any card for full execution detail.")
 
                     summary_rows = []
                     for _rank_i, (_, r) in enumerate(acceptance_ready_df.iterrows(), start=1):
@@ -1967,8 +2682,21 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                             # Mark EWMA vol source with indicator
                             _ewma_tag = " ⚡" if "EWMA" in _mc_vsrc else ""
 
+                            # Execution verdict badge
+                            _ev = str(_g(r, 'Execution_Verdict') or '').upper()
+                            _ev_rank = _g(r, 'Execution_Rank')
+                            if _ev == 'EXECUTE':
+                                _ev_badge = f"#{int(float(_ev_rank))}" if _ev_rank and str(_ev_rank) not in ('nan','None','') else "✓"
+                            elif _ev == 'SKIP':
+                                _ev_badge = "✗ SKIP"
+                            elif _ev == 'ALTERNATIVE':
+                                _ev_badge = "↔ ALT"
+                            else:
+                                _ev_badge = "—"
+
                             summary_rows.append({
                                 "#": _rank_i,
+                                "Verdict": _ev_badge,
                                 "Ticker": _g(r, 'Ticker', default='?'),
                                 "Strategy": _g(r, 'Strategy_Name', default='—'),
                                 "Bias": str(_g(r, 'Trade_Bias', default='—') or '').title(),
@@ -2094,8 +2822,33 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                             _mid_str = f"  ·  Mid ${float(_mid_prev):.2f}"
                         except Exception:
                             _mid_str = ''
-                        expander_label = f"{conf_color} **{ticker}** — {strat_name} — {str(trade_bias).title()}{_mid_str}  ·  {conf_band} confidence"
-                        with st.expander(expander_label, expanded=(card_idx == 0)):
+                        # Pulse verdict badge on header (if previously checked)
+                        _ready_pulse_key = f"pulse_result_ready_{ticker}_{strat_name}_{card_idx}"
+                        _ready_prev = st.session_state.get('pulse_results', {}).get(_ready_pulse_key)
+                        _ready_verdict_badge = ''
+                        if _ready_prev and 'verdict' in _ready_prev:
+                            _rv = _ready_prev['verdict']
+                            _rv_map = {'IMPROVED': ' | IMPROVED', 'DETERIORATED': ' | DETERIORATED', 'MIXED': ' | MIXED', 'UNCHANGED': ' | UNCHANGED'}
+                            _ready_verdict_badge = _rv_map.get(_rv, '')
+
+                        # Execution verdict prefix
+                        _exec_verdict_raw = str(_g(row, 'Execution_Verdict') or '').upper()
+                        _exec_verdict_reason = str(_g(row, 'Verdict_Reason') or '').strip()
+                        if _exec_verdict_raw == 'SKIP':
+                            _ev_prefix = '✗ '
+                        elif _exec_verdict_raw == 'ALTERNATIVE':
+                            _ev_prefix = '↔ '
+                        else:
+                            _ev_prefix = ''
+
+                        expander_label = f"{_ev_prefix}{conf_color} **{ticker}** — {strat_name} — {str(trade_bias).title()}{_mid_str}  ·  {conf_band} confidence{_ready_verdict_badge}"
+                        with st.expander(expander_label, expanded=(card_idx == 0 and _exec_verdict_raw != 'SKIP')):
+                          # ── Execution verdict banner (SKIP/ALTERNATIVE) ──────────
+                          if _exec_verdict_raw == 'SKIP' and _exec_verdict_reason:
+                              st.error(f"**SKIP** — {_exec_verdict_reason}")
+                          elif _exec_verdict_raw == 'ALTERNATIVE' and _exec_verdict_reason:
+                              st.info(f"**ALTERNATIVE** — {_exec_verdict_reason}")
+
                           # Make the gate line meaningful: for LEAPs add maturity context
                           _dte_gate = None
                           try:
@@ -2111,6 +2864,14 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                               st.caption(f"Gate: {gate_plain}  ·  {_iv_note}")
                           else:
                               st.caption(f"Gate: {gate_plain}")
+
+                          # ── LEAP Rate Sensitivity (Rho) ──────────────────────────
+                          if _is_leap:
+                              _rho_sens = str(_g(row, 'LEAP_Rate_Sensitivity') or '').strip()
+                              if _rho_sens and _rho_sens.startswith('HIGH'):
+                                  st.warning(f"💹 **Rate sensitivity:** {_rho_sens}")
+                              elif _rho_sens and _rho_sens.startswith('LOW'):
+                                  st.caption(f"💹 Rate sensitivity: {_rho_sens}")
 
                           # ── Feedback Calibration row ──────────────────────────────
                           _fb_action  = str(_g(row, 'Feedback_Action') or '').upper()
@@ -2129,6 +2890,22 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                               )
                           elif _fb_n > 0 and _fb_action not in ('', 'INSUFFICIENT_SAMPLE', 'NAN', 'NONE'):
                               st.caption(f"📊 Feedback ({_fb_n} trades): {_fb_note or _fb_action}")
+
+                          # ── Calendar deferral return badge ─────────────────────────
+                          _is_deferred_return = bool(_g(row, 'Calendar_Deferred_Return', default=False))
+                          _deferred_from = str(_g(row, 'Deferred_From_Date', default='') or '').strip()
+                          if _is_deferred_return and _deferred_from:
+                              st.markdown(
+                                  f"<div style='padding:6px 12px; border-radius:6px; background:rgba(26,127,55,0.12); "
+                                  f"border-left:4px solid #1a7f37; margin-bottom:8px;'>"
+                                  f"<span style='font-weight:700; color:#1a7f37; font-size:0.95em;'>"
+                                  f"🔁 DEFERRED RETURN</span>"
+                                  f"&nbsp;&nbsp;<span style='color:#666; font-size:0.85em;'>"
+                                  f"Originally deferred on {_deferred_from} (Friday theta bleed) — "
+                                  f"calendar clear today, ready for execution</span>"
+                                  f"</div>",
+                                  unsafe_allow_html=True,
+                              )
 
                           # ── Calendar risk row ─────────────────────────────────────
                           _cal_flag = str(_g(row, 'Calendar_Risk_Flag') or '').upper()
@@ -2259,6 +3036,22 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                           opt_type      = str(_g(row, 'Option_Type', default='—')).upper()
                           dte           = _g(row, 'Actual_DTE')
 
+                          # PMCC / multi-leg: parse JSON-encoded strikes & symbols
+                          _is_pmcc = opt_type == 'PMCC'
+                          _strike_display = _fmt_price(strike)
+                          if _is_pmcc:
+                              try:
+                                  import json as _json
+                                  _strikes = _json.loads(str(strike))
+                                  _strike_display = f"${_strikes[0]:.0f} / ${_strikes[1]:.0f}"
+                              except Exception:
+                                  pass
+                              try:
+                                  _syms = _json.loads(str(contract_sym))
+                                  contract_sym = " | ".join(s.strip() for s in _syms)
+                              except Exception:
+                                  pass
+
                           st.markdown("#### 📋 Contract")
                           c1, c2, c3, c4 = st.columns(4)
                           with c1:
@@ -2266,7 +3059,7 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                           with c2:
                               st.metric("Expiration", str(expiry))
                           with c3:
-                              st.metric("Strike / Type", f"{_fmt_price(strike)} {opt_type}")
+                              st.metric("Strike / Type", f"{_strike_display} {opt_type}")
                           with c4:
                               st.metric("DTE", f"{int(float(dte))} days" if dte else "—")
 
@@ -2338,7 +3131,7 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                               chase_limit_label = None
 
                           # ── Now Score: microstructure readiness badge ─────────────────────
-                          # Combines 5 intraday signals already present in Step12 output.
+                          # Combines 10 intraday/microstructure signals from Step12 output.
                           # Scores ≥50 → EXECUTE NOW, 25-49 → WAIT FOR FILL, <25 → NOT NOW
                           try:
                               _intraday_tag = str(_g(row, 'intraday_position_tag', default='') or '').upper()
@@ -2352,30 +3145,38 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                               _now_score   = 0
                               _now_reasons = []
 
-                              # 1. Intraday position tag (+25 / 0 / -15)
+                              # 1. Intraday position tag (+20 / 0 / -15)
                               # Bull strategies want price near recent low (buy the dip)
                               # Bear strategies want price near recent high (sell the rip)
+                              # Passarelli 0.708: intraday timing matters; reduced from +25 (heuristic, not strong RAG backing)
                               _is_bull_bias = 'BULL' in _trade_bias or str(_g(row, 'Strategy_Name', default='')).upper().find('PUT') == -1
                               _near_low  = 'NEAR_LOW'  in _intraday_tag
                               _near_high = 'NEAR_HIGH' in _intraday_tag
                               if (_is_bull_bias and _near_low) or (not _is_bull_bias and _near_high):
-                                  _now_score += 25
+                                  _now_score += 20
                                   _now_reasons.append('price at entry zone')
                               elif (_is_bull_bias and _near_high) or (not _is_bull_bias and _near_low):
                                   _now_score -= 15
                                   _now_reasons.append('price extended from entry zone')
 
-                              # 2. Momentum tag (+20 / 0 / -15)
+                              # 2. Momentum tag (+15 / 0 / -15)
+                              # Chan 0.709: flat is neutral-to-good for fill, not strongly positive
                               if 'FLAT' in _momentum_tag:
-                                  _now_score += 20
+                                  _now_score += 15
                                   _now_reasons.append('flat day — clean fill likely')
                               elif ('STRONG_UP' in _momentum_tag and not _is_bull_bias) or \
                                    ('STRONG_DOWN' in _momentum_tag and _is_bull_bias):
                                   _now_score -= 15
                                   _now_reasons.append('strong move against thesis')
 
-                              # 3. Bid-ask spread (+20 / +10 / -15)
+                              # 3. Bid-ask spread (+20 / +10 / -15, DTE-scaled for LEAPs)
+                              # Natenberg Ch.12: wide spreads on LEAPs are structural (market makers
+                              # widen for long-dated, high-delta options). A 7% spread on a 467-day
+                              # LEAP amortises to $0.004/day vs $0.063/day on a 30-day option.
+                              # Scale the penalty by min(1, 60/DTE) so LEAPs get proportional docks.
                               if _spread_pct_f is not None:
+                                  _spread_dte_f = float(_g(row, 'Actual_DTE', default=0) or 0)
+                                  _spread_dte_scale = min(1.0, 60.0 / _spread_dte_f) if _spread_dte_f > 0 else 1.0
                                   if _spread_pct_f <= 1.0:
                                       _now_score += 20
                                       _now_reasons.append('tight spread')
@@ -2383,13 +3184,18 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                                       _now_score += 10
                                       _now_reasons.append('acceptable spread')
                                   else:
-                                      _now_score -= 15
-                                      _now_reasons.append(f'wide spread {_spread_pct_f:.1f}%')
+                                      _spread_penalty = int(round(-15 * _spread_dte_scale))
+                                      _now_score += _spread_penalty
+                                      if _spread_dte_scale < 0.5:
+                                          _now_reasons.append(f'wide spread {_spread_pct_f:.1f}% (minor — LEAP)')
+                                      else:
+                                          _now_reasons.append(f'wide spread {_spread_pct_f:.1f}%')
 
-                              # 4. Gap (+15 / -20)
+                              # 4. Gap (+10 / -20)
+                              # Natenberg 0.673: gap risk exceeds theta benefit; absence of gap is neutral, not positive
                               _gap_pct_f = float(_gap_pct_val) if _gap_pct_val else 0.0
                               if 'NO_GAP' in _gap_tag or abs(_gap_pct_f) < 0.5:
-                                  _now_score += 15
+                                  _now_score += 10
                                   _now_reasons.append('no gap — price settled')
                               elif abs(_gap_pct_f) >= 1.5:
                                   _now_score -= 20
@@ -2402,6 +3208,119 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                               elif 'FALLING' in _vol_trend:
                                   _now_score -= 5
                                   _now_reasons.append('volume thin')
+
+                              # 6. Calendar risk — Friday/holiday theta awareness, DTE-scaled
+                              # LEAPs (DTE=500) get negligible penalty; short-dated (DTE=41) get full effect
+                              _cal_flag = str(_g(row, 'Calendar_Risk_Flag', default='') or '').upper()
+                              if _cal_flag in ('HIGH_BLEED', 'ELEVATED_BLEED', 'PRE_HOLIDAY_EDGE', 'ADVANTAGEOUS'):
+                                  _cal_dte = float(_g(row, 'Actual_DTE', default=0) or 0)
+                                  _cal_theta_f = min(1.0, 45.0 / _cal_dte) if _cal_dte > 0 else 1.0
+                                  if _cal_flag == 'HIGH_BLEED':
+                                      _cal_adj = int(round(-25 * _cal_theta_f))
+                                      _now_score += _cal_adj
+                                      _now_reasons.append(f'pre-holiday theta bleed — defer' if _cal_theta_f > 0.5 else 'pre-holiday (minor — LEAP)')
+                                  elif _cal_flag == 'ELEVATED_BLEED':
+                                      _cal_adj = int(round(-20 * _cal_theta_f))
+                                      _now_score += _cal_adj
+                                      _now_reasons.append(f'Friday long premium — defer to Monday' if _cal_theta_f > 0.5 else 'Friday (minor — LEAP)')
+                                  elif _cal_flag == 'PRE_HOLIDAY_EDGE':
+                                      # Benklifa 0.643: "no free ride" — weekend gap risk offsets theta; reduced from +20
+                                      _cal_adj = int(round(15 * _cal_theta_f))
+                                      _now_score += _cal_adj
+                                      _now_reasons.append('pre-holiday theta collection edge')
+                                  elif _cal_flag == 'ADVANTAGEOUS':
+                                      _cal_adj = int(round(12 * _cal_theta_f))
+                                      _now_score += _cal_adj
+                                      _now_reasons.append('Friday theta advantage')
+
+                              # 7. Last-trade divergence — mid unreliable when last fill is far off
+                              # Harris 0.724: "best execution... whether and when orders execute"
+                              # Use spread-relative measure instead of percentage — for options,
+                              # percentage difference is meaningless at small prices but the bid-ask
+                              # spread is the true liquidity signal (Natenberg Ch.12, Passarelli Ch.6).
+                              try:
+                                  _last_f_badge = float(last_opt) if last_opt else None
+                                  _mid_f_badge = float(mid) if mid else None
+                                  _bid_f_badge = float(bid) if bid else None
+                                  _ask_f_badge = float(ask) if ask else None
+                                  if _last_f_badge and _mid_f_badge and _mid_f_badge > 0:
+                                      _last_abs_div = abs(_last_f_badge - _mid_f_badge)
+                                      _spread_abs = (_ask_f_badge - _bid_f_badge) if (_ask_f_badge and _bid_f_badge) else None
+                                      if _spread_abs and _spread_abs > 0:
+                                          # How many spreads away is last trade from mid?
+                                          _spread_multiples = _last_abs_div / _spread_abs
+                                          if _spread_multiples > 2.0:
+                                              _now_score -= 15
+                                              _now_reasons.append(f'last trade {_spread_multiples:.1f}× spread from mid — unreliable quote')
+                                          elif _spread_multiples > 1.0:
+                                              _now_score -= 8
+                                              _now_reasons.append(f'last trade {_spread_multiples:.1f}× spread from mid')
+                                      else:
+                                          # No spread available — fall back to absolute threshold
+                                          if _last_abs_div > 1.0:
+                                              _now_score -= 15
+                                              _now_reasons.append(f'last trade ${_last_abs_div:.2f} from mid — unreliable quote')
+                                          elif _last_abs_div > 0.50:
+                                              _now_score -= 8
+                                              _now_reasons.append(f'last trade ${_last_abs_div:.2f} from mid')
+                              except Exception:
+                                  pass
+
+                              # 8. Time-of-day (Lopez de Prado 0.701 — order flow varies by time)
+                              # First/last 15 min have wider spreads and more noise; mid-session is cleanest
+                              try:
+                                  from zoneinfo import ZoneInfo as _NowTZ
+                                  _now_et = __import__('datetime').datetime.now(_NowTZ("America/New_York"))
+                                  _now_mins = _now_et.hour * 60 + _now_et.minute
+                                  _is_weekday_now = _now_et.weekday() < 5
+                                  if not _is_weekday_now or _now_mins < 570 or _now_mins >= 960:
+                                      # Weekend or outside market hours — no time bonus/penalty
+                                      pass
+                                  elif _now_mins < 585 or _now_mins > 945:
+                                      # First 15 min (9:30-9:45) or last 15 min (15:45-16:00)
+                                      _now_score -= 10
+                                      _now_reasons.append('open/close chop — wider spreads')
+                                  elif 600 <= _now_mins <= 900:
+                                      # 10:00-15:00 ET — liquidity sweet spot (Passarelli Ch.6)
+                                      _now_score += 5
+                                      _now_reasons.append('mid-session liquidity')
+                              except Exception:
+                                  pass
+
+                              # 9. IV spike at entry (Natenberg Ch.3, Passarelli Ch.6)
+                              # Entering long premium when IV is temporarily spiked = overpaying
+                              try:
+                                  _iv_spike_tag = str(_g(row, 'Intraday_IV_Spike', default='') or '').upper()
+                                  _iv_spike_pct = _g(row, 'IV_Spike_Pct')
+                                  if _iv_spike_tag == 'SPIKE_UNFAVORABLE':
+                                      _spike_pct_f = float(_iv_spike_pct) if _iv_spike_pct else 0
+                                      _now_score -= 15
+                                      _now_reasons.append(f'IV spike {_spike_pct_f:+.0f}% — overpaying for vol')
+                                  elif _iv_spike_tag == 'SPIKE_FAVORABLE':
+                                      _now_score += 10
+                                      _now_reasons.append('IV dip — cheaper entry')
+                              except Exception:
+                                  pass
+
+                              # 10. Strike-level OI depth (Harris 0.724 — displayed quotes = limited size)
+                              # Low OI means market maker quotes are thin; fill quality degrades
+                              try:
+                                  _oi_val = float(oi) if oi and str(oi) not in ('nan', 'None', '') else None
+                                  if _oi_val is not None:
+                                      if _oi_val >= 5000:
+                                          _now_score += 10
+                                          _now_reasons.append('deep OI — reliable quotes')
+                                      elif _oi_val >= 1000:
+                                          _now_score += 5
+                                          _now_reasons.append('adequate OI')
+                                      elif _oi_val < 100:
+                                          _now_score -= 15
+                                          _now_reasons.append(f'thin OI ({int(_oi_val)}) — quotes unreliable')
+                                      elif _oi_val < 500:
+                                          _now_score -= 8
+                                          _now_reasons.append(f'low OI ({int(_oi_val)})')
+                              except Exception:
+                                  pass
 
                               # Clamp and render badge
                               _now_score = max(-30, min(90, _now_score))
@@ -2416,14 +3335,62 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                                   _badge_label = '🔴 NOT NOW'
 
                               _reason_str = ' · '.join(_now_reasons) if _now_reasons else 'no microstructure data'
-                              st.markdown(
-                                  f"<div style='padding:8px 12px; border-radius:6px; background:rgba(0,0,0,0.08); "
-                                  f"border-left:4px solid {_badge_color}; margin-bottom:8px;'>"
-                                  f"<span style='font-weight:700; color:{_badge_color}; font-size:1.05em;'>{_badge_label}</span>"
-                                  f"&nbsp;&nbsp;<span style='color:#888; font-size:0.88em;'>score {_now_score} · {_reason_str}</span>"
-                                  f"</div>",
-                                  unsafe_allow_html=True
-                              )
+
+                              # ── Action Priority Score (APS) — two-axis ranking ──
+                              # Edge (70%) + Timing (30%) with floor and convex boost
+                              _edge_score = _g(row, 'Trade_Edge_Score')
+                              _edge_f = float(_edge_score) if _edge_score and str(_edge_score) not in ('nan', 'None', '') else None
+
+                              if _edge_f is not None:
+                                  # Normalize NOW score: -30..90 → 0..100
+                                  _timing_norm = max(0, min(100, (_now_score + 30) * 100 / 120))
+                                  # A: Cap timing penalty — floor at 20
+                                  _timing_eff = max(_timing_norm, 20.0)
+                                  # B: Boost exceptional trades — convex amplification above 85
+                                  _edge_boost = max(0, (_edge_f - 85) * 0.5)
+                                  _aps = _edge_f * 0.70 + _timing_eff * 0.30 + _edge_boost
+                                  _aps = max(0, min(100, _aps))
+
+                                  if _aps >= 75:
+                                      _aps_color = '#1a7f37'
+                                      _aps_label = 'PRIORITY EXECUTE'
+                                      _aps_icon = '🟢'
+                                  elif _aps >= 50:
+                                      _aps_color = '#1a7f37'
+                                      _aps_label = 'STAGE'
+                                      _aps_icon = '🟡'
+                                  elif _aps >= 25:
+                                      _aps_color = '#9a6700'
+                                      _aps_label = 'WATCHLIST'
+                                      _aps_icon = '🟠'
+                                  else:
+                                      _aps_color = '#cf222e'
+                                      _aps_label = 'PASS'
+                                      _aps_icon = '🔴'
+
+                                  st.markdown(
+                                      f"<div style='padding:8px 12px; border-radius:6px; background:rgba(0,0,0,0.05); "
+                                      f"border-left:4px solid {_aps_color}; margin-bottom:4px;'>"
+                                      f"<span style='font-weight:700; color:{_aps_color}; font-size:1.05em;'>"
+                                      f"{_aps_icon} {_aps_label}</span>"
+                                      f"&nbsp;&nbsp;<span style='color:#888; font-size:0.88em;'>"
+                                      f"APS {_aps:.0f} · edge {_edge_f:.0f} · timing {_timing_norm:.0f}"
+                                      f"</span></div>"
+                                      f"<div style='padding:4px 12px; margin-bottom:8px;'>"
+                                      f"<span style='color:#888; font-size:0.82em;'>"
+                                      f"{_badge_label} — {_reason_str}</span></div>",
+                                      unsafe_allow_html=True
+                                  )
+                              else:
+                                  # No edge score — show NOW badge only
+                                  st.markdown(
+                                      f"<div style='padding:8px 12px; border-radius:6px; background:rgba(0,0,0,0.08); "
+                                      f"border-left:4px solid {_badge_color}; margin-bottom:8px;'>"
+                                      f"<span style='font-weight:700; color:{_badge_color}; font-size:1.05em;'>{_badge_label}</span>"
+                                      f"&nbsp;&nbsp;<span style='color:#888; font-size:0.88em;'>score {_now_score} · {_reason_str}</span>"
+                                      f"</div>",
+                                      unsafe_allow_html=True
+                                  )
                           except Exception:
                               pass  # Badge is informational — never break card rendering
 
@@ -2439,6 +3406,9 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                                   _mid_f  = float(mid) if mid else None
                                   if _last_f and _mid_f and abs(_last_f - _mid_f) / _mid_f > 0.20:
                                       st.caption(f"Last trade: {_fmt_price(last_opt)} ⚠️ stale print — use mid")
+                                  elif _last_f and _mid_f and abs(_last_f - _mid_f) / _mid_f > 0.03:
+                                      _div_pct = abs(_last_f - _mid_f) / _mid_f * 100
+                                      st.caption(f"Last trade: {_fmt_price(last_opt)} ⚠️ {_div_pct:.1f}% from mid — mid may be unreliable")
                                   else:
                                       st.caption(f"Last trade: {_fmt_price(last_opt)}")
                               except Exception:
@@ -2704,6 +3674,22 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                               st.metric("Contract IV", impl_vol_disp)
                               st.caption("Implied vol at this strike")
 
+                          # ── Rho for LEAPs (below Greeks row) ────────────────────
+                          if _is_leap:
+                              _rho_v = _g(row, 'Rho')
+                              try:
+                                  _rho_f = float(_rho_v)
+                                  if abs(_rho_f) >= 0.01:
+                                      _rho_impact = _rho_f * 100  # per-contract impact per +1% rate
+                                      _rho_severity = "material" if abs(_rho_f) >= 0.05 else "minor"
+                                      st.caption(
+                                          f"**Rho (ρ):** {_rho_f:+.3f} — "
+                                          f"${_rho_impact:+.1f}/contract per +1% rate move "
+                                          f"({_rho_severity} for {int(_dte_gate or 0)}d LEAP; Hull Ch.10)"
+                                      )
+                              except (TypeError, ValueError):
+                                  pass
+
                           st.divider()
 
                           # ── Row 6: Risk Profile ───────────────────────────────────
@@ -2877,6 +3863,10 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                           st.divider()
 
                           # ── Row 6.5: Monte Carlo P&L Distribution ────────────────
+                          # Status-aware rendering:
+                          #   READY          → position sizing (contracts, CVaR, tail fatness)
+                          #   AWAIT_CONFIRM  → thesis evaluation (win prob, P50, risk/reward)
+                          #   WAIT_FOR_FILL  → risk preview (P10 loss, CVaR, assignment prob)
                           _mc_cvar_v  = row.get('MC_CVaR')
                           _mc_ratio_v = row.get('MC_CVaR_P10_Ratio')
                           _mc_p10_v   = row.get('MC_P10_Loss')
@@ -2888,6 +3878,7 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                           _mc_note_v  = str(row.get('MC_Sizing_Note') or '')
                           _mc_sz_v    = str(row.get('Sizing_Method_Used') or 'FIXED')
                           _mc_paths_v = row.get('MC_Paths_Used')
+                          _mc_exec_st = str(row.get('Execution_Status') or 'READY').upper()
                           # Extract vol source from note (e.g. "[EWMA(λ=0.94,AAPL)]" or "[hv_30]")
                           _mc_vsrc_c  = (_mc_note_v.split('[')[1].split(']')[0] if '[' in _mc_note_v and ']' in _mc_note_v else 'HV')
                           _mc_ewma_used = 'EWMA' in _mc_vsrc_c
@@ -2900,7 +3891,6 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
 
                           if _mc_ran:
                               _ewma_badge = " ⚡EWMA" if _mc_ewma_used else ""
-                              st.markdown(f"#### 🎲 Monte Carlo P&L Distribution{_ewma_badge}")
                               try:
                                   _cvar_f = float(_mc_cvar_v) if _mc_cvar_v and str(_mc_cvar_v) not in ('nan','None','') else None
                                   _ratio_f = float(_mc_ratio_v) if _mc_ratio_v and str(_mc_ratio_v) not in ('nan','None','') else None
@@ -2910,87 +3900,243 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                                   _win_f  = float(_mc_win_v)
                                   _maxc_i = int(float(_mc_maxc_v))
 
-                                  # Row A: CVaR + tail ratio + P50 + Win%
-                                  _mc_c1, _mc_c2, _mc_c3, _mc_c4 = st.columns(4)
-                                  with _mc_c1:
-                                      if _cvar_f is not None:
-                                          _cvar_color = "🔴" if _cvar_f < -500 else ("🟡" if _cvar_f < -100 else "🟢")
-                                          _fat_note = f" (fat tail {_ratio_f:.1f}×)" if _ratio_f and _ratio_f > 1.5 else ""
-                                          _ratio_desc = f"{_ratio_f:.2f}× — {'fat tail, size conservatively' if _ratio_f > 1.5 else 'normal tail'}" if _ratio_f else ""
-                                          st.metric(
-                                              f"{_cvar_color} CVaR (tail mean)",
-                                              f"${_cvar_f:+,.0f}",
-                                              help=(
-                                                  "Conditional Value at Risk — mean P&L of worst 10% tail paths. "
-                                                  "Coherent risk measure (Artzner 1999). "
-                                                  f"CVaR/P10 ratio = {_ratio_desc}. "
-                                                  "Sizing denominator: MaxC = (account × 2%) / |CVaR|."
-                                              ) if _ratio_f else "Mean P&L of worst 10% paths — CVaR sizing denominator."
-                                          )
-                                      else:
-                                          st.metric("CVaR", "—")
-                                  with _mc_c2:
-                                      _p10_color = "🔴" if _p10_f < -200 else ("🟡" if _p10_f < 0 else "🟢")
-                                      st.metric(
-                                          f"{_p10_color} P10 (bad day)",
-                                          f"${_p10_f:+,.0f}",
-                                          help="10th-percentile P&L per contract — boundary of worst 10% of paths"
-                                      )
-                                  with _mc_c3:
-                                      _p50_color = "🟢" if _p50_f >= 0 else "🔴"
-                                      st.metric(
-                                          f"{_p50_color} P50 (median)",
-                                          f"${_p50_f:+,.0f}",
-                                          help="Median expected P&L per contract at expiry"
-                                      )
-                                  with _mc_c4:
-                                      _win_color = "🟢" if _win_f >= 0.55 else ("🟡" if _win_f >= 0.45 else "🔴")
-                                      st.metric(
-                                          f"{_win_color} Win Prob",
-                                          f"{_win_f:.0%}",
-                                          help="Fraction of simulated paths that expire profitable"
-                                      )
+                                  # ── READY: Position Sizing (hero = contracts + CVaR + tail fatness) ──
+                                  if _mc_exec_st == 'READY':
+                                      st.markdown(f"#### 🎲 Position Sizing — Monte Carlo{_ewma_badge}")
 
-                                  # Row B: P90 + tail ratio badge + vol source
-                                  _mc_d1, _mc_d2 = st.columns([1, 3])
-                                  with _mc_d1:
-                                      st.metric(
-                                          "P90 (good day)",
-                                          f"${_p90_f:+,.0f}",
-                                          help="90th-percentile P&L — best realistic outcome"
-                                      )
-                                  with _mc_d2:
-                                      if _ratio_f is not None:
-                                          _tail_color = "🔴" if _ratio_f > 2.0 else ("🟡" if _ratio_f > 1.5 else "🟢")
-                                          _tail_label = "fat tail — size conservatively" if _ratio_f > 1.5 else "normal tail"
+                                      # Row A: Max contracts + CVaR + Tail Fatness
+                                      _mc_c1, _mc_c2, _mc_c3 = st.columns(3)
+                                      with _mc_c1:
                                           st.metric(
-                                              f"{_tail_color} Tail Fatness (CVaR/P10)",
-                                              f"{_ratio_f:.2f}×",
-                                              help=(
-                                                  "CVaR÷P10 ratio. 1.0 = perfectly normal GBM tail. "
-                                                  ">1.5 = fat tail (short DTE deep-ITM, high vol). "
-                                                  "MC sizes more conservatively when ratio is high."
+                                              "Max Contracts",
+                                              f"{_maxc_i}",
+                                              help="CVaR-bounded contract ceiling: (account × 2%) / |CVaR| (McMillan Ch.3)"
+                                          )
+                                      with _mc_c2:
+                                          if _cvar_f is not None:
+                                              _cvar_color = "🔴" if _cvar_f < -500 else ("🟡" if _cvar_f < -100 else "🟢")
+                                              st.metric(
+                                                  f"{_cvar_color} CVaR (tail mean)",
+                                                  f"${_cvar_f:+,.0f}",
+                                                  help="Conditional Value at Risk — mean P&L of worst 10% tail paths (Artzner 1999)"
                                               )
+                                          else:
+                                              st.metric("CVaR", "—")
+                                      with _mc_c3:
+                                          if _ratio_f is not None:
+                                              _tail_color = "🔴" if _ratio_f > 2.0 else ("🟡" if _ratio_f > 1.5 else "🟢")
+                                              _tail_label = "fat tail — size conservatively" if _ratio_f > 1.5 else "normal tail"
+                                              st.metric(
+                                                  f"{_tail_color} Tail Fatness (CVaR/P10)",
+                                                  f"{_ratio_f:.2f}×",
+                                                  help=(
+                                                      f"CVaR÷P10 ratio. 1.0 = normal GBM tail. "
+                                                      f">1.5 = fat tail (short DTE, deep ITM, high vol). "
+                                                      f"Current: {_tail_label}."
+                                                  )
+                                              )
+
+                                      # Row B: P10/P50/P90 distribution + Win%
+                                      _mc_d1, _mc_d2, _mc_d3, _mc_d4 = st.columns(4)
+                                      with _mc_d1:
+                                          _p10_color = "🔴" if _p10_f < -200 else ("🟡" if _p10_f < 0 else "🟢")
+                                          st.metric(f"{_p10_color} P10", f"${_p10_f:+,.0f}", help="10th-percentile P&L — worst 10% boundary")
+                                      with _mc_d2:
+                                          _p50_color = "🟢" if _p50_f >= 0 else "🔴"
+                                          st.metric(f"{_p50_color} P50", f"${_p50_f:+,.0f}", help="Median expected P&L per contract")
+                                      with _mc_d3:
+                                          st.metric("P90", f"${_p90_f:+,.0f}", help="90th-percentile P&L — best realistic outcome")
+                                      with _mc_d4:
+                                          _win_color = "🟢" if _win_f >= 0.55 else ("🟡" if _win_f >= 0.45 else "🔴")
+                                          st.metric(f"{_win_color} Win Prob", f"{_win_f:.0%}", help="Fraction of paths that expire profitable")
+
+                                      # Assignment probability (income strategies)
+                                      if _mc_asgn_v is not None and str(_mc_asgn_v) not in ('nan', 'None', ''):
+                                          _asgn_f = float(_mc_asgn_v)
+                                          if _asgn_f > 0:
+                                              _asgn_color = "🔴" if _asgn_f > 0.30 else ("🟡" if _asgn_f > 0.15 else "🟢")
+                                              st.caption(
+                                                  f"{_asgn_color} **Assignment probability:** {_asgn_f:.0%}  "
+                                                  f"({'elevated — widen strike or reduce DTE' if _asgn_f > 0.30 else 'acceptable' if _asgn_f > 0.15 else 'low — well cushioned'})"
+                                              )
+
+                                      _vol_src_display = f"`{_mc_vsrc_c}`" + (" ⚡ EWMA" if _mc_ewma_used else "")
+                                      st.caption(
+                                          f"🎲 2,000 GBM paths · CVaR ≤ 2% account · Vol: {_vol_src_display}  \n"
+                                          f"_{_mc_note_v}_"
+                                      )
+
+                                      # ── MC Variance Premium (Sinclair 0.738) ──
+                                      _vp_verdict = str(row.get('MC_VP_Verdict', '') or '')
+                                      if _vp_verdict and _vp_verdict not in ('SKIP', 'nan', 'None'):
+                                          st.markdown("---")
+                                          _vp_icon = {"CHEAP": "🟢", "FAIR": "🟡", "EXPENSIVE": "🔴"}.get(_vp_verdict, "⚪")
+                                          st.markdown(f"#### {_vp_icon} Variance Premium — {_vp_verdict}")
+                                          _vp_c1, _vp_c2, _vp_c3 = st.columns(3)
+                                          with _vp_c1:
+                                              _vp_score = row.get('MC_VP_Score')
+                                              if pd.notna(_vp_score):
+                                                  st.metric("VP Score", f"{float(_vp_score):.2f}",
+                                                            help="Expected payoff / premium. >1.15 = cheap, <0.75 = expensive (Sinclair Ch.5)")
+                                          with _vp_c2:
+                                              _vp_fair = row.get('MC_VP_Premium_Fair')
+                                              if pd.notna(_vp_fair):
+                                                  st.metric("Fair Premium", f"${float(_vp_fair):.2f}",
+                                                            help="MC-implied fair value using realized vol (HV), not implied vol")
+                                          with _vp_c3:
+                                              _vp_edge = row.get('MC_VP_Edge')
+                                              if pd.notna(_vp_edge):
+                                                  _edge_color = "🟢" if float(_vp_edge) > 0 else "🔴"
+                                                  st.metric(f"{_edge_color} Edge / Contract", f"${float(_vp_edge):+,.0f}",
+                                                            help="(Fair - Market) × 100 — positive = option is underpriced")
+                                          _vp_note = str(row.get('MC_VP_Note', '') or '')
+                                          if _vp_note and _vp_note not in ('nan', 'None', 'MC_SKIP'):
+                                              st.caption(f"_{_vp_note}_")
+
+                                      # ── MC Earnings Event Simulation (Augen 0.754) ──
+                                      _earn_verdict = str(row.get('MC_Earn_Verdict', '') or '')
+                                      if _earn_verdict and _earn_verdict not in ('SKIP', 'nan', 'None'):
+                                          st.markdown("---")
+                                          _earn_icon = {"HOLD_THROUGH": "🟢", "CLOSE_BEFORE": "🔴", "NEUTRAL": "🟡"}.get(_earn_verdict, "⚪")
+                                          st.markdown(f"#### {_earn_icon} Earnings Event — {_earn_verdict.replace('_', ' ')}")
+                                          _ec1, _ec2, _ec3, _ec4 = st.columns(4)
+                                          with _ec1:
+                                              _ev_hold = row.get('MC_Earn_EV_Hold')
+                                              if pd.notna(_ev_hold):
+                                                  st.metric("EV Hold Through", f"${float(_ev_hold):+,.0f}",
+                                                            help="Expected P&L if you hold through earnings announcement")
+                                          with _ec2:
+                                              _ev_close = row.get('MC_Earn_EV_Close')
+                                              if pd.notna(_ev_close):
+                                                  st.metric("EV Close Before", f"${float(_ev_close):+,.0f}",
+                                                            help="Expected P&L if you close before earnings")
+                                          with _ec3:
+                                              _earn_edge = row.get('MC_Earn_Edge')
+                                              if pd.notna(_earn_edge):
+                                                  _ee_color = "🟢" if float(_earn_edge) > 0 else "🔴"
+                                                  st.metric(f"{_ee_color} Edge (Hold-Close)", f"${float(_earn_edge):+,.0f}",
+                                                            help="EV difference: positive = holding through earnings is better")
+                                          with _ec4:
+                                              _earn_pprof = row.get('MC_Earn_P_Profit')
+                                              if pd.notna(_earn_pprof):
+                                                  st.metric("P(Profit)", f"{float(_earn_pprof):.0%}",
+                                                            help="Probability of profit if held through earnings")
+                                          _earn_note = str(row.get('MC_Earn_Note', '') or '')
+                                          if _earn_note and _earn_note not in ('nan', 'None', 'MC_SKIP'):
+                                              st.caption(f"_{_earn_note}_")
+
+                                  # ── WAITLIST: Thesis Evaluation (hero = win prob + P50 + risk/reward) ──
+                                  elif _mc_exec_st in ('AWAIT_CONFIRMATION', 'BLOCKED'):
+                                      st.markdown(f"#### 📊 Thesis Evaluation — Monte Carlo{_ewma_badge}")
+
+                                      # Row A: Win Prob + P50 + Risk/Reward ratio
+                                      _mc_c1, _mc_c2, _mc_c3 = st.columns(3)
+                                      with _mc_c1:
+                                          _win_color = "🟢" if _win_f >= 0.55 else ("🟡" if _win_f >= 0.45 else "🔴")
+                                          st.metric(
+                                              f"{_win_color} Win Probability",
+                                              f"{_win_f:.0%}",
+                                              help="Fraction of 2,000 simulated paths that expire profitable — is this trade worth waiting for?"
+                                          )
+                                      with _mc_c2:
+                                          _p50_color = "🟢" if _p50_f >= 0 else "🔴"
+                                          st.metric(
+                                              f"{_p50_color} Expected Outcome (P50)",
+                                              f"${_p50_f:+,.0f}",
+                                              help="Median P&L per contract — the most likely outcome at expiry"
+                                          )
+                                      with _mc_c3:
+                                          _rr_ratio = abs(_p90_f / _p10_f) if _p10_f != 0 else 0
+                                          _rr_color = "🟢" if _rr_ratio >= 2.0 else ("🟡" if _rr_ratio >= 1.0 else "🔴")
+                                          st.metric(
+                                              f"{_rr_color} Reward / Risk",
+                                              f"{_rr_ratio:.1f}×",
+                                              help="P90 ÷ |P10| — how much upside per unit of downside. >2× = favorable asymmetry"
                                           )
 
-                                  # Assignment probability (income strategies only)
-                                  if _mc_asgn_v is not None and str(_mc_asgn_v) not in ('nan', 'None', ''):
-                                      _asgn_f = float(_mc_asgn_v)
-                                      if _asgn_f > 0:
-                                          _asgn_color = "🔴" if _asgn_f > 0.30 else ("🟡" if _asgn_f > 0.15 else "🟢")
-                                          st.caption(
-                                              f"{_asgn_color} **Assignment probability at expiry:** {_asgn_f:.0%}  "
-                                              f"({'elevated — widen strike or reduce DTE' if _asgn_f > 0.30 else 'acceptable' if _asgn_f > 0.15 else 'low — well cushioned'})"
-                                          )
+                                      # Row B: P10/P90 range
+                                      _mc_d1, _mc_d2 = st.columns(2)
+                                      with _mc_d1:
+                                          _p10_color = "🔴" if _p10_f < -200 else ("🟡" if _p10_f < 0 else "🟢")
+                                          st.metric(f"{_p10_color} Downside (P10)", f"${_p10_f:+,.0f}", help="10th-percentile loss — worst realistic scenario")
+                                      with _mc_d2:
+                                          st.metric("Upside (P90)", f"${_p90_f:+,.0f}", help="90th-percentile gain — best realistic scenario")
 
-                                  # Sizing recommendation
-                                  _vol_src_display = f"`{_mc_vsrc_c}`" + (" ⚡ EWMA(λ=0.94) — forward-leaning, reacts faster to vol expansion" if _mc_ewma_used else " — flat backward-looking window")
-                                  st.caption(
-                                      f"🎲 **MC sizing** (2,000 GBM paths): "
-                                      f"max **{_maxc_i} contract{'s' if _maxc_i != 1 else ''}** where **CVaR** ≤ 2% of account (McMillan Ch.3). "
-                                      f"Vol source: {_vol_src_display}.  \n"
-                                      f"_{_mc_note_v}_"
-                                  )
+                                      # Thesis verdict
+                                      if _win_f >= 0.55 and _p50_f > 0 and _rr_ratio >= 1.5:
+                                          st.caption("**Thesis: STRONG** — favorable win rate, positive EV, good reward/risk. Worth monitoring for entry.")
+                                      elif _win_f >= 0.45 and _p50_f >= 0:
+                                          st.caption("**Thesis: MARGINAL** — borderline EV. Monitor but don't chase.")
+                                      else:
+                                          st.caption("**Thesis: WEAK** — unfavorable distribution. Consider removing from watchlist.")
+
+                                      st.caption(f"_2,000 GBM paths · Vol: `{_mc_vsrc_c}`{' ⚡ EWMA' if _mc_ewma_used else ''}_")
+
+                                  # ── WAIT_FOR_FILL: Risk Preview (hero = P10 loss + CVaR + assignment) ──
+                                  elif _mc_exec_st == 'WAIT_FOR_FILL':
+                                      st.markdown(f"#### ⚠️ Risk Preview — Monte Carlo{_ewma_badge}")
+
+                                      # Row A: P10 loss + CVaR + Assignment
+                                      _mc_c1, _mc_c2, _mc_c3 = st.columns(3)
+                                      with _mc_c1:
+                                          _p10_color = "🔴" if _p10_f < -200 else ("🟡" if _p10_f < 0 else "🟢")
+                                          st.metric(
+                                              f"{_p10_color} Max Realistic Loss (P10)",
+                                              f"${_p10_f:+,.0f}",
+                                              help="10th-percentile P&L — the loss you should be prepared for if filled"
+                                          )
+                                      with _mc_c2:
+                                          if _cvar_f is not None:
+                                              _cvar_color = "🔴" if _cvar_f < -500 else ("🟡" if _cvar_f < -100 else "🟢")
+                                              st.metric(
+                                                  f"{_cvar_color} CVaR (tail risk)",
+                                                  f"${_cvar_f:+,.0f}",
+                                                  help="Mean loss in worst 10% of paths — what happens in the tail"
+                                              )
+                                          else:
+                                              st.metric("CVaR", "—")
+                                      with _mc_c3:
+                                          if _mc_asgn_v is not None and str(_mc_asgn_v) not in ('nan', 'None', ''):
+                                              _asgn_f = float(_mc_asgn_v)
+                                              _asgn_color = "🔴" if _asgn_f > 0.30 else ("🟡" if _asgn_f > 0.15 else "🟢")
+                                              st.metric(
+                                                  f"{_asgn_color} Assignment Prob",
+                                                  f"{_asgn_f:.0%}",
+                                                  help="Probability of ITM at expiry — assignment risk if filled"
+                                              )
+                                          else:
+                                              _win_color = "🟢" if _win_f >= 0.55 else ("🟡" if _win_f >= 0.45 else "🔴")
+                                              st.metric(f"{_win_color} Win Prob", f"{_win_f:.0%}", help="Fraction of paths profitable at expiry")
+
+                                      # Row B: P50 + P90 context
+                                      _mc_d1, _mc_d2 = st.columns(2)
+                                      with _mc_d1:
+                                          _p50_color = "🟢" if _p50_f >= 0 else "🔴"
+                                          st.metric(f"{_p50_color} Expected (P50)", f"${_p50_f:+,.0f}", help="Median P&L if filled and held to expiry")
+                                      with _mc_d2:
+                                          st.metric("Best Case (P90)", f"${_p90_f:+,.0f}", help="90th-percentile outcome — upside if filled")
+
+                                      st.caption(f"_Risk preview based on 2,000 GBM paths · Vol: `{_mc_vsrc_c}`{' ⚡ EWMA' if _mc_ewma_used else ''}_")
+
+                                  # ── Fallback: unknown status — show full panel ──
+                                  else:
+                                      st.markdown(f"#### 🎲 Monte Carlo P&L Distribution{_ewma_badge}")
+                                      _mc_c1, _mc_c2, _mc_c3, _mc_c4 = st.columns(4)
+                                      with _mc_c1:
+                                          if _cvar_f is not None:
+                                              _cvar_color = "🔴" if _cvar_f < -500 else ("🟡" if _cvar_f < -100 else "🟢")
+                                              st.metric(f"{_cvar_color} CVaR", f"${_cvar_f:+,.0f}")
+                                          else:
+                                              st.metric("CVaR", "—")
+                                      with _mc_c2:
+                                          st.metric("P10", f"${_p10_f:+,.0f}")
+                                      with _mc_c3:
+                                          st.metric("P50", f"${_p50_f:+,.0f}")
+                                      with _mc_c4:
+                                          _win_color = "🟢" if _win_f >= 0.55 else ("🟡" if _win_f >= 0.45 else "🔴")
+                                          st.metric(f"{_win_color} Win Prob", f"{_win_f:.0%}")
+                                      st.caption(f"_2,000 GBM paths · Vol: `{_mc_vsrc_c}` · Max {_maxc_i} contracts_")
+
                               except Exception as _mc_render_err:
                                   st.caption(f"🎲 MC data available but render failed: {_mc_render_err}")
                           else:
@@ -3338,241 +4484,107 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                               st.caption(f"IV context: {_iv_ctx_clean}")
                               st.caption(f"System confidence: {conf_score}/100" if conf_score else "Confidence: —")
 
+                          # ── Behavioral Memory (YTD scan arc) ──────────────────────
+                          _bm_score_card = _g(row, 'Behavioral_Score')
+                          _bm_regime_dur = _g(row, 'Regime_Duration')
+                          _bm_regime_path = _g(row, 'Regime_Path')
+                          _bm_adx_trend = _g(row, 'ADX_Trend')
+                          _bm_vol_accum = _g(row, 'Volume_Accumulation')
+                          _bm_dqs_trend = _g(row, 'DQS_Trend')
+                          _bm_scan_freq = _g(row, 'Scan_Frequency')
+                          _bm_iv_arc = _g(row, 'IV_Arc')
+                          _bm_earn_ctx = _g(row, 'Earnings_Context')
+                          _bm_mgmt = _g(row, 'Mgmt_Track_Record')
+                          _bm_prior = _g(row, 'Prior_Trades')
+                          _bm_depth = _g(row, 'History_Depth')
+                          _bm_confidence = _g(row, 'Mgmt_Confidence')
+                          _bm_strat_detail = _g(row, 'Mgmt_Strategy_Detail')
+                          _bm_fault = _g(row, 'Fault_Pattern')
+                          _bm_contradictions = _g(row, 'Contradiction_Flags')
+                          if _bm_score_card is not None and str(_bm_score_card) not in ('', '50', '50.0', 'nan'):
+                              _bm_label = (
+                                  'Strong' if float(_bm_score_card or 50) >= 70
+                                  else 'Weak' if float(_bm_score_card or 50) < 40
+                                  else 'Neutral'
+                              )
+                              _depth_str = f", {_bm_depth}d history" if _bm_depth and str(_bm_depth) not in ('0', '') else ''
+                              _maturity_tag = _g(row, 'Data_Maturity')
+                              _maturity_str = f" [{_maturity_tag}]" if _maturity_tag and str(_maturity_tag) not in ('', 'nan', 'MATURE') else ''
+                              st.markdown(f"**Behavioral Arc** — {_bm_label} ({_bm_score_card}/100{_depth_str}{_maturity_str})")
+                              _bm_parts = []
+                              if _bm_regime_path and str(_bm_regime_path) != '':
+                                  _bm_parts.append(f"Regime: {_bm_regime_path} ({_bm_regime_dur}d stable)")
+                              if _bm_adx_trend and str(_bm_adx_trend) not in ('UNKNOWN', ''):
+                                  _bm_parts.append(f"ADX: {_bm_adx_trend}")
+                              if _bm_vol_accum and str(_bm_vol_accum) not in ('UNKNOWN', ''):
+                                  _bm_parts.append(f"Vol: {_bm_vol_accum}")
+                              if _bm_dqs_trend and str(_bm_dqs_trend) not in ('UNKNOWN', ''):
+                                  _bm_parts.append(f"Score: {_bm_dqs_trend}")
+                              if _bm_iv_arc and str(_bm_iv_arc) not in ('UNKNOWN', ''):
+                                  _bm_parts.append(f"IV: {_bm_iv_arc}")
+                              if _bm_earn_ctx and str(_bm_earn_ctx) not in ('NO_DATA', ''):
+                                  _bm_parts.append(f"Earnings: {_bm_earn_ctx}")
+                              if _bm_mgmt and str(_bm_mgmt) not in ('NO_DATA', ''):
+                                  _conf_tag = f" [{_bm_confidence}]" if _bm_confidence and str(_bm_confidence) not in ('NONE', '') else ''
+                                  _bm_parts.append(f"Track: {_bm_mgmt}{_conf_tag} ({_bm_prior} trades)")
+                              if _bm_strat_detail and str(_bm_strat_detail) not in ('', 'nan'):
+                                  _bm_parts.append(f"By strategy: {_bm_strat_detail}")
+                              if _bm_scan_freq and str(_bm_scan_freq) not in ('0', ''):
+                                  _bm_parts.append(f"READY {_bm_scan_freq}x YTD")
+                              if _bm_parts:
+                                  st.caption(' | '.join(_bm_parts))
+                              # Fault pattern + contradiction flags + move context (second line)
+                              _bm_flags = []
+                              if _bm_fault and str(_bm_fault) not in ('INSUFFICIENT_DATA', 'NONE', '', 'nan'):
+                                  _bm_flags.append(f"Fault: {_bm_fault}")
+                              if _bm_contradictions and str(_bm_contradictions) not in ('', 'nan'):
+                                  _bm_flags.append(str(_bm_contradictions).replace('_', ' ').title())
+                              _bm_move_drivers = _g(row, 'Move_Drivers')
+                              _bm_last_dip = _g(row, 'Last_Dip_Context')
+                              if _bm_move_drivers and str(_bm_move_drivers) not in ('', 'nan'):
+                                  _bm_flags.append(f"Moves: {_bm_move_drivers}")
+                              if _bm_last_dip and str(_bm_last_dip) not in ('', 'NONE', 'nan'):
+                                  _bm_flags.append(f"Last dip: {_bm_last_dip}")
+                              _bm_event_rx = _g(row, 'Event_Reactions')
+                              if _bm_event_rx and str(_bm_event_rx) not in ('', 'nan'):
+                                  _bm_flags.append(f"Events: {_bm_event_rx}")
+                              _bm_worst_evt = _g(row, 'Worst_Event_Type')
+                              if _bm_worst_evt and str(_bm_worst_evt) not in ('', 'nan'):
+                                  _bm_flags.append(f"Worst: {_bm_worst_evt}")
+                              _bm_maturity = _g(row, 'Data_Maturity')
+                              if _bm_maturity and str(_bm_maturity) not in ('', 'nan', 'MATURE'):
+                                  _bm_flags.append(f"Data: {_bm_maturity}")
+                              if _bm_flags:
+                                  st.caption(' | '.join(_bm_flags))
+
                           # ── Copy Card — plain-text snapshot for clipboard ──────────
                           with st.expander("📋 Copy Card", expanded=False):
-                              _cc_lines = []
-
-                              # Header
-                              _cc_lines.append(f"{conf_color} {ticker} — {strat_name} — {str(trade_bias).title()} · Mid ${_fmt_price(mid)} · {conf_band} confidence")
-                              _cc_lines.append(f"Gate: {gate_plain}")
-                              _cc_lines.append("")
-
-                              # Stock context
-                              _cc_lines.append("Stock Price")
-                              _arrow_cc = "▲" if (net_chg_pct or 0) >= 0 else "▼"
-                              _cc_lines.append(f"${_fmt_price(stock_price)}")
-                              _cc_lines.append(f"{_arrow_cc} {_fmt_pct(net_chg_pct)}")
-                              _cc_lines.append(f"RSI")
-                              _cc_lines.append(f"{_fmt_float(rsi_val, 1)}")
-                              _cc_lines.append(f"ADX {_fmt_float(adx_val, 1)}")
-                              _cc_lines.append("")
-                              _cc_lines.append(f"Trend / EMA")
-                              _cc_lines.append(f"{trend_st} / {ema_sig}")
-                              _pos_str_cc = _fmt_pct(pos52, 0) if pos52 else "—"
-                              _cc_lines.append(f"52W Position")
-                              _cc_lines.append(f"{_pos_str_cc}")
-                              _cc_lines.append(f"H {_fmt_price(hi52)} / L {_fmt_price(lo52)}")
-                              _cc_lines.append("")
-
-                              # Contract
-                              _cc_lines.append("📋 Contract")
-                              _cc_lines.append(f"Symbol")
-                              _cc_lines.append(f"{contract_sym}")
-                              _cc_lines.append(f"Expiration")
-                              _cc_lines.append(f"{expiry}")
-                              _cc_lines.append(f"Strike / Type")
-                              _cc_lines.append(f"{_fmt_price(strike)} {opt_type}")
-                              _cc_lines.append(f"DTE")
-                              _cc_lines.append(f"{int(float(dte))} days" if dte else "—")
-
-                              # Now Score
-                              try:
-                                  _cc_lines.append(f"{_badge_label}  score {_now_score} · {_reason_str}")
-                              except Exception:
-                                  pass
-
-                              # Entry Pricing
-                              _cc_lines.append("💵 Entry Pricing")
-                              _cc_lines.append(f"Bid / Ask")
-                              _cc_lines.append(f"{_fmt_price(bid)} / {_fmt_price(ask)}")
-                              _cc_lines.append(f"Spread: {_fmt_pct(spread_pct)}")
-                              _cc_lines.append("")
-                              _cc_lines.append(f"Mid (target entry)")
-                              _cc_lines.append(f"${_fmt_price(mid)}")
-                              try:
-                                  _cc_lines.append(f"Last trade: ${_fmt_price(last_opt)}")
-                              except Exception:
-                                  pass
-                              _cc_lines.append("")
-                              try:
-                                  _cc_lines.append(f"BS Fair-value band")
-                                  _cc_lines.append(f"{_fmt_price(entry_lo)} – {_fmt_price(entry_hi)}")
-                                  if prem_vs_fv:
-                                      _pvf = float(prem_vs_fv)
-                                      if is_income and _pvf > 0:
-                                          _cc_lines.append(f"✅ Selling {_pvf:.1f}% above BS fair value")
-                                      elif _pvf < 0:
-                                          _cc_lines.append(f"✅ Buying {abs(_pvf):.1f}% below BS fair value")
-                              except Exception:
-                                  pass
-                              _cc_lines.append("")
-
-                              # Income: you receive / Directional: you pay
-                              if is_income or is_buy_write:
-                                  _cc_lines.append(f"💰 You receive")
-                                  _cc_lines.append(f"${_fmt_price(mid)}")
-                                  _cc_lines.append(f"Sell at mid or better (higher = more premium)")
-                              else:
-                                  _cc_lines.append(f"💰 You pay")
-                                  _cc_lines.append(f"${_fmt_price(mid)}")
-                                  _cc_lines.append(f"Buy at mid or better (lower = cheaper entry)")
-                              _cc_lines.append("")
-                              _cc_lines.append(f"Liquidity: {liq_grade}{' — ' + str(liq_reason) if liq_reason else ''}")
-                              _cc_lines.append("")
-                              _cc_lines.append(f"OI: {oi}")
-                              _cc_lines.append("")
-
-                              # GTC Exit Rules
-                              try:
-                                  _mid_f_gc = float(mid)
-                                  if is_income or is_buy_write:
-                                      _profit_tgt = _mid_f_gc * 0.50
-                                      _stop_loss  = _mid_f_gc * 2.0
-                                      _cc_lines.append("🎯 GTC Exit Rules (Good-Till-Cancelled)")
-                                      _cc_lines.append(f"Profit target: +50% Buy back at")
-                                      _cc_lines.append(f"{_profit_tgt:.2f}")
-                                      _cc_lines.append(f"(+{_profit_tgt * 100:.0f}/contract)")
-                                      _cc_lines.append("")
-                                      _cc_lines.append(f"Stop loss: –200% Buy back at ")
-                                      _cc_lines.append(f"{_stop_loss:.2f}")
-                                      _cc_lines.append(f"(−{(_stop_loss - _mid_f_gc) * 100:.0f}/contract)")
-                                  else:
-                                      _profit_tgt = _mid_f_gc * 2.0
-                                      _stop_loss  = _mid_f_gc * 0.50
-                                      _cc_lines.append("🎯 GTC Exit Rules (Good-Till-Cancelled)")
-                                      _cc_lines.append(f"Profit target: +100% Sell at")
-                                      _cc_lines.append(f"{_profit_tgt:.2f}")
-                                      _cc_lines.append(f"(+{(_profit_tgt - _mid_f_gc) * 100:.0f}/contract)")
-                                      _cc_lines.append("")
-                                      _cc_lines.append(f"Stop loss: –50% Sell at")
-                                      _cc_lines.append(f"{_stop_loss:.2f}")
-                                      _cc_lines.append(f"(−{(_mid_f_gc - _stop_loss) * 100:.0f}/contract)")
-                                  _cc_lines.append("")
-                                  _cc_lines.append(f"Time stop: DTE ≤ 14 Exit regardless of P&L")
-                                  _cc_lines.append("")
-                              except Exception:
-                                  pass
-
-                              # Greeks
-                              _cc_lines.append("🔢 Greeks")
-                              try:
-                                  _d_v = _g(row, 'Delta')
-                                  _g_v = _g(row, 'Gamma')
-                                  _v_v = _g(row, 'Vega')
-                                  _t_v = _g(row, 'Theta')
-                                  _iv_c = _g(row, 'Implied_Volatility')
-                                  _cc_lines.append(f"Delta (Δ)")
-                                  _cc_lines.append(f"{float(_d_v):.3f}" if _d_v else "—")
-                                  _cc_lines.append(f"Gamma (Γ)")
-                                  _cc_lines.append(f"{float(_g_v):.3f}" if _g_v else "—")
-                                  _cc_lines.append(f"Vega (V)")
-                                  _cc_lines.append(f"{float(_v_v):.3f}" if _v_v else "—")
-                                  _cc_lines.append(f"Theta (Θ)")
-                                  _cc_lines.append(f"{float(_t_v):.3f}" if _t_v else "—")
-                                  _cc_lines.append(f"Contract IV")
-                                  _cc_lines.append(f"{float(_iv_c):.1f}%" if _iv_c else "—")
-                              except Exception:
-                                  pass
-                              _cc_lines.append("")
-
-                              # Risk Profile
-                              _cc_lines.append("⚠️ Risk Profile")
-                              try:
-                                  if max_loss:
-                                      _cc_lines.append(f"Max Loss (1 contract)")
-                                      if is_income:
-                                          _cc_lines.append("Opportunity cost")
-                                      else:
-                                          _cc_lines.append(f"${max_loss:,.0f}")
-                                  if breakeven:
-                                      _cc_lines.append(f"Breakeven at expiry")
-                                      _cc_lines.append(f"${float(breakeven):.2f}")
-                                  if cap_display:
-                                      _cc_lines.append(f"Capital Required")
-                                      _cc_lines.append(f"${float(cap_display):,.0f}")
-                                  if _em_pct_f is not None:
-                                      _cc_lines.append(f"Expected Move (1σ)")
-                                      _em_cc = f"{_em_pct_f:.1f}%"
-                                      if _em_dollar is not None:
-                                          _em_cc += f" (${_em_dollar:,.0f})"
-                                      _cc_lines.append(_em_cc)
-                              except Exception:
-                                  pass
-                              _cc_lines.append("")
-
-                              # Volatility Context
-                              _cc_lines.append("📈 Volatility Context")
-                              try:
-                                  _iv30_c = _g(row, 'iv_30d')
-                                  _hv30_c = _g(row, 'HV30')
-                                  _gap_c  = _g(row, 'IVHV_gap_30D')
-                                  _ivr_c  = _g(row, 'IV_Rank_20D')
-                                  _ss_c   = _g(row, 'Surface_Shape')
-                                  _ivm_c  = _g(row, 'IV_Maturity_State')
-                                  _ivml_c = _g(row, 'IV_Maturity_Level')
-                                  _ihc_c  = _g(row, 'IV_History_Count')
-                                  _cc_lines.append(f"IV 30D / HV 30D")
-                                  _cc_lines.append(f"{float(_iv30_c):.1f}% / {float(_hv30_c):.1f}%" if _iv30_c and _hv30_c else "—")
-                                  if _gap_c:
-                                      _cc_lines.append(f"Gap: {'+' if float(_gap_c) > 0 else ''}{float(_gap_c):.1f}%")
-                                  _cc_lines.append("")
-                                  _cc_lines.append(f"IV Rank")
-                                  _cc_lines.append(f"{float(_ivr_c):.1f}" if _ivr_c else "—")
-                                  _cc_lines.append("")
-                                  _cc_lines.append(f"Surface Shape")
-                                  _cc_lines.append(f"{_ss_c}" if _ss_c else "—")
-                                  _cc_lines.append("")
-                                  _cc_lines.append(f"IV Maturity")
-                                  _cc_lines.append(f"Level {_ivml_c} ({_ihc_c}d collected)" if _ivml_c else "—")
-                              except Exception:
-                                  pass
-                              _cc_lines.append("")
-
-                              # Thesis
-                              _cc_lines.append("🧠 Thesis & Signal Reference")
-                              try:
-                                  _thesis_c = _g(row, 'thesis')
-                                  _theory_c = _g(row, 'Theory_Source')
-                                  _regime_c = _g(row, 'Regime_Context')
-                                  _iv_ctx_c = _g(row, 'IV_Context')
-                                  _chart_r  = _g(row, 'Chart_Regime')
-                                  _ema_s    = _g(row, 'Chart_EMA_Signal')
-                                  _sma20_c  = _g(row, 'SMA20')
-                                  _sma50_c  = _g(row, 'SMA50')
-                                  _macd_c   = _g(row, 'MACD')
-                                  _atr_c    = _g(row, 'Atr_Pct')
-                                  _dir_b    = _g(row, 'directional_bias')
-                                  _str_b    = _g(row, 'structure_bias')
-                                  _tim_q    = _g(row, 'timing_quality')
-                                  _mom_t    = _g(row, 'momentum_tag')
-                                  _comp_t   = _g(row, 'compression_tag')
-                                  _ent_t    = _g(row, 'entry_timing_context')
-                                  _conf_sc  = _g(row, 'Confidence')
-
-                                  if _thesis_c: _cc_lines.append(f"{_thesis_c}")
-                                  if _theory_c: _cc_lines.append(f"Theory source: {_theory_c}")
-                                  _cc_lines.append("")
-                                  _cc_lines.append("Price Structure")
-                                  _cc_lines.append(f"Chart regime: {_chart_r}")
-                                  _cc_lines.append(f"EMA signal: {_ema_s}")
-                                  _cc_lines.append(f"SMA20: {_fmt_price(_sma20_c)}  |  SMA50: {_fmt_price(_sma50_c)}")
-                                  _cc_lines.append(f"MACD: {_fmt_float(_macd_c, 2)} | ATR: {_fmt_pct(_atr_c)}")
-                                  _cc_lines.append("")
-                                  _cc_lines.append("Execution Context")
-                                  _cc_lines.append(f"Directional bias: {_dir_b}")
-                                  _cc_lines.append(f"Structure: {_str_b}")
-                                  _cc_lines.append(f"Timing quality: {_tim_q}")
-                                  _cc_lines.append(f"Momentum: {_mom_t} | Compression: {_comp_t}")
-                                  _cc_lines.append(f"Entry context: {_ent_t}")
-                                  _cc_lines.append("")
-                                  _cc_lines.append("IV & Regime")
-                                  _cc_lines.append(f"Regime context: {_regime_c}")
-                                  _cc_lines.append(f"IV context: {_iv_ctx_c}")
-                                  _cc_lines.append(f"System confidence: {_conf_sc}/100" if _conf_sc else "Confidence: —")
-                              except Exception:
-                                  pass
-
-                              _copy_text = "\n".join(_cc_lines)
+                              _cc_ctx = dict(
+                                  conf_color=conf_color, conf_band=conf_band, gate_plain=gate_plain,
+                                  ticker=ticker, strat_name=strat_name, trade_bias=trade_bias,
+                                  mid=mid, bid=bid, ask=ask, strike=_strike_display, dte=dte,
+                                  opt_type=opt_type, expiry=expiry, contract_sym=contract_sym,
+                                  stock_price=stock_price, net_chg_pct=net_chg_pct,
+                                  rsi_val=rsi_val, adx_val=adx_val, trend_st=trend_st, ema_sig=ema_sig,
+                                  hi52=hi52, lo52=lo52, pos52=pos52,
+                                  is_income=is_income, is_buy_write=is_buy_write,
+                                  is_directional=is_directional, is_volatility=is_volatility,
+                                  _is_leap=_is_leap,
+                                  breakeven=breakeven, max_loss=max_loss, cap_display=cap_display,
+                                  _em_pct_f=_em_pct_f, _em_dollar=_em_dollar,
+                                  chase_limit=chase_limit, chase_limit_label=chase_limit_label,
+                                  entry_lo=entry_lo, entry_hi=entry_hi,
+                                  prem_vs_fv=prem_vs_fv, last_opt=last_opt,
+                                  liq_grade=liq_grade, liq_reason=liq_reason,
+                                  spread_pct=spread_pct, oi=oi,
+                                  _badge_label=_badge_label, _now_score=_now_score,
+                                  _reason_str=_reason_str,
+                              )
+                              _copy_text = _build_copy_card_text(
+                                  row, _cc_ctx,
+                                  fmt_price=_fmt_price, fmt_pct=_fmt_pct,
+                                  fmt_float=_fmt_float, safe_get=_g,
+                              )
                               st.code(_copy_text, language=None)
 
                           with st.expander("🔍 All signals used (audit reference)"):
@@ -3594,6 +4606,39 @@ def render_scan_view(core_project_root, scan_output_dir, sanitize_func, set_view
                               available = [c for c in used_cols if c in row.index]
                               ref_df = pd.DataFrame({'Field': available, 'Value': [str(row[c]) for c in available]})
                               st.dataframe(ref_df, width="stretch", hide_index=True)
+
+                          # ── Pulse Check Button ──────────────────────────────
+                          st.divider()
+                          _pulse_key = f"pulse_ready_{ticker}_{strat_name}_{card_idx}"
+                          _pulse_result_key = f"pulse_result_ready_{ticker}_{strat_name}_{card_idx}"
+
+                          if st.button("Pulse Check", key=_pulse_key, type="secondary"):
+                              with st.spinner(f"Fetching live chain for {ticker}..."):
+                                  _p_expiration = str(_g(row, 'Selected_Expiration', default='') or '')
+                                  _p_strike = float(_g(row, 'Selected_Strike', 'Strike', default=0) or 0)
+                                  _p_option_type = str(_g(row, 'Option_Type', default='call') or 'call')
+                                  _p_contract_sym = str(_g(row, 'Contract_Symbol', default='') or '')
+
+                                  _p_result = _live_pulse_check(
+                                      ticker=ticker,
+                                      expiration=_p_expiration,
+                                      strike=_p_strike,
+                                      option_type=_p_option_type,
+                                      contract_symbols=_p_contract_sym,
+                                      scan_row=row,
+                                  )
+                                  # Persist result in session state
+                                  if 'pulse_results' not in st.session_state:
+                                      st.session_state.pulse_results = {}
+                                  st.session_state.pulse_results[_pulse_result_key] = _p_result
+
+                          # Show persisted result (survives Streamlit reruns)
+                          if st.session_state.get('pulse_results', {}).get(_pulse_result_key):
+                              _render_pulse_result(
+                                  st.session_state.pulse_results[_pulse_result_key],
+                                  scan_row=row,
+                                  key_prefix=_pulse_key,
+                              )
 
                 else:
                     st.info("No trades currently meet all execution gates (READY).")
@@ -3686,11 +4731,6 @@ If you hold any of the tickers below, check whether selling the listed call make
                         st.info("No valid CC setups after data parsing.")
 
             with tab_waitlist:
-                st.subheader("🟡 WAITLIST — Awaiting Confirmation")
-                st.markdown("""
-                These trades are valid but waiting on specific conditions to be satisfied before execution.
-                Each entry has explicit wait conditions and a TTL (Time-To-Live) before expiry.
-                """)
 
                 # Try to load from wait_list table (DuckDB)
                 df_waitlist = pd.DataFrame()
@@ -3853,6 +4893,40 @@ If you hold any of the tickers below, check whether selling the listed call make
                     st.info("Run the pipeline to see row counts.")
 
             with tab_audit:
+                # ── Missing-Data Health Badge ────────────────────────────────
+                _md_health = results.get('missing_data_health')
+                if _md_health and isinstance(_md_health, dict):
+                    _md_status = _md_health.get('overall_health', 'UNKNOWN')
+                    _md_colors = {'GREEN': '🟢', 'YELLOW': '🟡', 'RED': '🔴', 'UNKNOWN': '⚪'}
+                    _md_icon = _md_colors.get(_md_status, '⚪')
+                    st.markdown(f"### {_md_icon} Data Completeness: **{_md_status}**")
+
+                    _md_comp = _md_health.get('completeness', {})
+                    if _md_comp:
+                        _comp_cols = st.columns(len(_md_comp))
+                        for _ci, (_ck, _cv) in enumerate(sorted(_md_comp.items())):
+                            _comp_cols[_ci].metric(_ck.replace('_pct', '').replace('_', ' ').title(), f"{_cv:.0f}%")
+
+                    _md_reasons = _md_health.get('reason_distribution', {})
+                    if _md_reasons:
+                        with st.expander("Missing-data reasons", expanded=False):
+                            _reason_df = pd.DataFrame([
+                                {'Reason': k, 'Count': v} for k, v in sorted(_md_reasons.items(), key=lambda x: -x[1])
+                            ])
+                            st.dataframe(_reason_df, hide_index=True, use_container_width=True)
+
+                    _md_top = _md_health.get('top_missing', [])
+                    if _md_top:
+                        with st.expander("Top missing fields", expanded=False):
+                            st.dataframe(pd.DataFrame(_md_top), hide_index=True, use_container_width=True)
+
+                    _md_imp = _md_health.get('impossible_violations', [])
+                    if _md_imp:
+                        st.error(f"**{len(_md_imp)} impossible violations detected** — fields that should never be null after their step")
+                        st.dataframe(pd.DataFrame(_md_imp), hide_index=True, use_container_width=True)
+
+                    st.divider()
+
                 if 'pipeline_health' in results:
                     health = results['pipeline_health']
                     audit_data = [

@@ -32,38 +32,6 @@ from .loaders.entry_quality_enhancements import (
     enrich_contracts_with_execution_quality
 )
 
-# --- Runtime Guards for Legacy Imports/Calls ---
-# These prevent accidental use of deprecated modules/functions.
-# Any attempt to import or call these will raise an error.
-
-# Legacy module: step7_strategy_recommendation_OLD
-try:
-    import sys
-    if 'core.scan_engine.step7_strategy_recommendation_OLD' in sys.modules:
-        raise ImportError("Legacy module 'step7_strategy_recommendation_OLD' is deprecated and cannot be imported.")
-except ImportError:
-    pass # Allow initial import to fail if not already imported
-
-# Legacy module: step11_strategy_pairing
-try:
-    import sys
-    if 'core.scan_engine.step11_strategy_pairing' in sys.modules:
-        raise ImportError("Legacy module 'step11_strategy_pairing' is deprecated and cannot be imported.")
-except ImportError:
-    pass # Allow initial import to fail if not already imported
-
-# Legacy functions (from step11_strategy_pairing)
-def _raise_legacy_error(func_name):
-    raise RuntimeError(f"Legacy function '{func_name}' is deprecated and cannot be called. Refer to LEGACY.md.")
-
-# Placeholder for legacy functions to prevent direct calls
-# These will be replaced by actual imports if the legacy module is somehow loaded,
-# but the import guard above should prevent that.
-compare_and_rank_strategies = lambda *args, **kwargs: _raise_legacy_error("compare_and_rank_strategies")
-pair_and_select_strategies = lambda *args, **kwargs: _raise_legacy_error("pair_and_select_strategies")
-calculate_position_sizing = lambda *args, **kwargs: _raise_legacy_error("calculate_position_sizing") # Legacy function from step8_position_sizing
-
-# --- End Runtime Guards ---
 
 __all__ = [
     'run_full_scan_pipeline',

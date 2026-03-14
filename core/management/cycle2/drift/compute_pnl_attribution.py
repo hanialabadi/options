@@ -87,7 +87,7 @@ def compute_pnl_attribution(df: pd.DataFrame) -> pd.DataFrame:
     
     # Ensure all potential entry columns exist to avoid KeyErrors
     potential_entry_cols = [
-        'Delta_Entry', 'Theta_Entry', 'Vega_Entry', 'Gamma_Entry', 
+        'Delta_Entry', 'Theta_Entry', 'Vega_Entry', 'Gamma_Entry', 'Rho_Entry',
         'Underlying_Price_Entry', 'IV_Entry', 'IV_Entry_Source', 'Entry_Timestamp'
     ]
     for col in potential_entry_cols:
@@ -158,6 +158,7 @@ def compute_pnl_attribution(df: pd.DataFrame) -> pd.DataFrame:
         'PnL_From_Theta',
         'PnL_From_Vega',
         'PnL_From_Gamma',
+        'PnL_From_Rho',
         'PnL_Unexplained'
     ]
     
@@ -281,6 +282,25 @@ def _compute_options_attribution(df: pd.DataFrame, mask: pd.Series) -> pd.DataFr
             df.at[idx, 'PnL_From_Gamma'] = 0.5 * gamma_entry * (price_move ** 2) * 100 * quantity
         else:
             df.at[idx, 'PnL_From_Gamma'] = 0.0
+
+        # Rho attribution: PnL from interest rate changes (material for LEAPs)
+        # Rho = option price change per +1% rate move (per-share).
+        # Formula: Rho_Entry * Δr(%) * 100 * quantity
+        # We don't yet track rate history, so estimate Δr from RISK_FREE_RATE
+        # changes between entry and now. For v1: use 0 when no rate data —
+        # the column is wired into the identity so PnL_Unexplained shrinks
+        # automatically once a rate feed is added.
+        rho_entry = df.at[idx, 'Rho_Entry'] if 'Rho_Entry' in df.columns else np.nan
+        if pd.notna(rho_entry) and abs(rho_entry) > 0:
+            # v1: no rate-change feed — contribution is 0, but sensitivity is logged
+            df.at[idx, 'PnL_From_Rho'] = 0.0
+            # Annotate sensitivity for LEAPs (DTE >= 180)
+            _dte = df.at[idx, 'DTE'] if 'DTE' in df.columns else 0
+            if pd.notna(_dte) and _dte >= 180:
+                # Per-1% rate move impact (informational, stored for dashboard)
+                df.at[idx, 'Rho_Rate_Sensitivity'] = rho_entry * 100 * quantity
+        else:
+            df.at[idx, 'PnL_From_Rho'] = 0.0
     return df
 
 
@@ -310,10 +330,11 @@ def _compute_attribution_quality(df: pd.DataFrame, mask: pd.Series) -> pd.DataFr
         actual_pnl = df.at[idx, 'Unrealized_PnL'] if 'Unrealized_PnL' in df.columns else 0.0
         
         attributed_pnl = (
-            df.at[idx, 'PnL_From_Delta'] + 
-            df.at[idx, 'PnL_From_Theta'] + 
-            df.at[idx, 'PnL_From_Vega'] + 
-            df.at[idx, 'PnL_From_Gamma']
+            df.at[idx, 'PnL_From_Delta'] +
+            df.at[idx, 'PnL_From_Theta'] +
+            df.at[idx, 'PnL_From_Vega'] +
+            df.at[idx, 'PnL_From_Gamma'] +
+            df.at[idx, 'PnL_From_Rho']
         )
         
         df.at[idx, 'PnL_Unexplained'] = actual_pnl - attributed_pnl
@@ -338,7 +359,7 @@ def _compute_passarelli_signals(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
     # 1. Dominant Pressure
-    attribution_cols = ['PnL_From_Delta', 'PnL_From_Theta', 'PnL_From_Vega', 'PnL_From_Gamma']
+    attribution_cols = ['PnL_From_Delta', 'PnL_From_Theta', 'PnL_From_Vega', 'PnL_From_Gamma', 'PnL_From_Rho']
     def get_dominant_pressure(row):
         vals = {col.split('_')[-1]: abs(row[col]) for col in attribution_cols if col in row and pd.notna(row[col])}
         if not vals or all(v == 0 for v in vals.values()): return 'N/A'
@@ -370,7 +391,7 @@ def aggregate_trade_pnl_attribution(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or 'TradeID' not in df.columns:
         return df
     df = df.copy()
-    attribution_cols = ['PnL_From_Delta', 'PnL_From_Theta', 'PnL_From_Vega', 'PnL_From_Gamma', 'PnL_Unexplained']
+    attribution_cols = ['PnL_From_Delta', 'PnL_From_Theta', 'PnL_From_Vega', 'PnL_From_Gamma', 'PnL_From_Rho', 'PnL_Unexplained']
     for col in attribution_cols:
         if col in df.columns:
             df[f"{col}_Trade"] = df.groupby('TradeID')[col].transform('sum')

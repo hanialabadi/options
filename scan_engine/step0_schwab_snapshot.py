@@ -63,6 +63,7 @@ if str(project_root) not in sys.path:
 from scan_engine.loaders.schwab_api_client import SchwabClient
 from core.shared.data_contracts.config import TICKER_UNIVERSE_PATH, SCAN_SNAPSHOT_DIR, PRICE_CACHE_DIR, PROJECT_ROOT
 from scan_engine.iv_collector.rest_collector import IVRestCollector, collect_iv_surface, iv_collected_today
+from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
 
 logger = logging.getLogger(__name__)
 
@@ -1418,10 +1419,22 @@ def generate_live_snapshot(
     hv_coverage = df[df['hv_status'] == 'COMPUTED']
     logger.info(f"\n   HV Coverage: {len(hv_coverage)}/{len(df)} ({100*len(hv_coverage)/len(df):.1f}%)")
     
-    # IV Coverage (if fetched)
-    if fetch_iv:
+    # IV Coverage
+    if fetch_iv and not _iv_already_collected:
         iv_coverage = df[df['iv_30d'].notna()]
         logger.info(f"   IV Coverage: {len(iv_coverage)}/{len(df)} ({100*len(iv_coverage)/len(df):.1f}%)")
+    elif _iv_already_collected:
+        # iv_30d in CSV is NaN because REST was skipped — query DuckDB for truth
+        try:
+            _iv_con = get_domain_connection(DbDomain.IV_HISTORY, read_only=True)
+            _iv_cnt = _iv_con.execute(
+                "SELECT COUNT(DISTINCT ticker) FROM iv_term_history "
+                "WHERE date = current_date AND iv_30d IS NOT NULL"
+            ).fetchone()[0]
+            _iv_con.close()
+            logger.info(f"   IV Coverage: {_iv_cnt}/{len(df)} ({100*_iv_cnt/len(df):.1f}%) [from iv_term_history — REST skipped]")
+        except Exception:
+            logger.info("   IV Coverage: skipped (already collected today — see iv_term_history)")
     
     # Failure Breakdown
     logger.info(f"\n   Fetch Status Breakdown:")

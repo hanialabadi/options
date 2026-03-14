@@ -51,10 +51,21 @@ class LiveGreeksProvider:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def should_refresh(self) -> bool:
-        """True only during market hours — no intraday noise off-hours."""
+        """
+        True when live Greeks add value:
+          - Market open → always True (chains are live)
+          - Market closed → True if broker CSV Greeks are from prior session
+            (allows enrichment from session cache when available)
+        """
         try:
             from core.shared.data_layer.market_time import is_market_open
-            return is_market_open()
+            if is_market_open():
+                logger.info("[LiveGreeks] Market open — refreshing live Greeks.")
+                return True
+            # Off-hours: still worth refreshing if we have a Schwab client
+            # (chain data from last session close is better than stale CSV)
+            logger.debug("[LiveGreeks] Market closed — will attempt refresh from session cache.")
+            return True
         except Exception:
             return False
 
@@ -96,12 +107,15 @@ class LiveGreeksProvider:
                 continue
 
             # Map chain data back to rows
+            _skipped = 0
             for idx in ticker_rows.index:
                 row  = df.loc[idx]
                 strike   = float(row.get("Strike", 0) or 0)
                 exp_date = _parse_expiry(row.get("Expiration"))
                 cp       = str(row.get("Call/Put", "") or "").upper()
                 if not exp_date or not cp or strike == 0:
+                    logger.debug(f"[LiveGreeks] Skipping {ticker} row: missing strike/exp/cp")
+                    _skipped += 1
                     continue
 
                 greeks = _extract_greeks_for_contract(chain_data, strike, exp_date, cp)
@@ -111,9 +125,19 @@ class LiveGreeksProvider:
                     df.loc[idx, "Gamma_Live"]   = greeks.get("gamma", np.nan)
                     df.loc[idx, "Vega_Live"]    = greeks.get("vega",  np.nan)
                     df.loc[idx, "Theta_Live"]   = greeks.get("theta", np.nan)
+                    # Bridge live Greeks to canonical columns doctrine reads
+                    if pd.notna(greeks.get("delta")):
+                        df.loc[idx, "Delta"] = greeks["delta"]
+                    if pd.notna(greeks.get("gamma")):
+                        df.loc[idx, "Gamma"] = greeks["gamma"]
+                    if pd.notna(greeks.get("vega")):
+                        df.loc[idx, "Vega"] = greeks["vega"]
+                    if pd.notna(greeks.get("theta")):
+                        df.loc[idx, "Theta"] = greeks["theta"]
                     df.loc[idx, "Greeks_Source"] = "schwab_live"
+                    df.loc[idx, "Greeks_TS"]    = datetime.now(tz=timezone.utc).isoformat()
 
-                    # Update option pricing — fixes P&L staleness from Fidelity CSV
+                    # Update option pricing from live chain
                     _live_bid  = greeks.get("bid")
                     _live_ask  = greeks.get("ask")
                     _live_last = greeks.get("last")
@@ -149,7 +173,15 @@ class LiveGreeksProvider:
                         df.loc[idx, "Volume"] = int(_live_vol)
 
                     fetched_count += 1
+                else:
+                    logger.debug(
+                        f"[LiveGreeks] No chain match for {ticker} "
+                        f"strike={strike} exp={exp_date} cp={cp}"
+                    )
+                    _skipped += 1
 
+            if _skipped:
+                logger.info(f"[LiveGreeks] {ticker}: {_skipped} contracts had no chain match.")
             time.sleep(_CHAIN_DELAY_SEC)
 
         if fetched_count:
@@ -190,9 +222,41 @@ class LiveGreeksProvider:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _ensure_live_cols(df: pd.DataFrame) -> None:
-    for col in ("IV_Now", "Delta_Live", "Gamma_Live", "Vega_Live", "Theta_Live", "Greeks_Source"):
+    for col in ("IV_Now", "Delta_Live", "Gamma_Live", "Vega_Live", "Theta_Live",
+                "Greeks_Source", "Greeks_TS"):
         if col not in df.columns:
-            df[col] = np.nan if col != "Greeks_Source" else None
+            df[col] = np.nan if col not in ("Greeks_Source",) else None
+
+
+def _float_or_nan(val) -> float:
+    """Convert to float, preserving valid 0.0. Only None → NaN."""
+    return float(val) if val is not None else np.nan
+
+
+def safe_update(df: pd.DataFrame, col: str, new_values: pd.Series,
+                source_label: str = "") -> int:
+    """
+    Update df[col] with new_values, but refuse to overwrite non-null with null/NaN.
+    Returns count of rejected overwrites (for audit logging).
+
+    RAG: Natenberg (Neutrality) — never destroy valid data with absence of data.
+    """
+    if col not in df.columns:
+        df[col] = new_values
+        return 0
+    valid_existing = df[col].notna()
+    new_is_null = new_values.isna()
+    reject_mask = valid_existing & new_is_null
+    rejected = int(reject_mask.sum())
+    if rejected > 0:
+        logger.debug(
+            f"[safe_update] Rejected {rejected} NaN overwrites on '{col}'"
+            + (f" [{source_label}]" if source_label else "")
+        )
+    # Only update where we have new non-null values OR existing is null
+    update_mask = ~reject_mask
+    df.loc[update_mask.index[update_mask], col] = new_values.loc[update_mask.index[update_mask]]
+    return rejected
 
 
 def _parse_expiry(val) -> Optional[str]:
@@ -248,6 +312,7 @@ def _extract_greeks_for_contract(
                 break
 
         if target_key is None:
+            logger.debug(f"[LiveGreeks] No expiration match for {exp_date} in {cp_norm} chain")
             return None
 
         strikes_map = exp_map[target_key]
@@ -263,10 +328,12 @@ def _extract_greeks_for_contract(
                 continue
 
         if strike_key is None:
+            logger.debug(f"[LiveGreeks] No strike match for {strike} in expiration {target_key}")
             return None
 
         contracts = strikes_map[strike_key]
         if not contracts or not isinstance(contracts, list):
+            logger.debug(f"[LiveGreeks] Empty contract list for {strike} / {target_key}")
             return None
 
         c = contracts[0]
@@ -295,10 +362,10 @@ def _extract_greeks_for_contract(
 
         return {
             "iv":    iv,
-            "delta": float(c.get("delta",  np.nan) or np.nan),
-            "gamma": float(c.get("gamma",  np.nan) or np.nan),
-            "vega":  float(c.get("vega",   np.nan) or np.nan),
-            "theta": float(c.get("theta",  np.nan) or np.nan),
+            "delta": _float_or_nan(c.get("delta")),
+            "gamma": _float_or_nan(c.get("gamma")),
+            "vega":  _float_or_nan(c.get("vega")),
+            "theta": _float_or_nan(c.get("theta")),
             # Pricing — fixes P&L staleness
             "bid":           _safe_float("bid"),
             "ask":           _safe_float("ask"),

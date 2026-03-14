@@ -92,7 +92,7 @@ class PriceLevelCondition(BaseCondition):
     """
 
     def check(self, market_data: Dict[str, Any], wait_entry: Dict[str, Any]) -> bool:
-        operator = self.config["operator"]
+        operator = self._normalize_operator(self.config["operator"])
         threshold = self.config["threshold"]
         timeframe = self.config.get("timeframe", "close")
 
@@ -113,8 +113,13 @@ class PriceLevelCondition(BaseCondition):
             logger.warning(f"[CONDITION] Unknown operator: {operator}")
             return False
 
+    @staticmethod
+    def _normalize_operator(op: str) -> str:
+        """Map alternative operator names to canonical form."""
+        return {"less_than": "below", "greater_than": "above"}.get(op, op)
+
     def get_progress(self, market_data: Dict[str, Any], wait_entry: Dict[str, Any]) -> float:
-        operator = self.config["operator"]
+        operator = self._normalize_operator(self.config["operator"])
         threshold = self.config["threshold"]
         timeframe = self.config.get("timeframe", "close")
 
@@ -164,7 +169,7 @@ class PriceLevelCondition(BaseCondition):
         return 0.0
 
     def describe(self) -> str:
-        operator = self.config["operator"]
+        operator = self._normalize_operator(self.config["operator"])
         threshold = self.config["threshold"]
         timeframe = self.config.get("timeframe", "close")
 
@@ -602,40 +607,58 @@ class TechnicalCondition(BaseCondition):
 
     Config schema:
     {
-        "metric": "RSI" | "price_vs_sma20_pct",
-        "operator": "less_than" | "greater_than",
-        "threshold": float
+        "metric": "RSI" | "price_vs_sma20_pct" | "ADX" | "Market_Structure"
+                  | "Weekly_Trend_Bias" | "Keltner_Squeeze_Fired",
+        "operator": "less_than" | "greater_than" | "equals",
+        "threshold": float | str | bool
     }
 
     Examples:
     - RSI < 65 (overbought extension resolved)
     - RSI > 35 (oversold stabilized)
     - price_vs_sma20_pct < 3.0 (price returned near SMA20)
+    - ADX > 20 (trend emerging — Murphy Ch.14)
+    - Market_Structure equals Downtrend (swing structure aligns with bearish thesis)
+    - Weekly_Trend_Bias equals ALIGNED (higher timeframe confirms)
+    - Keltner_Squeeze_Fired equals True (squeeze resolved, direction known)
     """
 
     def check(self, market_data: Dict[str, Any], wait_entry: Dict[str, Any]) -> bool:
         metric   = self.config["metric"]
         operator = self.config["operator"]
-        threshold = float(self.config["threshold"])
+        threshold = self.config["threshold"]
 
         value = self._get_value(market_data, metric)
         if value is None:
             return False
 
+        # String/bool equality comparison for categorical metrics
+        if operator == "equals":
+            return self._equals(value, threshold)
+
+        threshold_f = float(threshold)
+        value_f = float(value)
+
         if operator == "less_than":
-            return value < threshold
+            return value_f < threshold_f
         elif operator == "greater_than":
-            return value > threshold
+            return value_f > threshold_f
         return False
 
     def get_progress(self, market_data: Dict[str, Any], wait_entry: Dict[str, Any]) -> float:
         metric    = self.config["metric"]
         operator  = self.config["operator"]
-        threshold = float(self.config["threshold"])
+        threshold = self.config["threshold"]
 
         value = self._get_value(market_data, metric)
         if value is None:
             return 0.0
+
+        # Categorical equality: binary progress
+        if operator == "equals":
+            return 1.0 if self._equals(value, threshold) else 0.0
+
+        threshold_f = float(threshold)
 
         # Progress = how far along toward the threshold from entry value
         entry_val = self._get_value(
@@ -645,26 +668,41 @@ class TechnicalCondition(BaseCondition):
         if entry_val is None:
             entry_val = value
 
+        entry_val_f = float(entry_val)
+
         if operator == "less_than":
-            if value <= threshold:
+            if float(value) <= threshold_f:
                 return 1.0
-            dist = entry_val - threshold
-            return max(0.0, min(1.0, (entry_val - value) / dist)) if dist > 0 else 0.0
+            dist = entry_val_f - threshold_f
+            return max(0.0, min(1.0, (entry_val_f - float(value)) / dist)) if dist > 0 else 0.0
         elif operator == "greater_than":
-            if value >= threshold:
+            if float(value) >= threshold_f:
                 return 1.0
-            dist = threshold - entry_val
-            return max(0.0, min(1.0, (value - entry_val) / dist)) if dist > 0 else 0.0
+            dist = threshold_f - entry_val_f
+            return max(0.0, min(1.0, (float(value) - entry_val_f) / dist)) if dist > 0 else 0.0
         return 0.0
 
     def describe(self) -> str:
         metric    = self.config["metric"]
         operator  = self.config["operator"]
         threshold = self.config["threshold"]
+        if operator == "equals":
+            return f"{metric} = {threshold}"
         op_str = "<" if operator == "less_than" else ">"
         return f"{metric} {op_str} {threshold}"
 
-    def _get_value(self, market_data: Dict[str, Any], metric: str) -> Optional[float]:
+    @staticmethod
+    def _equals(value: Any, threshold: Any) -> bool:
+        """Compare value to threshold, handling str/bool/numeric types."""
+        # Bool comparison
+        if isinstance(threshold, bool):
+            if isinstance(value, bool):
+                return value == threshold
+            return str(value).upper() in ('TRUE', '1', 'YES') if threshold else str(value).upper() in ('FALSE', '0', 'NO')
+        # String comparison (case-insensitive)
+        return str(value).upper().strip() == str(threshold).upper().strip()
+
+    def _get_value(self, market_data: Dict[str, Any], metric: str) -> Any:
         if metric == "RSI":
             v = market_data.get("RSI") or market_data.get("rsi")
             return float(v) if v is not None else None
@@ -673,6 +711,21 @@ class TechnicalCondition(BaseCondition):
             sma20 = market_data.get("SMA20") or market_data.get("sma20")
             if last and sma20 and float(sma20) > 0:
                 return (float(last) - float(sma20)) / float(sma20) * 100
+            return None
+        elif metric == "ADX":
+            v = market_data.get("ADX") or market_data.get("adx")
+            return float(v) if v is not None else None
+        elif metric == "Market_Structure":
+            return market_data.get("Market_Structure")
+        elif metric == "Weekly_Trend_Bias":
+            return market_data.get("Weekly_Trend_Bias")
+        elif metric == "Keltner_Squeeze_Fired":
+            v = market_data.get("Keltner_Squeeze_Fired")
+            if v is None:
+                return None
+            if isinstance(v, bool):
+                return v
+            return str(v).upper() in ('TRUE', '1', 'YES')
         return None
 
 

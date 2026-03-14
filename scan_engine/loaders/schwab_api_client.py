@@ -1,5 +1,6 @@
 import os
 import json
+import subprocess
 import time
 import requests
 from loguru import logger
@@ -12,6 +13,19 @@ load_dotenv()
 
 # --- Configuration Constants ---
 SCHWAB_API_BASE_URL = "https://api.schwabapi.com"
+
+
+def _send_token_expiry_alert(hours_left: float) -> None:
+    """Send a macOS notification when Schwab refresh token is about to expire."""
+    try:
+        subprocess.run([
+            "osascript", "-e",
+            f'display notification "Schwab refresh token expires in {hours_left:.0f}h. '
+            f'Run: python auth_schwab_minimal.py" '
+            f'with title "Options Pipeline" subtitle "⚠️ Auth Expiring"'
+        ], timeout=5, capture_output=True)
+    except Exception:
+        pass  # notification is best-effort
 
 class SchwabClient:
     """
@@ -39,6 +53,8 @@ class SchwabClient:
         """
         Pre-flight validation: Ensures token exists and is not expired.
         Attempts silent refresh if the access token is expired.
+        Proactively refreshes when refresh token is within 48h of expiring
+        to prevent the 7-day OAuth window from lapsing.
 
         CACHED: Only validates once per SchwabClient instance to prevent busy loop.
         """
@@ -51,8 +67,9 @@ class SchwabClient:
 
         logger.debug(f"[DEBUG_SCHWAB_AUTH] Initial load: status={self._auth_status}, expires_at={self._tokens.get('expires_at')}")
 
-        if self._auth_status == "EXPIRED":
-            logger.info("[DEBUG_SCHWAB_AUTH] Access token expired. Attempting silent refresh...")
+        if self._auth_status in ("EXPIRED", "REFRESH_EXPIRED"):
+            _reason = "Access token expired" if self._auth_status == "EXPIRED" else "Refresh token reportedly expired"
+            logger.info(f"[DEBUG_SCHWAB_AUTH] {_reason}. Attempting silent refresh...")
             new_tokens = refresh_schwab_tokens()
             if new_tokens:
                 self._tokens = new_tokens
@@ -71,14 +88,60 @@ class SchwabClient:
             logger.error(f"[DEBUG_SCHWAB_AUTH] Final auth status not OK: {self._auth_status}")
             raise RuntimeError(error_msg)
 
+        # Proactive refresh: if refresh token expires within 48h, refresh now
+        # to rotate the refresh token and get a fresh 7-day window.
+        # This prevents the weekend/holiday gap from killing the session.
+        import time as _time
+        _refresh_expires = (self._tokens or {}).get("refresh_expires_at", 0)
+        _hours_left = max(0, (_refresh_expires - int(_time.time())) / 3600)
+        if 0 < _hours_left < 48:
+            logger.warning(
+                f"⚠️ SCHWAB_AUTH: Refresh token expires in {_hours_left:.0f}h — "
+                f"proactively refreshing to extend 7-day window."
+            )
+            new_tokens = refresh_schwab_tokens()
+            if new_tokens:
+                self._tokens = new_tokens
+                logger.info("✅ SCHWAB_AUTH: Proactive refresh succeeded — new 7-day window.")
+            else:
+                logger.error(
+                    "🔴 SCHWAB_AUTH: Proactive refresh FAILED — refresh token expires "
+                    f"in {_hours_left:.0f}h. Run `python auth_schwab_minimal.py` ASAP."
+                )
+                _send_token_expiry_alert(_hours_left)
+
         # Mark as validated - subsequent calls will skip validation
         self._token_validated = True
         logger.debug("✅ SCHWAB_CLIENT: Token pre-flight check passed")
 
+    def invalidate_token_cache(self) -> None:
+        """
+        Reset the _token_validated flag so the next ensure_valid_token()
+        re-checks token freshness and refreshes if needed.
+
+        Call this when a 401 is received mid-run (access token expired
+        during a long-running operation like IV surface collection).
+        """
+        self._token_validated = False
+
     def _get_access_token(self) -> str:
         """
-        Retrieves the current access token. Raises error if invalid.
+        Retrieves the current access token.
+
+        Proactively refreshes if the access token is within 120s of
+        expiry — prevents 401s during long-running chain fetch loops.
         """
+        # Proactive expiry check: if token expires within 120s, force re-validation
+        if self._token_validated and self._tokens:
+            _expires_at = self._tokens.get("expires_at", 0)
+            if _expires_at > 0 and (int(time.time()) > (_expires_at - 120)):
+                logger.info(
+                    "🔄 SCHWAB_CLIENT: Access token expiring within 120s "
+                    "(expires_at=%d, now=%d) — forcing refresh.",
+                    _expires_at, int(time.time()),
+                )
+                self._token_validated = False
+
         self.ensure_valid_token()
         return self._tokens['access_token']
 

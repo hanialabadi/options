@@ -113,6 +113,7 @@
   "HV_Accel_Proxy": "object",
   "IV_Maturity_State": "object",
   "Regime": "object",
+  "IV_Rank": "float64",
   "HV_Trend_30D": "object",
   "Recent_Vol_Spike": "bool",
   "Regime_Original": "object",
@@ -158,5 +159,12 @@
   "entry_timing_context": "object",
   "days_to_earnings": "object",
   "earnings_proximity_flag": "bool",
+  "Earnings_Formation_Phase": "object",
+  "Earnings_IV_Velocity": "float64",
+  "Earnings_Move_Ratio": "float64",
+  "Earnings_Beat_Rate": "float64",
+  "Earnings_Avg_IV_Crush": "float64",
+  "Earnings_Consecutive_Beats": "float64",
+  "Earnings_Consecutive_Misses": "float64",
   "IVHV_gap_30D": "float64"
 }

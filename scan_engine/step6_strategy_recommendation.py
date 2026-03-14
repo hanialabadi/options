@@ -47,11 +47,6 @@ TIER1_ONLY = True
 
 # BUG 1 FIX — Entry quality gate
 # Directional strategies are suppressed when entry is flagged as CHASING.
-# Income and Volatility strategies are exempt (intraday extension doesn't affect their edge).
-# Murphy Ch.4: "Wait for the pullback"; Bulkowski: "Chase after 5%+ = statistical losing trade"
-_DIRECTIONAL_STRATEGIES = {'long call', 'long put', 'long call leap', 'long put leap',
-                           'call debit spread', 'put debit spread'}
-
 # Leveraged ETFs: LEAP strategies are structurally invalid on these products.
 # Reasons:
 #   1. No LEAP-tenor options (chains max at 90-180 DTE; Step 9B → NEAR_LEAP_FALLBACK).
@@ -80,7 +75,7 @@ def _calculate_approx_stock_price(row: pd.Series) -> Tuple[float, str]:
 
     Priority:
         1. SMA20 × (1 + Price_vs_SMA20 / 100)  — most accurate (Step 4 derived)
-        2. Close                                  — direct quote fallback
+        2. Stock_Price / last_price / Close      — direct quote fallback
         3. 0.0 / 'Missing'                        — no price data available
     """
     sma20 = row.get('SMA20', 0)
@@ -90,9 +85,16 @@ def _calculate_approx_stock_price(row: pd.Series) -> Tuple[float, str]:
         # Price_vs_SMA20 is a percentage (e.g., +5.0 = 5% above SMA20), not a dollar offset
         return sma20 * (1 + price_vs_sma20 / 100), 'SMA20_PCT'
 
-    close = row.get('Close')
-    if close is not None and not (isinstance(close, float) and pd.isna(close)) and float(close) > 0:
-        return float(close), 'Close'
+    # Fallback: try all known price column names from upstream steps
+    for _col in ('Stock_Price', 'last_price', 'closePrice', 'Close'):
+        _val = row.get(_col)
+        if _val is not None and not (isinstance(_val, float) and pd.isna(_val)):
+            try:
+                _fval = float(_val)
+                if _fval > 0:
+                    return _fval, _col
+            except (ValueError, TypeError):
+                continue
 
     return 0.0, 'Missing'
 
@@ -100,12 +102,15 @@ def _get_iv_rank(row: pd.Series, default: float = 50.0) -> float:
     """
     Resolve IV Rank from available columns.
 
-    Priority: IV_Rank_30D → IV_Rank → IV_Rank_XS → default.
-    IV_Rank_XS was removed when IVEngine replaced it with suffixed columns.
+    Priority: IV_Rank_20D (primary per IVEngine) → IV_Rank_30D → IV_Rank →
+              IV_Rank_XS → default.
+    IV_Rank_20D is the primary rank (IV_Rank_Source=ROLLING_20D) and matches
+    what Step 12 and the dashboard display.  Must be checked first so that
+    thesis text, Gate_Reason, and Volatility Context all show the same rank.
     Returns `default` (50) when all null — callers should treat null rank
     as IMMATURE and apply appropriate income/directional threshold logic.
     """
-    for col in ('IV_Rank_30D', 'IV_Rank_60D', 'IV_Rank', 'IV_Rank_XS'):
+    for col in ('IV_Rank_20D', 'IV_Rank_30D', 'IV_Rank_60D', 'IV_Rank', 'IV_Rank_XS'):
         val = row.get(col)
         if val is not None and not (isinstance(val, float) and np.isnan(val)):
             try:
@@ -113,6 +118,18 @@ def _get_iv_rank(row: pd.Series, default: float = 50.0) -> float:
             except (TypeError, ValueError):
                 continue
     return default
+
+
+def _is_iv_immature(row: pd.Series) -> bool:
+    """Check if ticker has insufficient IV history for income strategies.
+
+    Income strategies (BW, CC, CSP, PMCC) require reliable IV_Rank to evaluate
+    premium-selling edge.  With <30 days of IV history, IV_Rank defaults to 50
+    (neutral) — a fake value that produces noise recommendations.  Directional
+    and volatility strategies are unaffected (they rely on chart signals).
+    """
+    maturity = str(row.get('IV_Maturity_State', '') or '').strip().upper()
+    return maturity in ('IMMATURE', 'MISSING')  # empty/absent → unknown, allow through
 
 
 def _iv_rank_confidence_adjustment(iv_rank: float, iv_rank_known: bool) -> int:
@@ -253,12 +270,24 @@ def _validate_long_put(ticker: str, row: pd.Series) -> Optional[Dict]:
     signal = row.get('Signal_Type', '')
     gap_30d = row.get('IVHV_gap_30D', 0)
 
-    # Calculate longer-term gaps — only when both IV and HV are available
+    # Calculate longer-term gaps — prefer put-side IV; fall back to call-side if unavailable.
+    # Put-side IV (IV_*_D_Put) is the correct surface for long put entries, but our
+    # collection pipeline only gathers call-side IV. When put-side is NaN, call-side
+    # is a reasonable proxy (call/put IV converge near ATM). Flag the substitution.
+    _put_iv_proxy = False
     iv_180 = row.get('IV_180_D_Put')
+    if pd.isna(iv_180) or iv_180 is None:
+        iv_180 = row.get('IV_180_D_Call')
+        if pd.notna(iv_180) and iv_180 is not None:
+            _put_iv_proxy = True
     hv_180 = row.get('HV_180_D_Cur')
     gap_180d = (float(iv_180) - float(hv_180)) if (pd.notna(iv_180) and pd.notna(hv_180)) else None
 
     iv_60 = row.get('IV_60_D_Put')
+    if pd.isna(iv_60) or iv_60 is None:
+        iv_60 = row.get('IV_60_D_Call')
+        if pd.notna(iv_60) and iv_60 is not None:
+            _put_iv_proxy = True
     hv_60 = row.get('HV_60_D_Cur')
     gap_60d = (float(iv_60) - float(hv_60)) if (pd.notna(iv_60) and pd.notna(hv_60)) else None
 
@@ -297,6 +326,7 @@ def _validate_long_put(ticker: str, row: pd.Series) -> Optional[Dict]:
         'Confidence': 65,
         'Trade_Bias': 'Bearish',
         'Strategy_Type': 'Directional',
+        'Put_IV_Proxy_Used': 1 if _put_iv_proxy else 0,
         'Approx_Stock_Price': _lp_stock_price,
         'Approx_Stock_Price_Source': _lp_price_source,
     }
@@ -309,6 +339,8 @@ def _validate_csp(ticker: str, row: pd.Series) -> Optional[Dict]:
     Theory: Passarelli - Premium collection when IV > HV.
     Entry: Bullish signal + Rich IV (gap > 0) + Moderate IV_Rank (≤70).
     """
+    if _is_iv_immature(row):
+        return None  # <30d IV history — IV_Rank unreliable for income strategy
     stock_price, _price_source = _calculate_approx_stock_price(row)
     if stock_price == 0:
         return None  # Cannot compute capital obligation without stock price
@@ -391,6 +423,8 @@ def _validate_covered_call(ticker: str, row: pd.Series) -> Optional[Dict]:
     Theory: Passarelli - Premium collection on held stock.
     Entry: Bearish signal + Rich IV (gap > 0) + Stock ownership.
     """
+    if _is_iv_immature(row):
+        return None  # <30d IV history — IV_Rank unreliable for income strategy
     stock_price, _price_source = _calculate_approx_stock_price(row)
     signal = row.get('Signal_Type', '')
     gap_30d = row.get('IVHV_gap_30D')  # None if key missing; NaN if key exists with no value
@@ -447,8 +481,10 @@ def _validate_buy_write(ticker: str, row: pd.Series) -> Optional[Dict]:
     Theory: Cohen Ch.7 - Buy stock + sell call when IV very rich.
     Entry: Bullish signal + Rich IV (gap_30d > 0).
     IV Rank gate: only enforced when rank is available (>50 required);
-    when IMMATURE (null), gap-based check is sufficient.
+    when IMMATURE (null), gap-based check is insufficient for income.
     """
+    if _is_iv_immature(row):
+        return None  # <30d IV history — IV_Rank unreliable for income strategy
     stock_price, _price_source = _calculate_approx_stock_price(row)
     if stock_price == 0:
         return None  # Cannot compute capital without stock price
@@ -514,6 +550,101 @@ def _validate_buy_write(ticker: str, row: pd.Series) -> Optional[Dict]:
     }
 
 
+def _validate_pmcc(ticker: str, row: pd.Series) -> Optional[Dict]:
+    """
+    Validate Poor Man's Covered Call (PMCC) strategy.
+
+    Theory: Passarelli Ch.6 / Hull Ch.10 — diagonal call spread used as
+    capital-efficient buy-write substitute.  Long deep-ITM LEAP call replaces
+    stock ownership; short near-term OTM call generates income.
+
+    Entry:
+      - Bullish signal (same directional thesis as buy-write)
+      - Rich IV (gap_30d ≥ 6) — need meaningful premium on the short call
+      - IV_Rank ≥ 40 when known — confirms premium environment
+      - NOT leveraged ETF (LEAP required — daily-reset invalidates LEAP)
+    """
+    if _is_iv_immature(row):
+        return None  # <30d IV history — IV_Rank unreliable for income strategy
+    if ticker.upper() in _LEVERAGED_ETFS:
+        return None
+
+    stock_price, _price_source = _calculate_approx_stock_price(row)
+    if stock_price == 0:
+        return None
+
+    signal = row.get('Signal_Type', '')
+    gap_30d = row.get('IVHV_gap_30D')
+
+    # Resolve IV Rank
+    iv_rank_raw = None
+    for col in ('IV_Rank_30D', 'IV_Rank_60D', 'IV_Rank', 'IV_Rank_XS'):
+        v = row.get(col)
+        if v is not None and not (isinstance(v, float) and np.isnan(v)):
+            try:
+                iv_rank_raw = float(v)
+                break
+            except (TypeError, ValueError):
+                pass
+    iv_rank = iv_rank_raw if iv_rank_raw is not None else 50.0
+
+    # ── Signal gate ──────────────────────────────────────────────
+    _pmcc_bidirectional_override = False
+    if signal not in ['Bullish', 'Sustained Bullish']:
+        ema_signal = str(row.get('Chart_EMA_Signal', '') or '').strip()
+        if (signal == 'Bidirectional' and ema_signal == 'Bullish'
+                and gap_30d is not None and not (isinstance(gap_30d, float) and pd.isna(gap_30d))
+                and gap_30d >= 8.0):
+            _pmcc_bidirectional_override = True
+        else:
+            return None
+
+    # ── IV gap gate (stricter than BW — needs rich short-call premium) ──
+    if gap_30d is None or (isinstance(gap_30d, float) and pd.isna(gap_30d)):
+        return None
+    if gap_30d < 6.0:
+        return None  # Need ≥6pt gap to justify diagonal complexity
+
+    # ── IV Rank gate ─────────────────────────────────────────────
+    if iv_rank_raw is not None and iv_rank < 40:
+        return None  # Premium environment too thin for short leg income
+
+    _pmcc_signal_note = ' [Bidirectional→Income: EMA Bullish + gap≥8]' if _pmcc_bidirectional_override else ''
+    _pmcc_signal_label = signal if not _pmcc_bidirectional_override else 'Bidirectional (EMA Bullish)'
+    _pmcc_base = 65 if _pmcc_bidirectional_override else 72
+    _pmcc_iv_rank_known = iv_rank_raw is not None
+    _pmcc_rank_adj = _iv_rank_confidence_adjustment(iv_rank, _pmcc_iv_rank_known)
+    _pmcc_confidence = max(40, min(95, _pmcc_base + _pmcc_rank_adj))
+    _pmcc_rank_note = f' [IV_Rank={iv_rank:.0f}→conf{_pmcc_rank_adj:+d}]' if _pmcc_rank_adj != 0 else ''
+
+    # Capital: LEAP ≈ 40% of stock price (deep ITM, delta 0.70-0.85)
+    # vs Buy-Write: stock_price × 100
+    leap_cost_est = stock_price * 0.40 * 100
+
+    return {
+        'Ticker': ticker,
+        'Strategy_Name': 'PMCC',
+        'Strategy_Tier': 1,
+        'Valid_Reason': (
+            f"{_pmcc_signal_label} + Rich IV (gap_30d={gap_30d:.1f}, IV_Rank={iv_rank:.0f}) "
+            f"[~{leap_cost_est/stock_price/100*100:.0f}% capital vs Buy-Write]"
+            f"{_pmcc_signal_note}{_pmcc_rank_note}"
+        ),
+        'Theory_Source': 'Passarelli Ch.6 / Hull Ch.10 - Diagonal as capital-efficient buy-write',
+        'Regime_Context': signal,
+        'IV_Context': f"gap_30d={gap_30d:.1f}, IV_Rank={iv_rank:.0f}",
+        'Capital_Requirement': leap_cost_est,
+        'Risk_Profile': f'Defined (max loss = LEAP premium, approx ${leap_cost_est:,.0f})',
+        'Greeks_Exposure': 'Long Delta (from LEAP), Short Vega (net), Long Theta (net)',
+        'Execution_Ready': True,
+        'Confidence': _pmcc_confidence,
+        'Trade_Bias': 'Bullish',
+        'Strategy_Type': 'INCOME',
+        'Approx_Stock_Price': stock_price,
+        'Approx_Stock_Price_Source': _price_source,
+    }
+
+
 def _validate_long_straddle(ticker: str, row: pd.Series) -> Optional[Dict]:
     """
     Validate Long Straddle strategy.
@@ -531,15 +662,15 @@ def _validate_long_straddle(ticker: str, row: pd.Series) -> Optional[Dict]:
     gap_30d = row.get('IVHV_gap_30D', 0)
     iv_rank = _get_iv_rank(row)
     
-    # Calculate longer-term gaps
-    iv_180 = row.get('IV_180_D_Call', 0)
-    hv_180 = row.get('HV_180_D_Cur', 0)
-    gap_180d = (iv_180 - hv_180) if (iv_180 and hv_180) else 0
-    
-    iv_60 = row.get('IV_60_D_Call', 0)
-    hv_60 = row.get('HV_60_D_Cur', 0)
-    gap_60d = (iv_60 - hv_60) if (iv_60 and hv_60) else 0
-    
+    # Calculate longer-term gaps — use None (not 0) when data missing
+    iv_180 = pd.to_numeric(row.get('IV_180_D_Call'), errors='coerce')
+    hv_180 = pd.to_numeric(row.get('HV_180_D_Cur'), errors='coerce')
+    gap_180d = (iv_180 - hv_180) if (pd.notna(iv_180) and pd.notna(hv_180)) else None
+
+    iv_60 = pd.to_numeric(row.get('IV_60_D_Call'), errors='coerce')
+    hv_60 = pd.to_numeric(row.get('HV_60_D_Cur'), errors='coerce')
+    gap_60d = (iv_60 - hv_60) if (pd.notna(iv_60) and pd.notna(hv_60)) else None
+
     # Natenberg Ch.9: Buy volatility when IV is cheap vs recent realized vol.
     # Gap (IV-HV) is the primary cheapness signal — negative gap = IV below HV = cheap.
     # IV_Rank provides additional context when data is mature; if immature (default=50),
@@ -557,13 +688,18 @@ def _validate_long_straddle(ticker: str, row: pd.Series) -> Optional[Dict]:
     iv_rank_is_real = iv_rank_raw is not None
 
     # Expansion proxy: gap shows cheap IV (primary gate)
-    expansion = (gap_180d < 0 or gap_60d < 0)
+    # None means unknown — only treat as cheap if we have real negative gap evidence
+    _gap180_cheap = gap_180d is not None and gap_180d < 0
+    _gap60_cheap = gap_60d is not None and gap_60d < 0
+    expansion = (_gap180_cheap or _gap60_cheap)
 
     # Rejection criteria
     if not expansion and signal != 'Bidirectional':
         return None  # No gap evidence of cheap IV AND no bidirectional signal
-    if gap_180d >= 0 and gap_60d >= 0:
-        return None  # IV not cheap vs HV across all timeframes
+    _gap180_ok = gap_180d is not None and gap_180d < 0
+    _gap60_ok = gap_60d is not None and gap_60d < 0
+    if not _gap180_ok and not _gap60_ok:
+        return None  # IV not cheap vs HV across available timeframes
     # Only apply rank gate when we have real (non-default) history
     # Natenberg: iv_rank < 40 is the sweet spot for vol buying, but absence of
     # history does not mean IV is expensive — use gap as the arbiter.
@@ -613,7 +749,12 @@ def _validate_long_straddle(ticker: str, row: pd.Series) -> Optional[Dict]:
         'Valid_Reason': valid_reason + vvix_warning,
         'Theory_Source': theory_src,
         'Regime_Context': signal if signal == 'Bidirectional' else 'Expansion',
-        'IV_Context': f"gap_30d={gap_30d:.1f}, gap_60d={gap_60d:.1f}, gap_180d={gap_180d:.1f}, IV_Rank={iv_rank:.0f}",
+        'IV_Context': ", ".join(filter(None, [
+            f"gap_30d={gap_30d:.1f}" if gap_30d is not None else None,
+            f"gap_60d={gap_60d:.1f}" if gap_60d is not None else None,
+            f"gap_180d={gap_180d:.1f}" if gap_180d is not None else None,
+            f"IV_Rank={iv_rank:.0f}",
+        ])),
         'Capital_Requirement': stock_price * 0.08 * 100,  # ~8% of stock price for ATM straddle
         'Risk_Profile': 'Defined (max loss = total premium)',
         'Greeks_Exposure': 'Delta-neutral, Long Vega, Short Theta',
@@ -642,14 +783,14 @@ def _validate_long_strangle(ticker: str, row: pd.Series) -> Optional[Dict]:
     gap_30d = row.get('IVHV_gap_30D', 0)
     iv_rank = _get_iv_rank(row)
 
-    # Calculate longer-term gaps
-    iv_180 = row.get('IV_180_D_Call', 0)
-    hv_180 = row.get('HV_180_D_Cur', 0)
-    gap_180d = (iv_180 - hv_180) if (iv_180 and hv_180) else 0
+    # Calculate longer-term gaps — use None (not 0) when data missing
+    iv_180 = pd.to_numeric(row.get('IV_180_D_Call'), errors='coerce')
+    hv_180 = pd.to_numeric(row.get('HV_180_D_Cur'), errors='coerce')
+    gap_180d = (iv_180 - hv_180) if (pd.notna(iv_180) and pd.notna(hv_180)) else None
 
-    iv_60 = row.get('IV_60_D_Call', 0)
-    hv_60 = row.get('HV_60_D_Cur', 0)
-    gap_60d = (iv_60 - hv_60) if (iv_60 and hv_60) else 0
+    iv_60 = pd.to_numeric(row.get('IV_60_D_Call'), errors='coerce')
+    hv_60 = pd.to_numeric(row.get('HV_60_D_Cur'), errors='coerce')
+    gap_60d = (iv_60 - hv_60) if (pd.notna(iv_60) and pd.notna(hv_60)) else None
 
     # Natenberg Ch.9: Strangle = OTM vol play (cheaper entry than straddle).
     # Gap is the primary cheapness evidence. IV_Rank < 50 is the ideal zone,
@@ -667,13 +808,15 @@ def _validate_long_strangle(ticker: str, row: pd.Series) -> Optional[Dict]:
     iv_rank_is_real_str = iv_rank_raw_str is not None
 
     # Expansion proxy: gap shows cheap IV (primary gate)
-    expansion = (gap_180d < 0 or gap_60d < 0)
+    _gap180_cheap = gap_180d is not None and gap_180d < 0
+    _gap60_cheap = gap_60d is not None and gap_60d < 0
+    expansion = (_gap180_cheap or _gap60_cheap)
 
     # Rejection criteria
     if not expansion and signal != 'Bidirectional':
         return None  # No cheapness evidence AND no bidirectional catalyst
-    if gap_180d >= 0 and gap_60d >= 0:
-        return None  # IV not cheap across any timeframe
+    if not _gap180_cheap and not _gap60_cheap:
+        return None  # IV not cheap across any available timeframe
     # Strangle is a cheaper version of straddle — allow up to rank 50 when known.
     # Block only on confirmed expensive IV (rank >= 50 with real data).
     if iv_rank_is_real_str and iv_rank >= 50:
@@ -707,7 +850,12 @@ def _validate_long_strangle(ticker: str, row: pd.Series) -> Optional[Dict]:
         'Valid_Reason': f"Expansion + Moderately Cheap IV (IV_Rank={iv_rank:.0f})" + vvix_warning_str,
         'Theory_Source': 'Natenberg Ch.9 - OTM volatility (requires significant price movement)',
         'Regime_Context': signal if signal == 'Bidirectional' else 'Expansion',
-        'IV_Context': f"gap_30d={gap_30d:.1f}, gap_60d={gap_60d:.1f}, gap_180d={gap_180d:.1f}, IV_Rank={iv_rank:.0f}",
+        'IV_Context': ", ".join(filter(None, [
+            f"gap_30d={gap_30d:.1f}" if gap_30d is not None else None,
+            f"gap_60d={gap_60d:.1f}" if gap_60d is not None else None,
+            f"gap_180d={gap_180d:.1f}" if gap_180d is not None else None,
+            f"IV_Rank={iv_rank:.0f}",
+        ])),
         'Capital_Requirement': stock_price * 0.05 * 100,  # ~5% of stock price for OTM strangle
         'Risk_Profile': 'Defined (max loss = total premium)',
         'Greeks_Exposure': 'Delta-neutral, Long Vega, Short Theta',
@@ -748,15 +896,15 @@ def _validate_long_call_leap(ticker: str, row: pd.Series) -> Optional[Dict]:
     gap_30d = row.get('IVHV_gap_30D', 0)
     iv_rank = _get_iv_rank(row)
     
-    # Calculate longer-term gaps
-    iv_180 = row.get('IV_180_D_Call', 0)
-    hv_180 = row.get('HV_180_D_Cur', 0)
-    gap_180d = (iv_180 - hv_180) if (iv_180 and hv_180) else 0
-    
-    iv_60 = row.get('IV_60_D_Call', 0)
-    hv_60 = row.get('HV_60_D_Cur', 0)
-    gap_60d = (iv_60 - hv_60) if (iv_60 and hv_60) else 0
-    
+    # Calculate longer-term gaps — use None (not 0) when data missing
+    iv_180 = pd.to_numeric(row.get('IV_180_D_Call'), errors='coerce')
+    hv_180 = pd.to_numeric(row.get('HV_180_D_Cur'), errors='coerce')
+    gap_180d = (iv_180 - hv_180) if (pd.notna(iv_180) and pd.notna(hv_180)) else None
+
+    iv_60 = pd.to_numeric(row.get('IV_60_D_Call'), errors='coerce')
+    hv_60 = pd.to_numeric(row.get('HV_60_D_Cur'), errors='coerce')
+    gap_60d = (iv_60 - hv_60) if (pd.notna(iv_60) and pd.notna(hv_60)) else None
+
     # LEAP criteria (stricter than short-term)
     # Note: 'Sustained Bullish' is stricter; fallback to 'Bullish' if not available
     if signal not in ['Sustained Bullish', 'Bullish']:
@@ -765,8 +913,8 @@ def _validate_long_call_leap(ticker: str, row: pd.Series) -> Optional[Dict]:
     # Use best available gap (180d preferred, fall back to 60d or 30d).
     # Hard-block only when IV is severely expensive (>15 pts above HV).
     # Hull does NOT mandate negative gap — it is context for timing, not a prerequisite.
-    _has_180 = pd.notna(iv_180) and pd.notna(hv_180) and iv_180 != 0 and hv_180 != 0
-    _has_60 = pd.notna(iv_60) and pd.notna(hv_60) and iv_60 != 0 and hv_60 != 0
+    _has_180 = gap_180d is not None
+    _has_60 = gap_60d is not None
     best_gap_leap_lc = gap_180d if _has_180 else (gap_60d if _has_60 else gap_30d)
     if best_gap_leap_lc is not None and best_gap_leap_lc > 15:
         return None  # IV severely expensive for a buyer — no edge (Sinclair)
@@ -820,24 +968,33 @@ def _validate_long_put_leap(ticker: str, row: pd.Series) -> Optional[Dict]:
     signal = row.get('Signal_Type', '')
     gap_30d = row.get('IVHV_gap_30D', 0)
     iv_rank = _get_iv_rank(row)
-    
-    # Calculate longer-term gaps
-    iv_180 = row.get('IV_180_D_Put', 0)
-    hv_180 = row.get('HV_180_D_Cur', 0)
-    gap_180d = (iv_180 - hv_180) if (iv_180 and hv_180) else 0
-    
-    iv_60 = row.get('IV_60_D_Put', 0)
-    hv_60 = row.get('HV_60_D_Cur', 0)
-    gap_60d = (iv_60 - hv_60) if (iv_60 and hv_60) else 0
-    
+
+    # Calculate longer-term gaps — prefer put-side IV; fall back to call-side if unavailable.
+    _put_iv_proxy = False
+    iv_180 = pd.to_numeric(row.get('IV_180_D_Put'), errors='coerce')
+    if pd.isna(iv_180):
+        iv_180 = pd.to_numeric(row.get('IV_180_D_Call'), errors='coerce')
+        if pd.notna(iv_180):
+            _put_iv_proxy = True
+    hv_180 = pd.to_numeric(row.get('HV_180_D_Cur'), errors='coerce')
+    gap_180d = (iv_180 - hv_180) if (pd.notna(iv_180) and pd.notna(hv_180)) else None
+
+    iv_60 = pd.to_numeric(row.get('IV_60_D_Put'), errors='coerce')
+    if pd.isna(iv_60):
+        iv_60 = pd.to_numeric(row.get('IV_60_D_Call'), errors='coerce')
+        if pd.notna(iv_60):
+            _put_iv_proxy = True
+    hv_60 = pd.to_numeric(row.get('HV_60_D_Cur'), errors='coerce')
+    gap_60d = (iv_60 - hv_60) if (pd.notna(iv_60) and pd.notna(hv_60)) else None
+
     # LEAP criteria
     if signal not in ['Sustained Bearish', 'Bearish']:
         return None
     # Hull Ch.10: cheap long-term IV improves LEAP entry edge.
     # Use best available gap (180d preferred, fall back to 60d or 30d).
     # Hard-block only when IV is severely expensive (>15 pts above HV).
-    _has_180_lp = pd.notna(iv_180) and iv_180 != 0 and pd.notna(hv_180) and hv_180 != 0
-    _has_60_lp = pd.notna(iv_60) and iv_60 != 0 and pd.notna(hv_60) and hv_60 != 0
+    _has_180_lp = gap_180d is not None
+    _has_60_lp = gap_60d is not None
     best_gap_leap_lp = gap_180d if _has_180_lp else (gap_60d if _has_60_lp else gap_30d)
     if best_gap_leap_lp is not None and best_gap_leap_lp > 15:
         return None  # IV severely expensive for a buyer — no edge (Sinclair)
@@ -860,6 +1017,7 @@ def _validate_long_put_leap(ticker: str, row: pd.Series) -> Optional[Dict]:
         'Execution_Ready': True,
         'Confidence': 70,
         'Trade_Bias': 'Bearish',
+        'Put_IV_Proxy_Used': 1 if _put_iv_proxy else 0,
         'Strategy_Type': 'Directional',
         'Approx_Stock_Price': stock_price,
         'Approx_Stock_Price_Source': _price_source,
@@ -1065,6 +1223,7 @@ def recommend_strategies(
             _validate_csp,
             _validate_covered_call,
             _validate_buy_write,
+            _validate_pmcc,
         ])
     if enable_volatility:
         validators.extend([
@@ -1077,62 +1236,18 @@ def recommend_strategies(
         ticker = row['Ticker']
         current_ticker_strategies = []
 
-        # BUG 1 FIX — Entry quality gate pre-check
-        # Murphy Ch.4: "Wait for the pullback" — CHASING entry suppresses directional strategies only.
-        # Income (CSP, CC, Buy-Write) and Volatility (Straddle, Strangle) are unaffected.
-        entry_quality = str(row.get('Entry_Quality') or '').upper()
-        entry_recommendation = str(row.get('Entry_Recommendation') or '').upper()
-        is_chasing = (entry_quality == 'CHASING' and entry_recommendation == 'AVOID')
-
         # Run all validators (independent, no mutual exclusion)
-        gate_applied_this_ticker = False
         for validator in validators:
             strategy = validator(ticker, row)
-            if strategy:  # If valid, append
-                # CHASING awareness: penalize confidence instead of suppressing.
-                # Murphy Ch.4 / Bulkowski: chasing entry = lower conviction, not zero conviction.
-                # The scan should surface all eligible strategies; the decision layer ranks them.
-                strat_name = str(strategy.get('Strategy_Name', '')).lower()
-                if is_chasing and strat_name in _DIRECTIONAL_STRATEGIES:
-                    _chase_penalty = 15
-                    _orig_conf = strategy.get('Confidence', 70)
-                    strategy['Confidence'] = max(_orig_conf - _chase_penalty, 40)
-                    strategy['Chasing_Penalized'] = True
-                    _chase_note = (
-                        f" [CHASING: Entry_Quality=CHASING, confidence {_orig_conf}→{strategy['Confidence']}; "
-                        f"Murphy Ch.4: wait for pullback]"
-                    )
-                    strategy['Valid_Reason'] = str(strategy.get('Valid_Reason', '')) + _chase_note
-                    logger.debug(
-                        f"[CHASING_GATE] {ticker}: penalized '{strategy['Strategy_Name']}' "
-                        f"confidence {_orig_conf}→{strategy['Confidence']} (was: suppress)"
-                    )
-                    gate_applied_this_ticker = True
-
+            if strategy:
                 # Copy all original row data for Step 9B
                 strategy_with_context = {**row.to_dict(), **strategy}
-                strategy_with_context['Entry_Quality_Gate_Applied'] = gate_applied_this_ticker
+                strategy_with_context['Entry_Quality_Gate_Applied'] = False
                 current_ticker_strategies.append(strategy_with_context)
 
-        # Backfill Entry_Quality_Gate_Applied on all strategies for this ticker
-        # (gate may have fired for a suppressed strategy even if income/vol passed through)
-        if gate_applied_this_ticker:
-            for s in current_ticker_strategies:
-                s['Entry_Quality_Gate_Applied'] = True
-
         if not current_ticker_strategies:
-            # TIER1_ONLY: suppress Neutral/Watch fallback — no output if no Tier 1 strategy qualifies
-            # TIER2_DISABLED: neutral_strategy = _create_neutral_strategy(ticker, row)
-            # TIER2_DISABLED: strategies.append(neutral_strategy)
-            if is_chasing:
-                logger.info(f"[CHASING_GATE] {ticker}: no strategies qualified (CHASING entry, validators returned None)")
-            else:
-                logger.debug(f"[TIER1] {ticker}: no Tier 1 strategy qualified — skipping neutral fallback")
+            logger.debug(f"[TIER1] {ticker}: no Tier 1 strategy qualified — skipping neutral fallback")
         else:
-            # Ensure every strategy has Entry_Quality_Gate_Applied set (False if gate never fired)
-            for s in current_ticker_strategies:
-                if 'Entry_Quality_Gate_Applied' not in s:
-                    s['Entry_Quality_Gate_Applied'] = False
             strategies.extend(current_ticker_strategies)
     
     # Convert to DataFrame (Strategy Ledger)

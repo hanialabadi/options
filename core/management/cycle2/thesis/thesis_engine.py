@@ -464,11 +464,17 @@ def _classify_thesis(
     if _is_long_directional:
         _is_put_dir = "PUT" in _strategy
         _roc5 = float(row.get("roc_5", 0) or 0)
-        # AUDIT FIX: use >= so boundary values (exactly 1.5% / 2.0%) are caught.
-        # Previously > strict meant ROC5=1.5% slipped through as "not adverse" while
-        # the decision engine still triggered direction-adverse EXIT — disagreement.
-        _roc5_adverse = (_roc5 >= 1.5 if _is_put_dir else _roc5 <= -1.5)
-        _drift_adverse = (drift_pct >= 0.02 if _is_put_dir else drift_pct <= -0.02)
+        _hv_20d_te = float(row.get("HV_20D", 0) or 0) if pd.notna(row.get("HV_20D")) else 0.0
+        # Sigma-normalized adverse detection — same helper as doctrine Gate 2b-dir.
+        # Ensures thesis_engine and doctrine agree on what constitutes "adverse."
+        from core.management.cycle3.doctrine.helpers import compute_direction_adverse_signals
+        _roc5_adverse, _drift_adverse, _roc5_z_te, _drift_z_te, _used_sigma_te = (
+            compute_direction_adverse_signals(_roc5, drift_pct, _hv_20d_te, _is_put_dir)
+        )
+        if _used_sigma_te:
+            _z_note = f" [roc5_z={_roc5_z_te:+.1f}σ, drift_z={_drift_z_te:+.1f}σ]"
+        else:
+            _z_note = " [HV missing — direction indeterminate]"
 
         if _roc5_adverse and _drift_adverse:
             w = _WEIGHTS["direction_adverse_severe"]
@@ -476,14 +482,14 @@ def _classify_thesis(
             _dir_label = "UP" if _is_put_dir else "DOWN"
             drivers.append({"signal": "direction_adverse_severe", "weight": w,
                              "note": f"Stock {_dir_label} (ROC5={_roc5:+.1f}%, "
-                                     f"Drift={drift_pct:+.1%}) against {_strategy}"})
+                                     f"Drift={drift_pct:+.1%}{_z_note}) against {_strategy}"})
         elif _roc5_adverse or _drift_adverse:
             w = _WEIGHTS["direction_adverse"]
             score += w
             _dir_label = "UP" if _is_put_dir else "DOWN"
             _sig = f"ROC5={_roc5:+.1f}%" if _roc5_adverse else f"Drift={drift_pct:+.1%}"
             drivers.append({"signal": "direction_adverse", "weight": w,
-                             "note": f"Stock trending {_dir_label} ({_sig}) "
+                             "note": f"Stock trending {_dir_label} ({_sig}{_z_note}) "
                                      f"against {_strategy}"})
 
     # ── Sector Relative Strength (z-score normalized, Natenberg Ch.8) ──────
@@ -677,13 +683,18 @@ def _build_summary(
     return ""
 
 
-# ── yfinance Micro Signal Fetcher ─────────────────────────────────────────────
+# ── Micro Signal Fetcher (Schwab + DuckDB primary, yfinance analyst-only) ─────
 
 def _fetch_micro_signals(ticker: str) -> Dict:
     """
-    Fetch company-specific signals from yfinance free tier.
+    Fetch company-specific micro signals.
     Returns dict with keys: eps_surprise_pct, analyst_net_change,
     post_earnings_gap_pct, gap_recovered, fetch_failed.
+
+    Data sources (in priority order):
+      - Schwab API: post-earnings gap detection (primary)
+      - DuckDB earnings_history: EPS surprise (covers 569/571 tickers)
+      - yfinance: analyst recommendations only (30d upgrade/downgrade trend)
 
     Gracefully returns {"fetch_failed": True} on any error.
     Rate-limited: skips if in backoff window.
@@ -743,90 +754,44 @@ def _fetch_micro_signals(ticker: str) -> Dict:
     except Exception:
         pass   # Schwab unavailable — fall through to yfinance
 
+    # ── EPS Surprise (DuckDB only — covers 569/571 tickers) ─────────────
+    try:
+        import duckdb as _thesis_duckdb
+        from core.shared.data_contracts.config import PIPELINE_DB_PATH as _THESIS_DB
+        _eps_con = _thesis_duckdb.connect(str(_THESIS_DB), read_only=True)
+        try:
+            _eps_row = _eps_con.execute("""
+                SELECT eps_surprise_pct FROM earnings_history
+                WHERE ticker = ? ORDER BY earnings_date DESC LIMIT 1
+            """, [ticker]).fetchone()
+            if _eps_row and _eps_row[0] is not None:
+                result["eps_surprise_pct"] = float(_eps_row[0]) / 100.0
+                result["fetch_failed"] = False
+        finally:
+            _eps_con.close()
+    except Exception as e:
+        logger.debug(f"[ThesisEngine] EPS surprise DuckDB lookup failed for {ticker}: {e}")
+
+    # ── Analyst Recommendation Trend (yfinance — only remaining yf call) ──
     try:
         import yfinance as yf
         stock = yf.Ticker(ticker)
-
-        # ── EPS Surprise ────────────────────────────────────────────────
-        try:
-            earnings = stock.quarterly_earnings
-            if earnings is not None and not earnings.empty and len(earnings) >= 1:
-                last = earnings.iloc[0]
-                actual   = float(last.get("Earnings", last.get("Actual", float("nan"))))
-                estimate = float(last.get("Estimate", float("nan")))
-                if estimate != 0 and not (pd.isna(actual) or pd.isna(estimate)):
-                    result["eps_surprise_pct"] = (actual - estimate) / abs(estimate)
-        except Exception as e:
-            logger.debug(f"[ThesisEngine] EPS surprise fetch failed for {ticker}: {e}")
-
-        # ── Analyst Recommendation Trend (30d) ──────────────────────────
-        try:
-            recs = stock.recommendations
-            if recs is not None and not recs.empty:
-                # Filter to last 30 days
-                cutoff = pd.Timestamp.now() - pd.Timedelta(days=30)
-                if recs.index.tz is not None:
-                    cutoff = cutoff.tz_localize(recs.index.tz)
-                recent = recs[recs.index >= cutoff]
-                if not recent.empty:
-                    # Count upgrades vs downgrades in "To Grade" vs "From Grade"
-                    # yfinance returns: Firm, To Grade, From Grade, Action
-                    upgrades   = (recent.get("Action", pd.Series()) == "up").sum()
-                    downgrades = (recent.get("Action", pd.Series()) == "down").sum()
-                    result["analyst_net_change"] = int(upgrades) - int(downgrades)
-        except Exception as e:
-            logger.debug(f"[ThesisEngine] Analyst recs fetch failed for {ticker}: {e}")
-
-        # ── Post-Earnings Gap ────────────────────────────────────────────
-        try:
-            cal = stock.calendar
-            if cal is not None:
-                # yfinance calendar may be dict or DataFrame depending on version
-                if isinstance(cal, dict):
-                    earnings_date = cal.get("Earnings Date")
-                    if isinstance(earnings_date, list) and earnings_date:
-                        earnings_date = earnings_date[0]
-                elif hasattr(cal, "iloc"):
-                    earnings_date = cal.get("Earnings Date", {})
-                    if hasattr(earnings_date, "iloc"):
-                        earnings_date = earnings_date.iloc[0] if not earnings_date.empty else None
-                else:
-                    earnings_date = None
-
-                if earnings_date is not None:
-                    edt = pd.Timestamp(earnings_date)
-                    now = pd.Timestamp.now()
-                    days_since = (now - edt).days
-
-                    # Look for a gap down on earnings day (0-3 days ago)
-                    if 0 <= days_since <= 5:
-                        hist = stock.history(period="10d")
-                        if hist is not None and len(hist) >= 3:
-                            # Find earnings day row
-                            edt_date = edt.date()
-                            hist.index = hist.index.normalize()
-                            rows_near = hist[hist.index.date >= edt_date]
-                            if not rows_near.empty:
-                                earn_row = rows_near.iloc[0]
-                                # Gap = open vs prior close
-                                prior_close = hist.iloc[max(0, hist.index.get_loc(rows_near.index[0]) - 1)]["Close"]
-                                gap_pct = (earn_row["Open"] - prior_close) / prior_close
-                                result["post_earnings_gap_pct"] = float(gap_pct)
-
-                                # Check if recovered: current close vs pre-earnings close
-                                current_close = hist.iloc[-1]["Close"]
-                                result["gap_recovered"] = bool(current_close >= prior_close * 0.99)
-        except Exception as e:
-            logger.debug(f"[ThesisEngine] Post-earnings gap fetch failed for {ticker}: {e}")
-
-        result["fetch_failed"] = False
-
+        recs = stock.recommendations
+        if recs is not None and not recs.empty:
+            cutoff = pd.Timestamp.now() - pd.Timedelta(days=30)
+            if recs.index.tz is not None:
+                cutoff = cutoff.tz_localize(recs.index.tz)
+            recent = recs[recs.index >= cutoff]
+            if not recent.empty:
+                upgrades   = (recent.get("Action", pd.Series()) == "up").sum()
+                downgrades = (recent.get("Action", pd.Series()) == "down").sum()
+                result["analyst_net_change"] = int(upgrades) - int(downgrades)
     except Exception as e:
         err_str = str(e).lower()
         if "rate" in err_str or "429" in err_str or "too many" in err_str:
             logger.warning(f"[ThesisEngine] Rate limit hit for {ticker}. Backing off 120s.")
             _YF_BACKOFF_UNTIL = time.time() + 120
         else:
-            logger.debug(f"[ThesisEngine] yfinance failed for {ticker}: {e}")
+            logger.debug(f"[ThesisEngine] Analyst recs fetch failed for {ticker}: {e}")
 
     return result

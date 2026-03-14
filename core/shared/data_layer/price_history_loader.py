@@ -35,7 +35,12 @@ PRICE_HISTORY_CACHE = dc.Cache(str(PRICE_CACHE_DIR / "diskcache_price_history"))
 
 # === Smart Persistence Layer (DuckDB) ===
 # Explicitly import connection functions and table name
-from core.shared.data_layer.duckdb_utils import get_duckdb_connection, get_duckdb_write_connection, PRICE_HISTORY_METADATA_TABLE, initialize_price_history_metadata_table, initialize_price_history_table
+from core.shared.data_layer.duckdb_utils import (
+    get_duckdb_connection, get_duckdb_write_connection,
+    get_domain_connection, get_domain_write_connection, DbDomain,
+    PRICE_HISTORY_METADATA_TABLE, initialize_price_history_metadata_table,
+    initialize_price_history_table,
+)
 from core.shared.data_layer.market_time import price_freshness
 
 def _is_debug_mode() -> bool:
@@ -51,7 +56,7 @@ def _get_metadata(ticker: str, con: Optional[duckdb.DuckDBPyConnection] = None) 
     Retrieves price history metadata for a ticker from DuckDB.
     Uses an existing connection if provided, otherwise opens a new read-only connection.
     """
-    _con = con if con is not None else get_duckdb_connection() # Use provided connection or open new
+    _con = con if con is not None else get_domain_connection(DbDomain.CHART, read_only=True)
     try:
         result = _con.execute(f"""
             SELECT Ticker, Last_Fetch_TS, Source, Days_History, Backoff_Until
@@ -107,7 +112,7 @@ def _update_metadata(ticker: str, success: bool, source: str = None, backoff_dur
     if backoff_duration > 0:
         backoff_until_dt = now + timedelta(seconds=backoff_duration)
     
-    _con = con if con is not None else get_duckdb_write_connection() # Use provided connection or open new
+    _con = con if con is not None else get_domain_write_connection(DbDomain.CHART)
     try:
         if success:
             _con.execute(f"""
@@ -236,7 +241,7 @@ def _load_from_duckdb_cache(ticker: str, days: int, con: Optional[duckdb.DuckDBP
     Returns:
         DataFrame with OHLC data or None if not in cache
     """
-    _con = con if con is not None else get_duckdb_connection()
+    _con = con if con is not None else get_domain_connection(DbDomain.CHART, read_only=True)
     owns_connection = con is None
 
     try:
@@ -300,7 +305,7 @@ def check_ohlc_availability(ticker: str, min_bars: int = 30,
             'staleness_hours': float or None
         }
     """
-    _con = con if con is not None else get_duckdb_connection()
+    _con = con if con is not None else get_domain_connection(DbDomain.CHART, read_only=True)
     owns_connection = con is None
 
     try:
@@ -368,109 +373,90 @@ def load_price_history(ticker: str, days: int = 180, client=None, use_cache: boo
             logger.debug(f"Diskcache read failed for {ticker}: {e}")
 
     # 2. Try Schwab (Priority Authority)
+    # On ANY Schwab failure, fall through to DuckDB cache (step 3) instead of returning early.
+    # The DuckDB cache has valid OHLC bars for most tickers — returning (None, FAILED) here
+    # caused 40%+ of positions to get MISSING_PRIMITIVES when Schwab was intermittently down.
     if client:
         try:
-            # Use periodType=month with period=6 (180 days ≈ 126 trading days) to get enough
-            # history for SMA50 calculation. startDate/endDate without frequencyType only
-            # returns ~1 month; period-based requests reliably return full daily history.
-            response_raw = client.get_price_history( # This returns the requests.Response object
+            response_raw = client.get_price_history(
                 symbol=ticker,
                 periodType="month",
                 period=6,
                 frequencyType="daily",
                 frequency=1
             )
-            # CRITICAL FIX: Handle empty response body from Schwab API (200 None)
-            # response_raw is now a dict, not a requests.Response object
             if not response_raw or 'candles' not in response_raw or not response_raw['candles']:
-                logger.warning(f"⚠️ Schwab fetch for {ticker} returned empty response body or no candles data. Skipping Schwab data.")
-                return None, ChartDataStatus.NO_HISTORY # Fallback to yfinance
-            
-            # response_json is already response_raw since schwab_api_client now returns json()
-            response_json = response_raw 
-            
-            if response_json and 'candles' in response_json and response_json['candles']:
+                logger.warning(f"⚠️ Schwab fetch for {ticker} returned empty/no candles. Falling through to DuckDB cache.")
+            else:
+                response_json = response_raw
                 df = pd.DataFrame(response_json['candles'])
                 df = df.rename(columns={
-                    'open': 'Open', 'high': 'High', 'low': 'Low', 
+                    'open': 'Open', 'high': 'High', 'low': 'Low',
                     'close': 'Close', 'volume': 'Volume'
                 })
-                
-                if 'datetime' not in df.columns:
-                    logger.warning(f"⚠️ Schwab fetch for {ticker} returned no 'datetime' column in candles. Skipping Schwab data.")
-                    return None, ChartDataStatus.NO_HISTORY # Fallback to yfinance
 
-                # Ensure datetime column is numeric before conversion
-                df['datetime'] = pd.to_numeric(df['datetime'], errors='coerce')
-                df['datetime'] = pd.to_datetime(df['datetime'], unit='ms', errors='coerce')
-                
-                # CRITICAL: Ensure there are valid datetime values before setting index
-                if df['datetime'].notna().any():
-                    df = df.set_index('datetime')
+                if 'datetime' not in df.columns:
+                    logger.warning(f"⚠️ Schwab fetch for {ticker} missing 'datetime' column. Falling through to DuckDB cache.")
                 else:
-                    logger.warning(f"⚠️ Schwab fetch for {ticker} returned no valid datetime values. Skipping Schwab data.")
-                    return None, ChartDataStatus.NO_HISTORY # Fallback to yfinance
-                
-                if len(df) >= 30:
-                    # Always persist to DuckDB for SMA/Murphy indicator use regardless of freshness.
-                    # Historical bars are needed even if the latest bar is T-1.
-                    if con is not None:
-                        try:
-                            persist_df = df.reset_index().rename(columns={
-                                'datetime': 'date', 'Open': 'open_price', 'High': 'high_price',
-                                'Low': 'low_price', 'Close': 'close_price', 'Volume': 'volume'
-                            })
-                            persist_df['ticker'] = ticker
-                            persist_df['date'] = persist_df['date'].dt.date
-                            # Keep last candle per day (Schwab returns intraday timestamps)
-                            persist_df = persist_df.drop_duplicates(subset=['date'], keep='last')
-                            con.execute("DELETE FROM price_history WHERE UPPER(ticker) = UPPER(?)", [ticker])
-                            con.execute("""
-                                INSERT INTO price_history (ticker, date, open_price, high_price, low_price, close_price, volume, source)
-                                SELECT ticker, date, open_price, high_price, low_price, close_price, volume, 'SCHWAB'
-                                FROM persist_df
-                            """)
-                            logger.debug(f"{ticker}: Persisted {len(persist_df)} Schwab OHLC bars to DuckDB")
-                        except Exception as db_e:
-                            logger.warning(f"⚠️ {ticker}: Failed to persist Schwab OHLC to DuckDB: {db_e}")
-                    # Freshness check gates source label but NOT data availability.
-                    # Chart primitives (ROC, EMA, momentum) need historical bars —
-                    # T-1 data is perfectly valid for computing slopes and rate-of-change.
-                    # Previous code returned (None, NO_HISTORY) here, which caused
-                    # compute_chart_primitives to skip ALL tickers during after-hours
-                    # runs, leaving every momentum/scale-up gate blind.
-                    _is_fresh = price_freshness(df.index[-1])
-                    _source_label = "SCHWAB" if _is_fresh else "SCHWAB_STALE"
-                    if not _is_fresh:
-                        logger.info(f"📊 {ticker}: Schwab OHLC stale (last bar {df.index[-1]}), "
-                                    f"returning {len(df)} bars for chart primitives")
-                    try:
-                        _update_metadata(ticker, True, source=_source_label, days_history=len(df), con=con)
-                        return df.tail(days), _source_label
-                    except TypeError as cache_te:
-                        logger.error(f"❌ Diskcache.set failed for {ticker} with TypeError: {cache_te}. Skipping cache.", exc_info=True)
-                        _update_metadata(ticker, True, source=f"{_source_label}_NO_CACHE", days_history=len(df), con=con)
-                        return df.tail(days), f"{_source_label}_NO_CACHE"
-                else:
-                    logger.warning(f"⚠️ Schwab fetch for {ticker} returned insufficient data ({len(df)} rows). Skipping Schwab data.")
-                    return None, ChartDataStatus.NO_HISTORY # Fallback to yfinance
-            else:
-                logger.warning(f"⚠️ Schwab fetch for {ticker} returned no candles data. Skipping Schwab data.")
-                return None, ChartDataStatus.NO_HISTORY # Fallback to yfinance
-        except Exception as e: # Catch all exceptions here, including potential KeyError if 'candles' is missing
-            logger.error(f"❌ Schwab fetch for {ticker} failed with unexpected error: {e}", exc_info=True)
-            return None, ChartDataStatus.FAILED # Explicitly return FAILED status on exception
+                    df['datetime'] = pd.to_numeric(df['datetime'], errors='coerce')
+                    df['datetime'] = pd.to_datetime(df['datetime'], unit='ms', errors='coerce')
+
+                    if not df['datetime'].notna().any():
+                        logger.warning(f"⚠️ Schwab fetch for {ticker} returned no valid datetime values. Falling through to DuckDB cache.")
+                    else:
+                        df = df.set_index('datetime')
+
+                        if len(df) < 30:
+                            logger.warning(f"⚠️ Schwab fetch for {ticker} returned insufficient data ({len(df)} rows). Falling through to DuckDB cache.")
+                        else:
+                            # Persist to DuckDB for future cache use
+                            if con is not None:
+                                try:
+                                    persist_df = df.reset_index().rename(columns={
+                                        'datetime': 'date', 'Open': 'open_price', 'High': 'high_price',
+                                        'Low': 'low_price', 'Close': 'close_price', 'Volume': 'volume'
+                                    })
+                                    persist_df['ticker'] = ticker
+                                    persist_df['date'] = persist_df['date'].dt.date
+                                    persist_df = persist_df.drop_duplicates(subset=['date'], keep='last')
+                                    con.execute("DELETE FROM price_history WHERE UPPER(ticker) = UPPER(?)", [ticker])
+                                    con.execute("""
+                                        INSERT INTO price_history (ticker, date, open_price, high_price, low_price, close_price, volume, source)
+                                        SELECT ticker, date, open_price, high_price, low_price, close_price, volume, 'SCHWAB'
+                                        FROM persist_df
+                                    """)
+                                    logger.debug(f"{ticker}: Persisted {len(persist_df)} Schwab OHLC bars to DuckDB")
+                                except Exception as db_e:
+                                    logger.warning(f"⚠️ {ticker}: Failed to persist Schwab OHLC to DuckDB: {db_e}")
+                            _is_fresh = price_freshness(df.index[-1])
+                            _source_label = "SCHWAB" if _is_fresh else "SCHWAB_STALE"
+                            if not _is_fresh:
+                                logger.info(f"📊 {ticker}: Schwab OHLC stale (last bar {df.index[-1]}), "
+                                            f"returning {len(df)} bars for chart primitives")
+                            try:
+                                _update_metadata(ticker, True, source=_source_label, days_history=len(df), con=con)
+                                return df.tail(days), _source_label
+                            except TypeError as cache_te:
+                                logger.error(f"❌ Diskcache.set failed for {ticker} with TypeError: {cache_te}. Skipping cache.", exc_info=True)
+                                _update_metadata(ticker, True, source=f"{_source_label}_NO_CACHE", days_history=len(df), con=con)
+                                return df.tail(days), f"{_source_label}_NO_CACHE"
+        except Exception as e:
+            logger.warning(f"⚠️ Schwab fetch for {ticker} failed: {e}. Falling through to DuckDB cache.")
 
     # 3. Check DuckDB price_history cache (from yf_fetch.py)
+    # Chart primitives (ROC, EMA slopes, momentum) need historical bars — T-1/T-2 data
+    # is perfectly valid for computing slopes and rate-of-change. Return stale data with
+    # a label rather than falling through to yfinance (which may also reject it as stale).
     if use_cache:
         cached_df = _load_from_duckdb_cache(ticker, days, con=con)
         if cached_df is not None and not cached_df.empty and len(cached_df) >= 30:
-            # Freshness check (market-aware)
             if price_freshness(cached_df.index[-1]):
                 logger.debug(f"{ticker}: Using cached OHLC from DuckDB ({len(cached_df)} bars)")
                 return cached_df.tail(days), "DUCKDB_CACHE"
             else:
-                logger.warning(f"⚠️ Stale cached OHLC for {ticker} in DuckDB (last bar {cached_df.index[-1]})")
+                logger.info(f"📊 {ticker}: DuckDB OHLC stale (last bar {cached_df.index[-1]}), "
+                            f"returning {len(cached_df)} bars for chart primitives")
+                return cached_df.tail(days), "DUCKDB_CACHE_STALE"
 
     # 4. Try yfinance Auto-Fetch (only if not demand-driven mode)
     if skip_auto_fetch:

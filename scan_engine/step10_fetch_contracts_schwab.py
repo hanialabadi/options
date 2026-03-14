@@ -149,6 +149,7 @@ DELTA_TARGETS = {
     'Cash-Secured Put': (-0.30, -0.15),
     'Covered Call': (0.20, 0.40),     # OTM calls
     'Buy-Write': (0.20, 0.40),        # OTM calls
+    'PMCC': (0.25, 0.35),            # OTM short call (LEAP leg uses 0.70-0.85)
     'Straddle': None,                 # ATM (closest to 0.50 delta)
     'Strangle': None,                 # OTM on both sides
 }
@@ -167,6 +168,10 @@ CONTRACT_STATUS_LEAP_FALLBACK = 'LEAP_FALLBACK'
 # but does NOT have LEAP-like structural properties (Hull Ch.10: ≥270 required).
 # Step 8 assigns reduced confidence for this status.
 CONTRACT_STATUS_NEAR_LEAP_FALLBACK = 'NEAR_LEAP_FALLBACK'
+CONTRACT_STATUS_OI_FALLBACK = 'OI_FALLBACK'
+
+# Expiration cascade: max additional expirations to try after first liquidity failure
+MAX_EXPIRATION_CASCADE = 3
 
 # LEAP strategy names (eligible for fallback)
 LEAP_STRATEGIES = {'Long Call LEAP', 'Long Put LEAP'}
@@ -243,6 +248,191 @@ def find_best_expiration_with_fallback(expirations: List[str], min_dte: int, max
 
     return None, CONTRACT_STATUS_NO_EXPIRATIONS
 
+
+def _rank_cascade_expirations(
+    all_expirations: List[str],
+    tried: set,
+    target_dte: int,
+    min_dte: int,
+    is_leap: bool,
+) -> List[str]:
+    """
+    Rank untried expirations for the liquidity cascade.
+
+    LEAPs step DOWN in DTE (nearer = more liquid).
+    Non-LEAPs sort by absolute distance from target.
+    Respects min_dte floor (never picks an expiration below strategy minimum).
+    """
+    candidates = []
+    for exp in all_expirations:
+        if exp in tried:
+            continue
+        dte = calculate_dte(exp)
+        if dte < min_dte:
+            continue
+        candidates.append((exp, dte))
+
+    if is_leap:
+        # Nearer dates first — liquidity clusters at front cycles
+        candidates.sort(key=lambda x: x[1])
+    else:
+        # Closest to target first
+        candidates.sort(key=lambda x: abs(x[1] - target_dte))
+
+    return [exp for exp, _ in candidates]
+
+
+def _select_contract_for_strategy(
+    chain_df: pd.DataFrame,
+    strategy_name: str,
+    underlying_price: float,
+    market_open: bool,
+) -> Tuple[Optional[Dict], Optional[str], str]:
+    """
+    Run strategy-specific strike selection on a parsed chain DataFrame.
+
+    Returns:
+        (contract_details, failure_reason, option_type)
+    """
+    contract_details = None
+    failure_reason = None
+    option_type = 'call'
+
+    if strategy_name in ['Long Call', 'Long Call LEAP']:
+        contract_details = select_long_call_contract(chain_df, underlying_price, strategy_name)
+        option_type = 'call'
+    elif strategy_name in ['Long Put', 'Long Put LEAP']:
+        contract_details = select_long_put_contract(chain_df, underlying_price, strategy_name)
+        option_type = 'put'
+    elif strategy_name in ['CSP', 'Cash-Secured Put']:
+        contract_details = select_csp_contract(chain_df, underlying_price)
+        option_type = 'put'
+    elif strategy_name in ['Covered Call', 'Buy-Write']:
+        contract_details = select_covered_call_contract(chain_df, underlying_price)
+        option_type = 'call'
+    elif strategy_name == 'PMCC':
+        # PMCC short-call leg selected here; LEAP leg handled at fetch level
+        contract_details = find_strike_by_delta(chain_df, (0.25, 0.35), underlying_price, 'call')
+        option_type = 'call'
+    elif strategy_name == 'Straddle':
+        contract_details = select_straddle_contracts(chain_df, underlying_price)
+        option_type = 'straddle'
+    elif strategy_name == 'Strangle':
+        contract_details = select_strangle_contracts(chain_df, underlying_price)
+        option_type = 'strangle'
+    elif strategy_name == 'Neutral / Watch':
+        contract_details = select_straddle_contracts(chain_df, underlying_price)
+        option_type = 'straddle'
+    elif 'Vertical' in strategy_name or 'Spread' in strategy_name:
+        contract_details, failure_reason = select_vertical_spread_contracts(
+            chain_df, underlying_price, strategy_name, market_open
+        )
+        option_type = 'vertical'
+    else:
+        failure_reason = f'Unknown strategy: {strategy_name}'
+        option_type = ''
+
+    return contract_details, failure_reason, option_type
+
+
+def _attempt_single_expiration(
+    chain_data: Dict,
+    expiration: str,
+    ticker: str,
+    strategy_name: str,
+    underlying_price: float,
+    market_open: bool,
+    expiry_intent: str,
+    market_stress: str,
+) -> Dict:
+    """
+    Try one expiration: parse chain → select strike → grade liquidity.
+
+    Returns a partial result dict. Caller merges into the master result.
+    The '_cascade_passed' key indicates whether liquidity was acceptable.
+    The '_cascade_failure_type' key is 'oi', 'spread', or None.
+    """
+    attempt = {
+        'Selected_Expiration': expiration,
+        'Actual_DTE': calculate_dte(expiration),
+        '_cascade_passed': False,
+        '_cascade_failure_type': None,
+    }
+
+    chain_df = parse_schwab_chain_to_dataframe(chain_data, expiration)
+    attempt['Strikes_Available'] = len(chain_df)
+
+    if chain_df.empty:
+        attempt['Contract_Status'] = CONTRACT_STATUS_NO_CHAIN
+        attempt['Contract_Selection_Status'] = 'No_Chains_Available'
+        attempt['Chain_Rejection_Reason'] = f'No contracts for expiration {expiration}'
+        return attempt
+
+    contract_details, failure_reason, option_type = _select_contract_for_strategy(
+        chain_df, strategy_name, underlying_price, market_open,
+    )
+    attempt['Option_Type'] = option_type
+
+    if not contract_details:
+        attempt['Contract_Status'] = (
+            CONTRACT_STATUS_NO_CALLS if 'call' in option_type
+            else (CONTRACT_STATUS_NO_PUTS if 'put' in option_type else 'NO_CONTRACT_MATCH')
+        )
+        attempt['Contract_Selection_Status'] = 'No_Contracts_Available'
+        attempt['Chain_Rejection_Reason'] = failure_reason or f'No suitable contract for {strategy_name}'
+        return attempt
+
+    # Populate contract fields
+    attempt['Selected_Strike'] = contract_details['strike']
+    attempt['Contract_Symbol'] = contract_details['symbol']
+    attempt['Delta'] = contract_details['delta']
+    attempt['Gamma'] = contract_details['gamma']
+    attempt['Vega'] = contract_details['vega']
+    attempt['Theta'] = contract_details['theta']
+    attempt['Rho'] = contract_details.get('rho', 0)
+    attempt['Bid'] = contract_details['bid']
+    attempt['Ask'] = contract_details['ask']
+    attempt['Mid'] = contract_details['mark']
+    attempt['Last'] = contract_details['last']
+    attempt['Open_Interest'] = contract_details['open_interest']
+    attempt['Volume'] = contract_details['volume']
+    attempt['Implied_Volatility'] = contract_details['implied_volatility']
+    if 'put_call_skew' in contract_details:
+        attempt['Put_Call_Skew'] = contract_details['put_call_skew']
+
+    mid = attempt['Mid']
+    if mid > 0:
+        attempt['Bid_Ask_Spread_Pct'] = (attempt['Ask'] - attempt['Bid']) / mid * 100
+    else:
+        attempt['Bid_Ask_Spread_Pct'] = np.nan
+
+    # Grade liquidity
+    grade, score, reason = grade_liquidity(
+        attempt['Bid'], attempt['Ask'], mid,
+        attempt['Open_Interest'], attempt['Volume'],
+        market_open=market_open, expiry_intent=expiry_intent,
+        market_stress=market_stress,
+    )
+    attempt['Liquidity_Grade'] = grade
+    attempt['Liquidity_Score'] = score
+    attempt['Liquidity_Reason'] = reason
+    attempt['Spread_Quality_Adjusted'] = (market_stress.upper() in ('CRISIS', 'ELEVATED'))
+
+    if mid > 0:
+        attempt['Total_Debit'] = mid
+
+    if grade in ('Illiquid', 'Thin'):
+        attempt['Contract_Status'] = CONTRACT_STATUS_LIQUIDITY_FAIL
+        attempt['Contract_Selection_Status'] = 'No_Contracts_Available'
+        attempt['Chain_Rejection_Reason'] = f'Failed liquidity filter: {reason}'
+        attempt['_cascade_failure_type'] = 'oi' if 'OI' in reason else 'spread'
+    else:
+        attempt['Contract_Selection_Status'] = 'Contracts_Available'
+        attempt['_cascade_passed'] = True
+
+    return attempt
+
+
 def find_strike_by_delta(chain_df: pd.DataFrame, target_delta_range: Tuple[float, float], 
                          underlying_price: float, option_type: str) -> Optional[Dict]:
     """
@@ -270,8 +460,8 @@ def find_strike_by_delta(chain_df: pd.DataFrame, target_delta_range: Tuple[float
     
     if option_type == 'call':
         valid = type_chain[(type_chain['delta'] >= min_delta) & (type_chain['delta'] <= max_delta)].copy()
-    else:  # put
-        valid = type_chain[(type_chain['delta'] <= min_delta) & (type_chain['delta'] >= max_delta)].copy()
+    else:  # put — deltas are negative, e.g. min=-0.70, max=-0.30
+        valid = type_chain[(type_chain['delta'] >= min_delta) & (type_chain['delta'] <= max_delta)].copy()
     
     if valid.empty:
         # Fallback: find closest delta to midpoint, preferring strikes with OI > 0
@@ -526,14 +716,24 @@ def parse_schwab_chain_to_dataframe(chain_data: Dict, expiration: str) -> pd.Dat
         for strike_price, contracts in strikes.items():
             # Schwab returns array of contracts per strike (usually just 1)
             for contract in contracts:
+                def _clean_greek(val):
+                    """Return NaN for Schwab sentinel (-999) or missing Greeks."""
+                    if val is None:
+                        return np.nan
+                    try:
+                        v = float(val)
+                    except (TypeError, ValueError):
+                        return np.nan
+                    return np.nan if v <= -999 or v >= 999 else v
+
                 rows.append({
                     'strikePrice': float(strike_price),
                     'putCall': option_type.upper(),
-                    'delta': contract.get('delta', 0),
-                    'gamma': contract.get('gamma', 0),
-                    'vega': contract.get('vega', 0),
-                    'theta': contract.get('theta', 0),
-                    'rho': contract.get('rho', 0),
+                    'delta': _clean_greek(contract.get('delta')),
+                    'gamma': _clean_greek(contract.get('gamma')),
+                    'vega': _clean_greek(contract.get('vega')),
+                    'theta': _clean_greek(contract.get('theta')),
+                    'rho': _clean_greek(contract.get('rho')),
                     'bid': contract.get('bid', 0),
                     'ask': contract.get('ask', 0),
                     'last': contract.get('last', 0),
@@ -542,7 +742,7 @@ def parse_schwab_chain_to_dataframe(chain_data: Dict, expiration: str) -> pd.Dat
                     'askSize': contract.get('askSize', 0),
                     'totalVolume': contract.get('totalVolume', 0),
                     'openInterest': contract.get('openInterest', 0),
-                    'volatility': contract.get('volatility', 0),
+                    'volatility': _clean_greek(contract.get('volatility')),
                     'symbol': contract.get('symbol', ''),
                 })
     
@@ -612,6 +812,10 @@ def fetch_contracts_for_strategy(
     """
     Fetches and selects a single option contract (or combination for spreads)
     for a given strategy from the raw Schwab chain data.
+
+    Includes OI-aware expiration cascade: if the best-fit expiration fails
+    liquidity, tries up to MAX_EXPIRATION_CASCADE alternative expirations
+    (already fetched) before giving up.
     """
     result = {
         'Contract_Status': CONTRACT_STATUS_NO_CHAIN,
@@ -629,7 +833,9 @@ def fetch_contracts_for_strategy(
         'Liquidity_Grade': np.nan, 'Liquidity_Score': np.nan, 'Liquidity_Reason': np.nan,
         'Expirations_Checked': 0,
         'Strikes_Available': 0,
-        'Total_Debit': np.nan, # For spreads
+        'Total_Debit': np.nan,  # For spreads
+        'Expiration_Fallback_Used': False,
+        'Expiration_Attempts': 0,
     }
 
     if not chain_data:
@@ -643,7 +849,7 @@ def fetch_contracts_for_strategy(
     if 'putExpDateMap' in chain_data:
         for exp_key in chain_data['putExpDateMap'].keys():
             all_expirations.add(exp_key.split(':')[0])
-    
+
     all_expirations = sorted(list(all_expirations))
     result['Expirations_Checked'] = len(all_expirations)
 
@@ -659,124 +865,195 @@ def fetch_contracts_for_strategy(
     )
 
     if not selected_expiration:
-        result['Contract_Status'] = exp_status # Will be NO_EXPIRATIONS
+        result['Contract_Status'] = exp_status  # Will be NO_EXPIRATIONS
         result['Contract_Selection_Status'] = 'No_Expirations_In_DTE_WINDOW'
         result['Chain_Rejection_Reason'] = f'No expirations in DTE window {min_dte}-{max_dte}'
         return result
-    
-    result['Selected_Expiration'] = selected_expiration
-    result['Actual_DTE'] = calculate_dte(selected_expiration)
-    result['Contract_Status'] = exp_status # OK or LEAP_FALLBACK
 
-    # Parse chain for the selected expiration
-    chain_df = parse_schwab_chain_to_dataframe(chain_data, selected_expiration)
-    result['Strikes_Available'] = len(chain_df)
+    # ── Expiration cascade ───────────────────────────────────────────
+    # Try the best-fit expiration first.  If it fails liquidity, cascade
+    # through alternative expirations (already cached — no new API calls).
+    # LEAPs: floor at 180 DTE so cascade doesn't degrade to short-dated.
+    # Non-LEAPs: floor at min_dte from Step 9A.
+    cascade_min_dte = 180 if is_leap_strategy else max(min_dte, 20)
 
-    if chain_df.empty:
-        result['Contract_Status'] = CONTRACT_STATUS_NO_CHAIN
-        result['Contract_Selection_Status'] = 'No_Chains_Available'
-        result['Chain_Rejection_Reason'] = f'No contracts for expiration {selected_expiration}'
-        return result
+    tried = set()
+    expirations_to_try = [selected_expiration]
+    last_attempt = None
+    cascade_used = False
 
-    contract_details = None
-    failure_reason = None
+    for attempt_idx, exp_to_try in enumerate(expirations_to_try):
+        tried.add(exp_to_try)
 
-    # Strategy-specific selection
-    if strategy_name in ['Long Call', 'Long Call LEAP']:
-        contract_details = select_long_call_contract(chain_df, underlying_price, strategy_name)
-        result['Option_Type'] = 'call'
-    elif strategy_name in ['Long Put', 'Long Put LEAP']:
-        contract_details = select_long_put_contract(chain_df, underlying_price, strategy_name)
-        result['Option_Type'] = 'put'
-    elif strategy_name in ['CSP', 'Cash-Secured Put']:
-        contract_details = select_csp_contract(chain_df, underlying_price)
-        result['Option_Type'] = 'put'
-    elif strategy_name in ['Covered Call', 'Buy-Write']:
-        contract_details = select_covered_call_contract(chain_df, underlying_price)
-        result['Option_Type'] = 'call'
-    elif strategy_name == 'Straddle':
-        contract_details = select_straddle_contracts(chain_df, underlying_price)
-        result['Option_Type'] = 'straddle'
-    elif strategy_name == 'Strangle':
-        contract_details = select_strangle_contracts(chain_df, underlying_price)
-        result['Option_Type'] = 'strangle'
-    elif strategy_name == 'Neutral / Watch':
-        # Non-executable evaluation: still fetch contracts/greeks for diagnostics
-        contract_details = select_straddle_contracts(chain_df, underlying_price)
-        result['Option_Type'] = 'straddle'
-    elif 'Vertical' in strategy_name or 'Spread' in strategy_name: # Generic vertical spread
-        contract_details, failure_reason = select_vertical_spread_contracts(chain_df, underlying_price, strategy_name, market_open)
-        result['Option_Type'] = 'vertical'
+        attempt = _attempt_single_expiration(
+            chain_data, exp_to_try, ticker, strategy_name,
+            underlying_price, market_open, expiry_intent, market_stress,
+        )
+
+        last_attempt = attempt
+
+        if attempt['_cascade_passed']:
+            # Success — merge into result
+            if attempt_idx > 0:
+                cascade_used = True
+                logger.info(
+                    f"  🔄 {ticker} {strategy_name}: OI cascade — "
+                    f"found liquid contract at {exp_to_try} "
+                    f"(attempt {attempt_idx + 1}, DTE={attempt['Actual_DTE']})"
+                )
+            else:
+                logger.debug(
+                    f"  ✅ {ticker} {strategy_name}: Contract selected and passed liquidity."
+                )
+            break
+
+        # First failure — lazily compute alternatives for cascade
+        if attempt_idx == 0:
+            alternatives = _rank_cascade_expirations(
+                all_expirations, tried, target_dte,
+                cascade_min_dte, is_leap_strategy,
+            )
+            expirations_to_try.extend(alternatives[:MAX_EXPIRATION_CASCADE])
+            logger.debug(
+                f"  🔄 {ticker} {strategy_name}: Liquidity failed at {exp_to_try} "
+                f"({attempt.get('_cascade_failure_type', '?')}), "
+                f"cascading through {len(alternatives[:MAX_EXPIRATION_CASCADE])} alternatives"
+            )
+        else:
+            logger.debug(
+                f"  🔄 {ticker} {strategy_name}: Cascade attempt {attempt_idx + 1} "
+                f"failed at {exp_to_try} ({attempt.get('_cascade_failure_type', '?')})"
+            )
+
+    # ── Merge winning (or last failed) attempt into result ───────────
+    # Copy all non-internal keys from the attempt
+    for k, v in last_attempt.items():
+        if not k.startswith('_cascade'):
+            result[k] = v
+
+    result['Expiration_Attempts'] = len(tried)
+    result['Expiration_Fallback_Used'] = cascade_used
+
+    if last_attempt['_cascade_passed']:
+        # Preserve original exp_status (OK / LEAP_FALLBACK) unless cascade was used
+        if cascade_used:
+            result['Contract_Status'] = CONTRACT_STATUS_OI_FALLBACK
+        else:
+            result['Contract_Status'] = exp_status
     else:
-        logger.warning(f"  ⚠️  {ticker}: Unknown strategy '{strategy_name}' - skipping contract selection.")
-        result['Contract_Status'] = 'UNKNOWN_STRATEGY'
-        result['Contract_Selection_Status'] = 'No_Contracts_Available'
-        result['Chain_Rejection_Reason'] = f'Unknown strategy: {strategy_name}'
-        return result
+        # All attempts failed — keep the last failure status
+        logger.debug(
+            f"  ❌ {ticker} {strategy_name}: Cascade exhausted "
+            f"({len(tried)} expirations tried), final reject: "
+            f"{result.get('Chain_Rejection_Reason', '?')}"
+        )
 
-    if not contract_details:
-        logger.debug(f"  ❌ {ticker} {strategy_name}: No suitable contract found. Reason: {failure_reason if failure_reason else 'Generic failure'}")
-        result['Contract_Status'] = CONTRACT_STATUS_NO_CALLS if 'call' in result['Option_Type'] else (CONTRACT_STATUS_NO_PUTS if 'put' in result['Option_Type'] else 'NO_CONTRACT_MATCH')
-        result['Contract_Selection_Status'] = 'No_Contracts_Available'
-        result['Chain_Rejection_Reason'] = failure_reason if failure_reason else f'No suitable contract found for {strategy_name}'
-        return result
+    # ── PMCC: attach LEAP leg from a separate expiration ──────────
+    if strategy_name == 'PMCC' and last_attempt.get('_cascade_passed'):
+        result = _enrich_pmcc_leap_leg(chain_data, result, underlying_price, ticker)
 
-    # Populate result with contract details
-    result['Selected_Strike'] = contract_details['strike']
-    result['Contract_Symbol'] = contract_details['symbol']
-    result['Delta'] = contract_details['delta']
-    result['Gamma'] = contract_details['gamma']
-    result['Vega'] = contract_details['vega']
-    result['Theta'] = contract_details['theta']
-    result['Rho'] = contract_details['rho']
-    result['Bid'] = contract_details['bid']
-    result['Ask'] = contract_details['ask']
-    result['Mid'] = contract_details['mark'] # Use mark as mid for consistency
-    result['Last'] = contract_details['last']
-    result['Open_Interest'] = contract_details['open_interest']
-    result['Volume'] = contract_details['volume']
-    result['Implied_Volatility'] = contract_details['implied_volatility']
-    if 'put_call_skew' in contract_details:
-        result['Put_Call_Skew'] = contract_details['put_call_skew']
-
-    # Calculate Bid_Ask_Spread_Pct
-    if result['Mid'] > 0:
-        result['Bid_Ask_Spread_Pct'] = (result['Ask'] - result['Bid']) / result['Mid'] * 100
-    else:
-        result['Bid_Ask_Spread_Pct'] = np.nan
-
-    # Grade liquidity
-    grade, score, reason = grade_liquidity(
-        result['Bid'], result['Ask'], result['Mid'],
-        result['Open_Interest'], result['Volume'],
-        market_open=market_open, expiry_intent=expiry_intent,
-        market_stress=market_stress  # GAP 4: VIX-adjusted thresholds
-    )
-    result['Liquidity_Grade'] = grade
-    result['Liquidity_Score'] = score
-    result['Liquidity_Reason'] = reason
-    result['Spread_Quality_Adjusted'] = (market_stress.upper() in ('CRISIS', 'ELEVATED'))
-    logger.debug(f"  🔍 {ticker} {strategy_name}: Liquidity Grade: {grade} (Score: {score}, Reason: {reason})")
-
-    # Populate Total_Debit from Mid (mark price) — single-leg = premium, spread = net debit.
-    # Must happen BEFORE liquidity early-return so Thin contracts that pass R2.3a have valid debit.
-    if np.isnan(result.get('Total_Debit', np.nan)) and result.get('Mid', 0) > 0:
-        result['Total_Debit'] = result['Mid']
-
-    # Check if liquidity is acceptable
-    if grade == 'Illiquid' or grade == 'Thin': # Consider 'Thin' as well for rejection
-        result['Contract_Status'] = CONTRACT_STATUS_LIQUIDITY_FAIL
-        result['Contract_Selection_Status'] = 'No_Contracts_Available'
-        result['Chain_Rejection_Reason'] = f'Failed liquidity filter: {reason}'
-        logger.debug(f"  ❌ {ticker} {strategy_name}: Rejected due to liquidity: {reason}")
-        return result
-
-    result['Contract_Selection_Status'] = 'Contracts_Available'
-    logger.debug(f"  ✅ {ticker} {strategy_name}: Contract selected and passed liquidity.")
     return result
 
 
-def select_long_call_contract(chain_df: pd.DataFrame, underlying_price: float, 
+def _enrich_pmcc_leap_leg(
+    chain_data: Dict,
+    result: Dict,
+    underlying_price: float,
+    ticker: str,
+) -> Dict:
+    """
+    Find the LEAP long-call leg for PMCC from the full chain data.
+
+    Searches expirations ≥270 DTE for a deep-ITM call (delta 0.70-0.85).
+    If found, stores LEAP details in PMCC_LEAP_* columns alongside the
+    short-call leg already in the standard contract columns.
+    """
+    PMCC_LEAP_MIN_DTE = 270
+    PMCC_LEAP_DELTA = (0.70, 0.85)
+
+    # Collect LEAP-eligible expirations from the call chain
+    leap_expirations = []
+    if 'callExpDateMap' in chain_data:
+        for exp_key in chain_data['callExpDateMap']:
+            exp_date = exp_key.split(':')[0]
+            dte = calculate_dte(exp_date)
+            if dte >= PMCC_LEAP_MIN_DTE:
+                leap_expirations.append((exp_date, dte))
+
+    if not leap_expirations:
+        result['PMCC_LEAP_Status'] = 'NO_LEAP_EXPIRATION'
+        logger.debug(f"  PMCC {ticker}: No expirations with DTE≥{PMCC_LEAP_MIN_DTE}")
+        return result
+
+    # Sort by DTE — prefer closest to 365 DTE (sweet spot for PMCC LEAPs)
+    leap_expirations.sort(key=lambda x: abs(x[1] - 365))
+
+    for exp_date, dte in leap_expirations:
+        chain_df = parse_schwab_chain_to_dataframe(chain_data, exp_date)
+        if chain_df.empty:
+            continue
+
+        leap_contract = find_strike_by_delta(chain_df, PMCC_LEAP_DELTA, underlying_price, 'call')
+        if not leap_contract:
+            continue
+
+        # Verify LEAP is deep enough ITM: strike should be below underlying
+        if leap_contract['strike'] >= underlying_price:
+            continue
+
+        mid = leap_contract['mark']
+        if mid <= 0:
+            continue
+
+        spread_pct = (leap_contract['ask'] - leap_contract['bid']) / mid * 100 if mid > 0 else 999
+        if leap_contract['open_interest'] < 10:
+            continue  # Need some liquidity on the LEAP
+
+        result['PMCC_LEAP_Status'] = 'OK'
+        result['PMCC_LEAP_Expiration'] = exp_date
+        result['PMCC_LEAP_DTE'] = dte
+        result['PMCC_LEAP_Strike'] = leap_contract['strike']
+        result['PMCC_LEAP_Symbol'] = leap_contract['symbol']
+        result['PMCC_LEAP_Delta'] = leap_contract['delta']
+        result['PMCC_LEAP_Gamma'] = leap_contract['gamma']
+        result['PMCC_LEAP_Vega'] = leap_contract['vega']
+        result['PMCC_LEAP_Theta'] = leap_contract['theta']
+        result['PMCC_LEAP_Bid'] = leap_contract['bid']
+        result['PMCC_LEAP_Ask'] = leap_contract['ask']
+        result['PMCC_LEAP_Mid'] = mid
+        result['PMCC_LEAP_OI'] = leap_contract['open_interest']
+        result['PMCC_LEAP_Spread_Pct'] = spread_pct
+
+        # Combined PMCC cost = LEAP debit - short call credit
+        short_mid = result.get('Mid', 0) or 0
+        result['PMCC_Net_Debit'] = (mid - short_mid) * 100  # per-contract
+        result['PMCC_Max_Loss'] = mid * 100  # LEAP premium is max loss if short expires worthless
+
+        # Reclassify option type to diagonal
+        result['Option_Type'] = 'pmcc'
+        result['Contract_Symbol'] = json.dumps([
+            leap_contract['symbol'],
+            result.get('Contract_Symbol', ''),
+        ])
+        result['Selected_Strike'] = json.dumps([
+            leap_contract['strike'],
+            result.get('Selected_Strike', 0),
+        ])
+
+        logger.info(
+            f"  PMCC {ticker}: LEAP {exp_date} (DTE={dte}) "
+            f"strike={leap_contract['strike']:.2f} delta={leap_contract['delta']:.2f} "
+            f"mid=${mid:.2f} | short-call mid=${short_mid:.2f} | "
+            f"net debit=${result['PMCC_Net_Debit']:,.0f}"
+        )
+        return result
+
+    result['PMCC_LEAP_Status'] = 'NO_LIQUID_LEAP'
+    logger.debug(f"  PMCC {ticker}: No liquid deep-ITM LEAP found across {len(leap_expirations)} expirations")
+    return result
+
+
+def select_long_call_contract(chain_df: pd.DataFrame, underlying_price: float,
                                strategy_name: str) -> Optional[Dict]:
     """Select contract for Long Call or Long Call LEAP."""
     delta_range = DELTA_TARGETS.get(strategy_name, (0.30, 0.70))
@@ -836,19 +1113,19 @@ def select_straddle_contracts(chain_df: pd.DataFrame, underlying_price: float) -
     return {
         'strike': call_contract['strike'],  # Should be same for both
         'symbol': json.dumps([call_contract['symbol'], put_contract['symbol']]),
-        'delta': call_contract['delta'] + put_contract['delta'],
-        'gamma': call_contract['gamma'] + put_contract['gamma'],
-        'vega': call_contract['vega'] + put_contract['vega'],
-        'theta': call_contract['theta'] + put_contract['theta'],
-        'rho': call_contract.get('rho', 0) + put_contract.get('rho', 0),
+        'delta': np.nansum([call_contract['delta'], put_contract['delta']]),
+        'gamma': np.nansum([call_contract['gamma'], put_contract['gamma']]),
+        'vega': np.nansum([call_contract['vega'], put_contract['vega']]),
+        'theta': np.nansum([call_contract['theta'], put_contract['theta']]),
+        'rho': np.nansum([call_contract.get('rho', 0), put_contract.get('rho', 0)]),
         'bid': call_contract['bid'] + put_contract['bid'],
         'ask': call_contract['ask'] + put_contract['ask'],
         'last': call_contract['last'] + put_contract['last'],
         'mark': call_contract['mark'] + put_contract['mark'],
         'volume': call_contract['volume'] + put_contract['volume'],
         'open_interest': call_contract['open_interest'] + put_contract['open_interest'],
-        'implied_volatility': (call_contract['implied_volatility'] + put_contract['implied_volatility']) / 2,
-        'put_call_skew': put_contract['implied_volatility'] / call_contract['implied_volatility'] if call_contract['implied_volatility'] > 0 else np.nan,
+        'implied_volatility': np.nanmean([call_contract['implied_volatility'], put_contract['implied_volatility']]),
+        'put_call_skew': put_contract['implied_volatility'] / call_contract['implied_volatility'] if call_contract.get('implied_volatility', 0) > 0 else np.nan,
         'option_type': 'straddle',
     }
 
@@ -866,19 +1143,19 @@ def select_strangle_contracts(chain_df: pd.DataFrame, underlying_price: float) -
     return {
         'strike': json.dumps([put_contract['strike'], call_contract['strike']]),
         'symbol': json.dumps([call_contract['symbol'], put_contract['symbol']]),
-        'delta': call_contract['delta'] + put_contract['delta'],
-        'gamma': call_contract['gamma'] + put_contract['gamma'],
-        'vega': call_contract['vega'] + put_contract['vega'],
-        'theta': call_contract['theta'] + put_contract['theta'],
-        'rho': call_contract.get('rho', 0) + put_contract.get('rho', 0),
+        'delta': np.nansum([call_contract['delta'], put_contract['delta']]),
+        'gamma': np.nansum([call_contract['gamma'], put_contract['gamma']]),
+        'vega': np.nansum([call_contract['vega'], put_contract['vega']]),
+        'theta': np.nansum([call_contract['theta'], put_contract['theta']]),
+        'rho': np.nansum([call_contract.get('rho', 0), put_contract.get('rho', 0)]),
         'bid': call_contract['bid'] + put_contract['bid'],
         'ask': call_contract['ask'] + put_contract['ask'],
         'last': call_contract['last'] + put_contract['last'],
         'mark': call_contract['mark'] + put_contract['mark'],
         'volume': call_contract['volume'] + put_contract['volume'],
         'open_interest': call_contract['open_interest'] + put_contract['open_interest'],
-        'implied_volatility': (call_contract['implied_volatility'] + put_contract['implied_volatility']) / 2,
-        'put_call_skew': put_contract['implied_volatility'] / call_contract['implied_volatility'] if call_contract['implied_volatility'] > 0 else np.nan,
+        'implied_volatility': np.nanmean([call_contract['implied_volatility'], put_contract['implied_volatility']]),
+        'put_call_skew': put_contract['implied_volatility'] / call_contract['implied_volatility'] if call_contract.get('implied_volatility', 0) > 0 else np.nan,
         'option_type': 'strangle',
     }
 
@@ -1117,7 +1394,10 @@ def fetch_contracts(df: pd.DataFrame, client: SchwabClient, expiry_intent: str =
         has_price = pd.notna(row.get('last_price')) and row.get('last_price', 0) > 0
 
         # Check basic Greeks (required for risk assessment)
-        has_greeks = all(pd.notna(row.get(greek)) for greek in ['Delta', 'Gamma', 'Vega', 'Theta'])
+        # Reject Schwab sentinels (-999) and implausible values
+        def _valid_greek(v):
+            return pd.notna(v) and -998 < float(v) < 998
+        has_greeks = all(_valid_greek(row.get(greek)) for greek in ['Delta', 'Gamma', 'Vega', 'Theta'])
 
         # Check contract details
         has_contract = pd.notna(row.get('Contract_Symbol')) and pd.notna(row.get('Mid'))
@@ -1162,7 +1442,8 @@ def fetch_contracts(df: pd.DataFrame, client: SchwabClient, expiry_intent: str =
     logger.info(f"\n📊 Contract Status Summary:")
     logger.info(f"   Total strategies: {total}")
     
-    for status in [CONTRACT_STATUS_OK, CONTRACT_STATUS_LEAP_FALLBACK, CONTRACT_STATUS_NEAR_LEAP_FALLBACK, CONTRACT_STATUS_NO_EXPIRATIONS,
+    for status in [CONTRACT_STATUS_OK, CONTRACT_STATUS_OI_FALLBACK, CONTRACT_STATUS_LEAP_FALLBACK, CONTRACT_STATUS_NEAR_LEAP_FALLBACK,
+                   CONTRACT_STATUS_NO_EXPIRATIONS,
                    CONTRACT_STATUS_NO_CALLS, CONTRACT_STATUS_NO_PUTS, CONTRACT_STATUS_GREEKS_FAIL,
                    CONTRACT_STATUS_IV_FAIL, CONTRACT_STATUS_LIQUIDITY_FAIL, CONTRACT_STATUS_NO_CHAIN]:
         count = status_counts.get(status, 0)
@@ -1181,7 +1462,7 @@ def fetch_contracts(df: pd.DataFrame, client: SchwabClient, expiry_intent: str =
     logger.info(f"   ⏰ No expirations in DTE window: {no_expirations} ({no_expirations/total*100:.1f}%)")
     
     # Liquidity breakdown (for available contracts)
-    ok_contracts = result_df[result_df['Contract_Status'].isin([CONTRACT_STATUS_OK, CONTRACT_STATUS_LEAP_FALLBACK, CONTRACT_STATUS_NEAR_LEAP_FALLBACK])]
+    ok_contracts = result_df[result_df['Contract_Status'].isin([CONTRACT_STATUS_OK, CONTRACT_STATUS_OI_FALLBACK, CONTRACT_STATUS_LEAP_FALLBACK, CONTRACT_STATUS_NEAR_LEAP_FALLBACK])]
     if len(ok_contracts) > 0:
         liquidity_counts = ok_contracts['Liquidity_Grade'].value_counts()
         logger.info(f"\n📊 Liquidity Grades (n={len(ok_contracts)}):")

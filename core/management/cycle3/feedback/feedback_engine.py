@@ -39,9 +39,11 @@ from core.management.cycle3.feedback.outcome_classifier import (
 
 logger = logging.getLogger(__name__)
 
-# Minimum sample size before a condition bucket generates a TIGHTEN/RELAX suggestion.
-# Below this, we show the data but label confidence = "INSUFFICIENT_SAMPLE".
-MIN_SAMPLE = 15
+# Staged sample thresholds for feedback calibration.
+# Partial signal at 5 trades (dampened by feedback_calibration.py consumer),
+# full signal at 15. Prevents months of zero calibration while accumulating.
+MIN_SAMPLE_PARTIAL = 5    # enough to classify direction
+MIN_SAMPLE_FULL = 15      # full confidence — original threshold
 
 # ── DDL ───────────────────────────────────────────────────────────────────────
 
@@ -428,15 +430,28 @@ def _record_closure(trade_id: str, con) -> None:
         gate_fired = gate_tag_from_doctrine_source(exit_doctrine_source_str)
 
         # ── Write closure record ──────────────────────────────────────────────
+        # Use named columns to avoid positional mismatch with ALTER TABLE'd schema
         con.execute("""
-            INSERT OR REPLACE INTO closed_trades VALUES (
+            INSERT OR REPLACE INTO closed_trades (
+                TradeID, Underlying_Ticker, Strategy,
+                Entry_TS, Entry_UL_Price, Entry_Premium, Entry_DTE,
+                Entry_MomentumState, Entry_IV_HV_Ratio, Entry_RSI, Entry_ROC20,
+                Entry_PCS, Entry_Action, Entry_Urgency,
+                Exit_TS, Exit_UL_Price, Exit_Premium, Exit_DTE,
+                Exit_Reason, Exit_Action,
+                PnL_Pct, PnL_Dollar, Days_Held, MFE_Pct, MAE_Pct,
+                Outcome_Type, Outcome_Emoji, Gate_Failed, Gate_Fired, Outcome_Note,
+                Exit_Signal_Followed, closed_at
+            ) VALUES (
                 ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?,
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?,
-                ?,
-                ?
+                ?, ?
             )
         """, [
             trade_id,
@@ -532,18 +547,18 @@ def _refresh_feedback_aggregates(con) -> None:
             label    = grp["_label"].iloc[0]
             strat    = str(grp["Strategy"].iloc[0] or "")
 
-            if n < MIN_SAMPLE:
+            if n < MIN_SAMPLE_PARTIAL:
                 suggested = "INSUFFICIENT_SAMPLE"
                 confidence = "INSUFFICIENT_SAMPLE"
             elif win_rate < 0.35 and avg_pnl < -0.10:
                 suggested  = "TIGHTEN"
-                confidence = "HIGH" if n >= 30 else "MEDIUM"
+                confidence = "HIGH" if n >= 30 else ("MEDIUM" if n >= MIN_SAMPLE_FULL else "LOW")
             elif win_rate > 0.70 and avg_pnl > 0.20:
                 suggested  = "REINFORCE"
-                confidence = "HIGH" if n >= 30 else "MEDIUM"
+                confidence = "HIGH" if n >= 30 else ("MEDIUM" if n >= MIN_SAMPLE_FULL else "LOW")
             else:
                 suggested  = "HOLD"
-                confidence = "MEDIUM" if n >= MIN_SAMPLE else "LOW"
+                confidence = "MEDIUM" if n >= MIN_SAMPLE_FULL else "LOW"
 
             rows.append({
                 "condition_key":    key,

@@ -58,6 +58,8 @@ def _score_delta(row: pd.Series) -> Tuple[float, str]:
 
     try:
         abs_d = abs(float(delta))
+        if abs_d >= 998:  # Schwab sentinel (-999) or implausible value
+            return 0.0, "Delta invalid (Schwab sentinel -999) (0/25)"
     except (TypeError, ValueError):
         return 0.0, "Delta missing (0/25)"
 
@@ -74,26 +76,49 @@ def _score_delta(row: pd.Series) -> Tuple[float, str]:
         else:
             return 2.0,  f"Delta {abs_d:.2f} — too OTM for LEAP (2/25)"
     else:
-        # Standard directional: sweet spot 0.30–0.65
-        # 0.65–0.75 = still fine (strong trend continuation)
-        # >0.75 = deep ITM, poor leverage for premium paid
-        if 0.30 <= abs_d <= 0.65:
-            return 25.0, f"Delta {abs_d:.2f} — sweet spot (25/25)"
-        elif 0.65 < abs_d <= 0.75:
-            # Mild fade — still useful in strong trend
-            pts = 25.0 - (abs_d - 0.65) / 0.10 * 8   # 25 → 17 linearly
-            return round(pts, 1), f"Delta {abs_d:.2f} — high but valid in strong trend ({pts:.0f}/25)"
-        elif 0.75 < abs_d <= 0.85:
-            pts = 17.0 - (abs_d - 0.75) / 0.10 * 12  # 17 → 5
-            return round(max(5.0, pts), 1), f"Delta {abs_d:.2f} — deep ITM, low leverage ({max(5, int(pts))}/25)"
-        elif abs_d > 0.85:
-            return 3.0,  f"Delta {abs_d:.2f} — deep ITM, synthetic stock risk (3/25)"
-        elif 0.20 <= abs_d < 0.30:
-            # Linear fade from 0 at 0.20 to 25 at 0.30
-            pts = (abs_d - 0.20) / 0.10 * 25
-            return round(pts, 1), f"Delta {abs_d:.2f} — low conviction OTM ({pts:.0f}/25)"
+        _is_directional = any(k in strategy for k in ('long call', 'long put'))
+
+        if _is_directional:
+            # Passarelli Ch.4: directional strategies need delta >= 0.45
+            # for meaningful P&L capture on the underlying move.
+            # 0.45–0.65: sweet spot for directional exposure
+            # 0.30–0.45: acceptable but sub-optimal — partial credit
+            if 0.45 <= abs_d <= 0.65:
+                return 25.0, f"Delta {abs_d:.2f} — directional sweet spot (25/25)"
+            elif 0.30 <= abs_d < 0.45:
+                # Linear 12 → 25 over 0.30 → 0.45
+                pts = 12.0 + (abs_d - 0.30) / 0.15 * 13
+                return round(pts, 1), f"Delta {abs_d:.2f} — low for directional ({pts:.0f}/25)"
+            elif 0.65 < abs_d <= 0.75:
+                pts = 25.0 - (abs_d - 0.65) / 0.10 * 8
+                return round(pts, 1), f"Delta {abs_d:.2f} — high but valid in strong trend ({pts:.0f}/25)"
+            elif 0.75 < abs_d <= 0.85:
+                pts = 17.0 - (abs_d - 0.75) / 0.10 * 12
+                return round(max(5.0, pts), 1), f"Delta {abs_d:.2f} — deep ITM, low leverage ({max(5, int(pts))}/25)"
+            elif abs_d > 0.85:
+                return 3.0, f"Delta {abs_d:.2f} — deep ITM, synthetic stock risk (3/25)"
+            elif 0.20 <= abs_d < 0.30:
+                pts = (abs_d - 0.20) / 0.10 * 12
+                return round(pts, 1), f"Delta {abs_d:.2f} — low conviction OTM ({pts:.0f}/25)"
+            else:
+                return 0.0, f"Delta {abs_d:.2f} — deep OTM lottery ticket (0/25)"
         else:
-            return 0.0,  f"Delta {abs_d:.2f} — deep OTM lottery ticket (0/25)"
+            # Non-directional (income, spreads, etc.): sweet spot 0.30–0.65
+            if 0.30 <= abs_d <= 0.65:
+                return 25.0, f"Delta {abs_d:.2f} — sweet spot (25/25)"
+            elif 0.65 < abs_d <= 0.75:
+                pts = 25.0 - (abs_d - 0.65) / 0.10 * 8
+                return round(pts, 1), f"Delta {abs_d:.2f} — high but valid in strong trend ({pts:.0f}/25)"
+            elif 0.75 < abs_d <= 0.85:
+                pts = 17.0 - (abs_d - 0.75) / 0.10 * 12
+                return round(max(5.0, pts), 1), f"Delta {abs_d:.2f} — deep ITM, low leverage ({max(5, int(pts))}/25)"
+            elif abs_d > 0.85:
+                return 3.0, f"Delta {abs_d:.2f} — deep ITM, synthetic stock risk (3/25)"
+            elif 0.20 <= abs_d < 0.30:
+                pts = (abs_d - 0.20) / 0.10 * 25
+                return round(pts, 1), f"Delta {abs_d:.2f} — low conviction OTM ({pts:.0f}/25)"
+            else:
+                return 0.0, f"Delta {abs_d:.2f} — deep OTM lottery ticket (0/25)"
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +159,7 @@ def _score_iv_timing(row: pd.Series) -> Tuple[float, str]:
             else:
                 return 4.0,  f"IV Rank {rank_f:.0f} — rich, expect smaller move (4/20)"
         except (TypeError, ValueError):
-            return 10.0, "No IV timing data — neutral (10/20)"
+            return 0.0, "No IV timing data — cannot assess entry timing (0/20)"
 
     # Gap-based: negative = IV < HV = cheap for buyers
     if gap_f <= -15:
@@ -172,7 +197,7 @@ def _score_spread(row: pd.Series) -> Tuple[float, str]:
         try:
             spread_pct = float(row.get('Bid_Ask_Spread_Pct'))
         except (TypeError, ValueError):
-            return 10.0, "No spread data — neutral (10/20)"
+            return 0.0, "No spread data — cannot assess execution friction (0/20)"
 
     if spread_pct <= 2.0:
         return 20.0, f"Spread {spread_pct:.1f}% — institutional tight (20/20)"
@@ -275,7 +300,7 @@ def _score_trend(row: pd.Series) -> Tuple[float, str]:
 
     # ── MACD (8 pts) ──────────────────────────────────────────────────────────
     try:
-        macd = float(row.get('MACD', 0) or 0)
+        macd = float(row.get('MACD') or np.nan)
         if is_bearish:
             if macd < -1.0:
                 pts += 8.0; hits.append(f"MACD {macd:.2f} strongly bearish")
@@ -342,7 +367,7 @@ def _score_trend(row: pd.Series) -> Tuple[float, str]:
 
     # ── RSI (7 pts) ───────────────────────────────────────────────────────────
     try:
-        rsi = float(row.get('RSI', 50) or 50)
+        rsi = float(row.get('RSI') or np.nan)
         if is_bearish:
             if rsi < 40:
                 pts += 7.0; hits.append(f"RSI {rsi:.0f} oversold — put timing good")

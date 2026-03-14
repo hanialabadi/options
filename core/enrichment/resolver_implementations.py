@@ -41,19 +41,13 @@ def resolve_iv_history_from_db(
     This is the fastest resolver - reads from local cache.
     Returns iv_history_count and IV_Maturity_State.
     """
-    from core.shared.data_layer.iv_term_history import get_iv_history_db_path
-    import duckdb
+    from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
 
     results = {}
-    db_path = get_iv_history_db_path()
-
-    if not db_path.exists():
-        logger.warning(f"IV history database not found at {db_path}")
-        return results
 
     con = None
     try:
-        con = duckdb.connect(str(db_path), read_only=True)
+        con = get_domain_connection(DbDomain.IV_HISTORY, read_only=True)
 
         # Batch query for all tickers
         placeholders = ', '.join([f"'{t.upper()}'" for t in tickers])
@@ -61,6 +55,7 @@ def resolve_iv_history_from_db(
             SELECT UPPER(ticker) as ticker, COUNT(DISTINCT date) as history_days
             FROM iv_term_history
             WHERE UPPER(ticker) IN ({placeholders})
+              AND iv_30d IS NOT NULL
             GROUP BY UPPER(ticker)
         """
         df = con.execute(query).fetchdf()
@@ -109,7 +104,7 @@ def resolve_iv_history_from_fidelity(
 
     NOTE: The actual scraping may happen asynchronously.
     """
-    from core.shared.data_layer.duckdb_utils import get_duckdb_connection, PIPELINE_DB_PATH
+    from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
 
     results = {}
 
@@ -144,7 +139,7 @@ def resolve_iv_history_from_fidelity(
 
     # Check what's already in the Fidelity cache
     try:
-        con = get_duckdb_connection(str(PIPELINE_DB_PATH))
+        con = get_domain_connection(DbDomain.PIPELINE, read_only=True)
 
         # GUARD: Check if fidelity_iv_long_term_history table exists
         table_exists = con.execute("""
@@ -206,14 +201,12 @@ def resolve_iv_rank_from_cache(
     Returns IV_Rank_30D from the latest available iv_term_history rows
     for each ticker. Requires >= 30 days of history.
     """
-    from core.shared.data_layer.iv_term_history import get_iv_history_db_path
-    import duckdb
+    from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
 
     results = {}
 
     try:
-        db_path = get_iv_history_db_path()
-        con = duckdb.connect(str(db_path), read_only=True)
+        con = get_domain_connection(DbDomain.IV_HISTORY, read_only=True)
 
         placeholders = ", ".join([f"'{t.upper()}'" for t in tickers])
         df = con.execute(f"""
@@ -271,27 +264,13 @@ def resolve_iv_rank_compute(
     Informational-only fields (clearly labeled) are provided for context,
     but NEVER used for execution eligibility.
     """
-    from core.shared.data_layer.iv_term_history import get_iv_history_db_path
-    import duckdb
+    from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
 
     results = {}
-    db_path = get_iv_history_db_path()
-
-    if not db_path.exists():
-        logger.warning(f"IV history database not found at {db_path}")
-        # Return explicit UNAVAILABLE for all tickers
-        for ticker in tickers:
-            results[ticker] = {
-                'IV_Rank_Computed': None,  # Advisory-only, not canonical
-                'IV_Rank_Status': 'UNAVAILABLE',
-                'IV_Rank_Reason': 'No IV history database',
-                'iv_history_count': 0,
-            }
-        return results
 
     con = None
     try:
-        con = duckdb.connect(str(db_path), read_only=True)
+        con = get_domain_connection(DbDomain.IV_HISTORY, read_only=True)
 
         for ticker in tickers:
             try:

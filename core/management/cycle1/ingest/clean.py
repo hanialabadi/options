@@ -14,6 +14,30 @@ logger = logging.getLogger(__name__) # Initialize logger
 # Canonical input path (future-proof for multi-broker support)
 CANONICAL_INPUT_PATH = PROJECT_ROOT / "data" / "brokerage_inputs" / "fidelity_positions.csv"
 CANONICAL_SNAPSHOT_DIR = PROJECT_ROOT / "data" / "snapshots" / "phase1"
+BROKERAGE_INPUTS_DIR = PROJECT_ROOT / "data" / "brokerage_inputs"
+
+
+def auto_detect_latest_positions(search_dir: Path = None) -> Path:
+    """
+    Find the newest Fidelity positions CSV by modification time.
+
+    Scans for Positions_All_Account*.csv and Positions_Live_*.csv patterns.
+    Falls back to CANONICAL_INPUT_PATH (symlink) if no candidates found.
+
+    RAG: Natenberg Ch.8 — stale data during event windows is catastrophic.
+    """
+    search_dir = search_dir or BROKERAGE_INPUTS_DIR
+    candidates = list(search_dir.glob("Positions_All_Account*.csv"))
+    candidates += list(search_dir.glob("Positions_Live_*.csv"))
+    if not candidates:
+        logger.warning(
+            f"[auto_detect] No position CSVs found in {search_dir}. "
+            f"Falling back to symlink: {CANONICAL_INPUT_PATH}"
+        )
+        return CANONICAL_INPUT_PATH
+    newest = max(candidates, key=lambda p: p.stat().st_mtime)
+    logger.info(f"[auto_detect] Latest positions CSV: {newest.name}")
+    return newest
 
 # File parsing constants
 FIDELITY_HEADER_ROWS = 2
@@ -105,9 +129,31 @@ def phase1_load_and_clean_positions(
     except Exception as e:
         logger.warning(f"⚠️  Warning: Could not extract header timestamp: {e}")
 
+    # --- Staleness Guard ---
+    # RAG: Natenberg Ch.8 — stale IV/price data during event windows is catastrophic.
+    # Passarelli Ch.6 — roll timing requires fresh Greeks.
+    _data_freshness = 'UNKNOWN'
+    _data_age_days = -1
+    if header_ts is not None:
+        try:
+            from core.shared.data_layer.market_time import trading_days_diff
+            from datetime import date
+            _data_age_days = trading_days_diff(header_ts.date(), date.today())
+            if _data_age_days > 2:
+                _data_freshness = 'STALE'
+                logger.warning(
+                    f"⚠️ STALENESS WARNING: Broker CSV is {_data_age_days} trading days old "
+                    f"(exported {header_ts}). Consider re-exporting from Fidelity."
+                )
+            else:
+                _data_freshness = 'FRESH'
+                logger.info(f"✅ CSV freshness: {_data_age_days} trading day(s) old — FRESH")
+        except Exception as _staleness_err:
+            logger.debug(f"Staleness check failed: {_staleness_err}")
+
     try:
-        # RAG: Smart Header Detection. 
-        # Fidelity raw exports have 2 metadata rows. 
+        # RAG: Smart Header Detection.
+        # Fidelity raw exports have 2 metadata rows.
         # If we are re-processing a cleaned file, we shouldn't skip.
         with open(input_path, 'r', encoding='utf-8-sig') as f:
             first_line = f.readline()
@@ -354,9 +400,16 @@ def phase1_load_and_clean_positions(
         df['Snapshot_TS'] = current_system_time
         print(f"✅ Using system time for Snapshot_TS: {current_system_time} (--allow-system-time).")
     elif 'As of Date/Time' in df.columns:
-        # Original logic for broker-derived timestamp
-        ts_series = df['As of Date/Time'].astype(str).str.replace(' ET', '', regex=False)
-        df['Snapshot_TS'] = pd.to_datetime(ts_series, format='%m-%d-%Y %I:%M:%S %p', errors='coerce')
+        # If the early timestamp conversion (line 152) already parsed this column,
+        # use the datetime values directly. Otherwise, parse from raw string.
+        if pd.api.types.is_datetime64_any_dtype(df['As of Date/Time']):
+            df['Snapshot_TS'] = df['As of Date/Time']
+        else:
+            ts_series = (df['As of Date/Time'].astype(str)
+                         .str.replace(' ET', '', regex=False)
+                         .str.replace(' at ', ' ', regex=False)
+                         .str.replace('/', '-', regex=False))
+            df['Snapshot_TS'] = pd.to_datetime(ts_series, format='%m-%d-%Y %I:%M:%S %p', errors='coerce')
 
         # Fallback to header_ts for missing values before failing
         if header_ts is not None:
@@ -396,7 +449,7 @@ def phase1_load_and_clean_positions(
     df = df[CYCLE1_WHITELIST + ['Snapshot_TS', 'AssetType', 'Underlying_Ticker', 'Premium']].copy()
 
     # Canonicalize column names: space → underscore for Fidelity columns that pipeline expects
-    _col_renames = {c: c.replace(' ', '_') for c in ['Open Int', 'Intrinsic Val', 'Time Val'] if c in df.columns}
+    _col_renames = {c: c.replace(' ', '_') for c in ['Open Int', 'Intrinsic Val', 'Time Val', 'Earnings Date'] if c in df.columns}
     if _col_renames:
         df = df.rename(columns=_col_renames)
 
@@ -412,6 +465,15 @@ def phase1_load_and_clean_positions(
         
         df.to_csv(snapshot_path, index=False)
         print(f"💾 Snapshot: {snapshot_path}")
+
+    # Data freshness + provenance stamps (flow into management_recommendations time-series)
+    df['Data_Freshness'] = _data_freshness
+    df['Data_Age_Trading_Days'] = _data_age_days
+    df['Greeks_Source'] = 'broker_csv'  # default — overwritten by LiveGreeksProvider later
+    if header_ts is not None:
+        df['Greeks_TS'] = header_ts.isoformat()
+    else:
+        df['Greeks_TS'] = None
 
     # Summary
     print(f"✅ Phase 1 complete: {len(df)} positions, {len(df.columns)} columns")

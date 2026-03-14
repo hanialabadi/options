@@ -68,10 +68,138 @@ from typing import Dict, Optional, Tuple
 import logging
 from .debug.debug_mode import get_debug_manager
 from core.shared.data_layer.market_stress_detector import check_market_stress, get_halt_reason
+from core.shared.data_layer.duckdb_utils import get_domain_connection, get_domain_write_connection, DbDomain
 from scan_engine.feedback_calibration import get_feedback_calibration
 from scan_engine.calendar_context import calendar_risk_flag
 
+# Layer 1 pure helpers — extracted to scan_engine/scoring/
+from .scoring.classifiers import (
+    operating_mode as _operating_mode,
+    dqs_confidence_band as _dqs_confidence_band,
+    classify_strategy_type,
+    assign_capital_bucket as _assign_capital_bucket,
+)
+from .scoring.bias_detectors import (
+    detect_directional_bias,
+    detect_structure_bias,
+    evaluate_timing_quality,
+)
+from .scoring.income_gates import check_income_eligibility
+from .scoring.filters import (
+    REGIME_STRATEGY_MATRIX,
+    lookup_regime_fit,
+    filter_ready_contracts,
+    sort_by_confidence,
+)
+from .scoring.thesis_quality import check_thesis_quality
+
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# R4.2–R4.5: Post-gate demotion sweep (runs AFTER per-row gate)
+# ============================================================
+# Extracted as a standalone function so pipeline.py can call it
+# regardless of whether it uses apply_acceptance_logic() or the
+# direct .apply(apply_execution_gate, ...) path.
+
+def apply_post_gate_demotions(df_result: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply R4.2–R4.5 demotion gates on a DataFrame that already has
+    Execution_Status assigned by the per-row execution gate.
+
+    These catch structural issues that individual row evaluation cannot see
+    (e.g., evaluator verdict overrides, DQS floor, regime conflicts).
+
+    Modifies df_result in-place and returns it.
+    """
+    # ── R4.2: Evaluator Verdict Gate ──
+    _eval_demoted = 0
+    _ready_with_eval = df_result[
+        (df_result['Execution_Status'] == 'READY') &
+        df_result['Evaluation_Notes'].fillna('').str.contains('Fails', case=False, na=False)
+    ].index if 'Evaluation_Notes' in df_result.columns else []
+
+    for idx in _ready_with_eval:
+        _eval_notes = str(df_result.at[idx, 'Evaluation_Notes'] or '')
+        _orig_gate = str(df_result.at[idx, 'Gate_Reason'] or '')
+        df_result.at[idx, 'Execution_Status'] = 'CONDITIONAL'
+        df_result.at[idx, 'Gate_Reason'] = (
+            f'R4.2: Evaluator verdict — {_eval_notes[:120]} '
+            f'[original: {_orig_gate}]'
+        )
+        _eval_demoted += 1
+    if _eval_demoted > 0:
+        logger.info(f"[R4.2] Evaluator verdict gate: demoted {_eval_demoted} READY→CONDITIONAL")
+
+    # ── R4.3: Effective DQS Floor ──
+    _DQS_READY_FLOOR = 45.0
+    _dqs_demoted = 0
+    if 'DQS_Score' in df_result.columns:
+        _ready_with_dqs = df_result[
+            (df_result['Execution_Status'] == 'READY') &
+            (df_result['DQS_Score'].fillna(0.0) < _DQS_READY_FLOOR)
+        ].index
+        for idx in _ready_with_dqs:
+            _dqs_val = float(df_result.at[idx, 'DQS_Score'])
+            _mult_val = float(df_result.at[idx, 'DQS_Combined_Multiplier']) if pd.notna(df_result.at[idx, 'DQS_Combined_Multiplier']) else 1.0
+            _orig_gate = str(df_result.at[idx, 'Gate_Reason'] or '')
+            df_result.at[idx, 'Execution_Status'] = 'CONDITIONAL'
+            df_result.at[idx, 'Gate_Reason'] = (
+                f'R4.3: DQS={_dqs_val:.0f} below floor {_DQS_READY_FLOOR:.0f} '
+                f'(combined mult={_mult_val:.2f}) — quality eroded below READY threshold '
+                f'[original: {_orig_gate}]'
+            )
+            _dqs_demoted += 1
+        if _dqs_demoted > 0:
+            logger.info(f"[R4.3] Effective DQS floor: demoted {_dqs_demoted} READY→CONDITIONAL")
+
+    # ── R4.4: Income in Downtrend ──
+    _income_trend_demoted = 0
+    _ready_income = df_result[
+        (df_result['Execution_Status'] == 'READY') &
+        (df_result['Strategy_Type'].fillna('').str.upper() == 'INCOME') &
+        (df_result['Market_Structure'].fillna('') == 'Downtrend')
+    ].index if ('Strategy_Type' in df_result.columns and 'Market_Structure' in df_result.columns) else []
+
+    for idx in _ready_income:
+        _orig_gate = str(df_result.at[idx, 'Gate_Reason'] or '')
+        df_result.at[idx, 'Execution_Status'] = 'CONDITIONAL'
+        df_result.at[idx, 'Gate_Reason'] = (
+            f'R4.4: Income strategy in Downtrend — selling premium against the trend '
+            f'increases assignment risk (Murphy Ch.4) [original: {_orig_gate}]'
+        )
+        _income_trend_demoted += 1
+    if _income_trend_demoted > 0:
+        logger.info(f"[R4.4] Income in Downtrend: demoted {_income_trend_demoted} READY→CONDITIONAL")
+
+    # ── R4.5: Oversold Chasing Gate ──
+    _chase_demoted = 0
+    _ready_bearish = df_result[
+        (df_result['Execution_Status'] == 'READY') &
+        (df_result['Trade_Bias'].fillna('').str.upper().str.contains('BEAR', na=False))
+    ].index if 'Trade_Bias' in df_result.columns else []
+
+    for idx in _ready_bearish:
+        _rsi = pd.to_numeric(df_result.at[idx, 'RSI'] if 'RSI' in df_result.columns else None, errors='coerce')
+        _bb = pd.to_numeric(df_result.at[idx, 'BB_Position'] if 'BB_Position' in df_result.columns else None, errors='coerce')
+        _rsi_div = str(df_result.at[idx, 'RSI_Divergence'] if 'RSI_Divergence' in df_result.columns else '')
+
+        if (pd.notna(_rsi) and _rsi < 30
+                and pd.notna(_bb) and _bb < 15
+                and 'bullish' in _rsi_div.lower()):
+            _orig_gate = str(df_result.at[idx, 'Gate_Reason'] or '')
+            df_result.at[idx, 'Execution_Status'] = 'CONDITIONAL'
+            df_result.at[idx, 'Gate_Reason'] = (
+                f'R4.5: Oversold chasing — RSI={_rsi:.0f}, BB={_bb:.0f}% with '
+                f'bullish divergence signals mean-reversion risk (Murphy Ch.9) '
+                f'[original: {_orig_gate}]'
+            )
+            _chase_demoted += 1
+    if _chase_demoted > 0:
+        logger.info(f"[R4.5] Oversold chasing: demoted {_chase_demoted} READY→CONDITIONAL")
+
+    return df_result
 
 
 # ============================================================
@@ -103,10 +231,7 @@ def _check_portfolio_gate(ticker: str, strategy_name: str) -> dict:
         return result  # Not a directional long — Portfolio_Gate only applies to directional longs
 
     try:
-        import duckdb
-        _pipeline_db = os.path.join(os.path.dirname(__file__), '..', 'data', 'pipeline.duckdb')
-        _pipeline_db = os.path.abspath(_pipeline_db)
-        con = duckdb.connect(_pipeline_db, read_only=True)
+        con = get_domain_connection(DbDomain.MANAGEMENT, read_only=True)
 
         # Find option positions for this underlying that match direction
         # Symbol convention: e.g. APH260417C160 (Call=bullish, Put=bearish)
@@ -142,345 +267,510 @@ def _check_portfolio_gate(ticker: str, strategy_name: str) -> dict:
 
 
 # ============================================================
-# STRATEGY TYPE CLASSIFICATION
+# STRATEGY TYPE CLASSIFICATION + SIGNAL DETECTION + INCOME GATES
+# Extracted to scan_engine/scoring/ (Layer 1 pure helpers).
+# Imported at top of file. Original functions preserved as imports.
 # ============================================================
 
-def _operating_mode(iv_maturity_level: int) -> str:
-    """
-    Returns a human-readable Operating_Mode tag that makes the IV data context
-    explicit in every READY/CONDITIONAL row.  Prevents the implicit 'CHART_DRIVEN'
-    fallback from being invisible in the output.
 
-    Level 1 (<20d): CHART_DRIVEN — no vol edge measurement possible
-    Level 2 (20-60d): CHART_DRIVEN — early IV, relative rank unreliable
-    Level 3 (60-120d): CHART_ASSISTED — partial IV context, rank directional only
-    Level 4 (120-180d): VOL_INFORMED — sufficient history for IV_Rank signals
-    Level 5 (180d+):  FULL_CONTEXT — mature surface, regime and rank trustworthy
+# ============================================================
+# DQS MULTIPLIER CHAIN — applied to all non-BLOCKED decisions
+# ============================================================
+
+def _apply_dqs_multiplier_chain(row: pd.Series, decision: Dict, iv_data_stale: bool = True) -> pd.Series:
     """
-    _map = {
-        1: "CHART_DRIVEN (IMMATURE: <20d IV history — no vol edge measurement)",
-        2: "CHART_DRIVEN (EARLY: 20-60d IV history — chart signals primary)",
-        3: "CHART_ASSISTED (PARTIAL: 60-120d IV history — IV rank directional only)",
-        4: "VOL_INFORMED (DEVELOPING: 120-180d IV history — IV_Rank valid)",
-        5: "FULL_CONTEXT (MATURE: 180d+ IV history — full vol surface available)",
+    Apply Calendar DQS, Signal Trajectory, and Multiplier Clamp to any decision.
+
+    Modifies ``decision`` in place and returns the (potentially updated) ``row``.
+    Safe to call from any gate path — reads all inputs from row/decision.
+    """
+    # ── Calendar DQS Multiplier ──────────────────────────────────────────────
+    _strat_name = str(row.get('Strategy_Name', '') or row.get('Strategy', '') or '').upper().replace('_', ' ')
+    _cal_flag, _cal_note = calendar_risk_flag(_strat_name)
+
+    _CAL_BASE_EFFECT = {
+        'HIGH_BLEED': -0.15,
+        'ELEVATED_BLEED': -0.10,
+        'PRE_HOLIDAY_EDGE': 0.08,
+        'ADVANTAGEOUS': 0.05,
     }
-    return _map.get(int(iv_maturity_level) if iv_maturity_level else 1,
-                    "CHART_DRIVEN (IMMATURE: <20d IV history — no vol edge measurement)")
+    _cal_base = _CAL_BASE_EFFECT.get(_cal_flag, 0.0)
+    _cal_dte_raw = pd.to_numeric(row.get('Actual_DTE') or row.get('DTE'), errors='coerce')
+    _cal_dte = float(_cal_dte_raw) if pd.notna(_cal_dte_raw) and _cal_dte_raw > 0 else 0.0
+    _cal_theta_factor = min(1.0, 45.0 / _cal_dte) if _cal_dte > 0 else 1.0
+    _cal_dqs_multiplier = 1.0 + (_cal_base * _cal_theta_factor)
 
-
-def _dqs_confidence_band(dqs_score, max_band: str = 'MEDIUM') -> str:
-    """
-    Translate a DQS_Score (0-100) into a confidence_band, capped at max_band.
-
-    Tiers mirror the DQS_Status thresholds:
-        DQS >= 75 (Strong)   → MEDIUM  (or HIGH if max_band allows)
-        DQS 50-74 (Eligible) → LOW
-        DQS < 50 (Weak)      → LOW
-
-    max_band: enforced ceiling — R2.3a (Acceptable liq) caps at MEDIUM,
-              R3.1/R3.2 (Good/Excellent liq) may allow HIGH.
-    """
-    try:
-        dqs = float(dqs_score) if dqs_score is not None and pd.notna(dqs_score) else 0.0
-    except (TypeError, ValueError):
-        dqs = 0.0
-
-    if dqs >= 75:
-        raw = 'HIGH'   # Strong setup — ceiling applied by max_band
-    else:
-        raw = 'LOW'    # Eligible (50-74) or Weak (<50) → LOW before ceiling
-
-    # Apply ceiling
-    _order = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2}
-    cap = _order.get(max_band, 2)
-    if _order.get(raw, 0) > cap:
-        return max_band
-    return raw
-
-
-def classify_strategy_type(strategy_name: str) -> str:
-    """
-    Classify strategy into DIRECTIONAL, INCOME, or VOLATILITY.
-    
-    Args:
-        strategy_name: Strategy name from Step 11
-        
-    Returns:
-        'DIRECTIONAL' | 'INCOME' | 'VOLATILITY' | 'UNKNOWN'
-    """
-    strategy_name_lower = strategy_name.lower()
-    
-    # Import re for regular expression matching
-    import re
-
-    # Income strategies (premium collection) - Prioritize these first
-    # Use word boundaries (\b) to ensure whole word matching
-    income_keywords = [r'\bcovered call\b', r'\bnaked put\b', r'\bcsp\b',
-                      r'\bbull put spread\b', r'\bbear call spread\b', r'\bcredit spread\b', r'\biron condor\b', r'\bbuy-write\b', r'\bcash-secured put\b']
-    
-    # Directional strategies (long/short bias)
-    directional_keywords = [r'\blong call\b', r'\blong put\b', r'\bleap call\b', r'\bleap put\b',
-                           r'\bbull call spread\b', r'\bbear put spread\b',
-                           r'\bcall debit spread\b', r'\bput debit spread\b', r'\bvertical spread\b']
-    
-    # Volatility strategies (non-directional)
-    volatility_keywords = [r'\bstraddle\b', r'\bstrangle\b', r'\bbutterfly\b', r'\bcondor\b']
-    
-    # Prioritize more specific classifications first, or ensure keywords are distinct
-    for keyword_regex in income_keywords:
-        if re.search(keyword_regex, strategy_name_lower):
-            return 'INCOME'
-            
-    for keyword_regex in directional_keywords:
-        if re.search(keyword_regex, strategy_name_lower):
-            return 'DIRECTIONAL'
-    
-    for keyword_regex in volatility_keywords:
-        if re.search(keyword_regex, strategy_name_lower):
-            return 'VOLATILITY'
-    
-    return 'UNKNOWN'
-
-
-def _assign_capital_bucket(strategy_type: str, dte, strategy_name: str) -> str:
-    """
-    Assign Capital_Bucket based on time horizon + structure type.
-
-    TACTICAL:  short-dated directional (DTE <= 60) or volatility strategies
-    STRATEGIC: LEAPS or long-dated directional (DTE > 60)
-    DEFENSIVE: income strategies (CSP, BW, CC, credit spreads)
-    """
-    import math
-    sn = (strategy_name or "").lower()
-    # LEAP keyword overrides DTE — always STRATEGIC
-    if "leap" in sn:
-        return "STRATEGIC"
-    if strategy_type == "DIRECTIONAL":
-        try:
-            dte_f = float(dte)
-            if math.isnan(dte_f):
-                dte_f = 45.0
-        except (TypeError, ValueError):
-            dte_f = 45.0
-        return "STRATEGIC" if dte_f > 60 else "TACTICAL"
-    if strategy_type == "INCOME":
-        return "DEFENSIVE"
-    if strategy_type == "VOLATILITY":
-        return "TACTICAL"
-    return "TACTICAL"  # fallback
-
-
-# ============================================================
-# PHASE 1 SIGNAL DETECTION
-# ============================================================
-
-def detect_directional_bias(momentum: str, regime_52w: str, gap: str, timing: str,
-                             ema_signal: str = 'UNKNOWN', trend_state: str = 'UNKNOWN',
-                             rsi: float = None, macd: float = None) -> str:
-    """
-    Detect bullish/bearish/neutral bias from chart + Phase 1 signals.
-
-    Primary signals (chart): EMA signal, Trend_State, RSI, MACD
-    Secondary signals (price structure): momentum_tag, 52w_regime
-
-    Returns:
-        'BULLISH_STRONG' | 'BULLISH_MODERATE' | 'BEARISH_STRONG' |
-        'BEARISH_MODERATE' | 'NEUTRAL'
-    """
-    # Normalise
-    ema_upper   = str(ema_signal).upper()
-    trend_upper = str(trend_state).upper()
-
-    bearish_chart = ema_upper in ('BEARISH', 'BEARISH_CROSS') or trend_upper == 'BEARISH'
-    bullish_chart = ema_upper in ('BULLISH', 'BULLISH_CROSS') or trend_upper == 'BULLISH'
-
-    # RSI & MACD directional tilt
-    rsi_bearish = rsi is not None and not pd.isna(rsi) and float(rsi) < 45
-    rsi_bullish = rsi is not None and not pd.isna(rsi) and float(rsi) > 55
-    macd_bearish = macd is not None and not pd.isna(macd) and float(macd) < 0
-    macd_bullish = macd is not None and not pd.isna(macd) and float(macd) > 0
-
-    bearish_score = sum([bearish_chart, rsi_bearish, macd_bearish,
-                         momentum == 'STRONG_DOWN_DAY'])
-    bullish_score = sum([bullish_chart, rsi_bullish, macd_bullish,
-                         momentum == 'STRONG_UP_DAY'])
-
-    # Strong signals: chart + 2 confirmations
-    if bearish_chart and bearish_score >= 3:
-        return 'BEARISH_STRONG'
-    if bullish_chart and bullish_score >= 3:
-        return 'BULLISH_STRONG'
-
-    # Moderate: chart signal present
-    if bearish_chart and bearish_score >= 1:
-        return 'BEARISH_MODERATE'
-    if bullish_chart and bullish_score >= 1:
-        return 'BULLISH_MODERATE'
-
-    # Fallback: price-structure only (no clear chart signal)
-    if momentum == 'STRONG_DOWN_DAY' and regime_52w in ['NEAR_52W_HIGH', 'MID_RANGE']:
-        return 'BEARISH_MODERATE'
-    if momentum == 'STRONG_UP_DAY' and regime_52w in ['NEAR_52W_LOW', 'MID_RANGE']:
-        return 'BULLISH_MODERATE'
-
-    return 'NEUTRAL'
-
-
-def detect_structure_bias(compression: str, regime_52w: str, momentum: str) -> str:
-    """
-    Detect range-bound vs trending vs breakout structure.
-    
-    Returns:
-        'RANGE_BOUND' | 'TRENDING' | 'BREAKOUT_SETUP' | 'BREAKOUT_TRIGGERED' | 'UNCLEAR'
-    """
-    # Range-bound (compression with low momentum)
-    if (compression in ['COMPRESSION', 'NORMAL'] and
-        regime_52w == 'MID_RANGE' and
-        momentum in ['FLAT_DAY', 'NORMAL']):
-        return 'RANGE_BOUND'
-    
-    # Trending (strong momentum with normal/expansion)
-    elif (momentum in ['STRONG_UP_DAY', 'STRONG_DOWN_DAY'] and
-          compression in ['NORMAL', 'EXPANSION']):
-        return 'TRENDING'
-    
-    # Breakout setup (compressed + flat, waiting for catalyst)
-    elif compression == 'COMPRESSION' and momentum in ['NORMAL', 'FLAT_DAY']:
-        return 'BREAKOUT_SETUP'
-    
-    # Breakout triggered (compressed + strong move)
-    elif compression == 'COMPRESSION' and momentum in ['STRONG_UP_DAY', 'STRONG_DOWN_DAY']:
-        return 'BREAKOUT_TRIGGERED'
-    
-    else:
-        return 'UNCLEAR'
-
-
-def evaluate_timing_quality(timing: str, intraday_pos: str, gap: str, momentum: str) -> str:
-    """
-    Evaluate entry timing quality.
-    
-    Returns:
-        'EXCELLENT' | 'GOOD' | 'FAIR' | 'POOR' | 'MODERATE'
-    """
-    # Excellent timing (early entry, no gap, pullback)
-    if timing in ['EARLY_LONG', 'EARLY_SHORT'] and gap == 'NO_GAP':
-        return 'EXCELLENT'
-    
-    # Good timing (moderate entry, mid-range)
-    elif timing == 'MODERATE' and intraday_pos == 'MID_RANGE':
-        return 'GOOD'
-    
-    # Fair timing (late entry but normal momentum)
-    elif timing in ['LATE_LONG', 'LATE_SHORT'] and momentum == 'NORMAL':
-        return 'FAIR'
-    
-    # Poor timing (late entry + gap + strong momentum = extended)
-    elif timing in ['LATE_LONG', 'LATE_SHORT'] and gap in ['GAP_UP', 'GAP_DOWN']:
-        return 'POOR'
-    
-    else:
-        return 'MODERATE'
-
-
-# ============================================================
-# INCOME ELIGIBILITY — VOLATILITY EDGE CHECKLIST
-# ============================================================
-
-def check_income_eligibility(row: pd.Series, actual_dte: float) -> Tuple[bool, str]:
-    """
-    Determine whether an income strategy (CSP / Covered Call / Buy-Write) has
-    a genuine volatility edge to sell premium.
-
-    Does NOT require 120+ days of IV history. Requires:
-      1. IV > HV  — there is premium to sell (gap_30d > 0)
-      2. IV not at the bottom of its recent distribution — rank > 30 OR gap large enough
-      3. Term structure supports near-term selling — Surface_Shape not inverted,
-         OR inverted with a large gap (>10 pts) as compensation
-      4. No earnings event inside the trade window
-
-    Returns:
-        (eligible: bool, reason: str)
-    """
-    gap_30d       = row.get('IVHV_gap_30D', None)
-    iv_rank_20d   = row.get('IV_Rank_20D', None)
-    iv_rank_30d   = row.get('IV_Rank_30D', None)   # BUG 2 FIX: also check 30D rank
-    surface_shape = str(row.get('Surface_Shape', '') or '').upper()
-    days_to_earn  = row.get('days_to_earnings', None)
-    iv_hist       = row.get('IV_History_Count', 0) or 0
-
-    # ── Condition 1: IV > HV (gap must be positive to sell premium) ──────────
-    try:
-        gap = float(gap_30d)
-    except (TypeError, ValueError):
-        return False, 'BLOCK: IV vs HV gap unavailable — cannot confirm premium edge'
-
-    if gap <= 0:
-        return False, f'BLOCK: IV not elevated vs HV (gap_30d={gap:.1f}) — no premium edge'
-
-    # ── Condition 2: IV not at the floor of its distribution ────────────────
-    # BUG 2 FIX: Explicit NaN guards before every threshold comparison.
-    # Priority: IV_Rank_20D → IV_Rank_30D → gap fallback (if both NaN).
-    # In pandas, NaN > 25 = False, which would incorrectly block valid setups.
-    # Use the best available rank; fall back to gap proxy when both are NaN.
-    rank_20d_ok = iv_rank_20d is not None and pd.notna(iv_rank_20d)
-    rank_30d_ok = iv_rank_30d is not None and pd.notna(iv_rank_30d)
-
-    if rank_20d_ok:
-        rank = float(iv_rank_20d)
-        rank_src = 'IV_Rank_20D'
-        if rank < 25:
-            return False, f'BLOCK: IV Rank too low ({rank:.0f}/100) — IV near 20d floor, no edge'
-    elif rank_30d_ok:
-        rank = float(iv_rank_30d)
-        rank_src = 'IV_Rank_30D'
-        if rank < 25:
-            return False, f'BLOCK: IV Rank too low ({rank:.0f}/100, 30D) — IV near floor, no edge'
-    else:
-        # Both ranks are NaN (< ~20 days history) — require a larger raw gap as proxy.
-        # BUG 2: gap >= 8 is the explicit fallback condition that was previously unreachable
-        # when NaN comparisons silently evaluated to False.
-        if gap < 8:
-            return False, (
-                f'BLOCK: IV Rank unavailable ({int(iv_hist)}d history) and gap_30d too small '
-                f'({gap:.1f} pts) — insufficient evidence of elevation'
+    if _cal_dqs_multiplier != 1.0:
+        _pre_cal_dqs = row.get('DQS_Score')
+        if pd.notna(_pre_cal_dqs):
+            row = row.copy() if not isinstance(row, dict) else row.copy()
+            row['DQS_Score'] = float(_pre_cal_dqs) * _cal_dqs_multiplier
+            logger.debug(
+                f"  [CalendarDQS] {_strat_name}: DQS {float(_pre_cal_dqs):.0f} "
+                f"→ {float(row['DQS_Score']):.0f} (×{_cal_dqs_multiplier:.3f}, "
+                f"{_cal_flag}, θ_factor={_cal_theta_factor:.2f}, DTE={_cal_dte:.0f})"
             )
-        rank = None
-        rank_src = 'gap_proxy'
+    decision['Calendar_DQS_Multiplier'] = round(_cal_dqs_multiplier, 4)
+    decision['Calendar_Theta_Factor'] = round(_cal_theta_factor, 2)
+    decision['Calendar_Risk_Flag'] = _cal_flag
+    decision['Calendar_Risk_Note'] = _cal_note
 
-    # ── Condition 3: Term structure ───────────────────────────────────────────
-    # INVERTED surface = short-term IV spike (front > back). Bad for selling
-    # near-term premium — you'd be selling into an already-elevated front month.
-    # Waive if gap is very large (>10 pts): large absolute spread overrides shape concern.
-    if surface_shape == 'INVERTED' and gap <= 10:
-        return False, (
-            f'BLOCK: Inverted term structure (Surface_Shape=INVERTED) with moderate gap '
-            f'({gap:.1f} pts) — front IV spike makes premium selling risky'
-        )
+    # Calendar risk confidence cap (belt + suspenders alongside multiplier)
+    if _cal_flag in ('HIGH_BLEED',) and decision.get('confidence_band') == 'HIGH':
+        decision['confidence_band'] = 'MEDIUM'
+        _old_gr = decision.get('Gate_Reason', '')
+        decision['Gate_Reason'] = _old_gr + ' [calendar-capped: pre-holiday long premium entry]'
 
-    # ── Condition 4: Earnings inside the trade window ────────────────────────
-    try:
-        dte_earn = float(days_to_earn)
-        if dte_earn > 0:
-            # NaN actual_dte: cannot confirm earnings are outside window — block conservatively.
-            # NaN > 0 evaluates False in Python; explicit guard is required.
-            if actual_dte is None or (isinstance(actual_dte, float) and pd.isna(actual_dte)):
-                return False, (
-                    f'BLOCK: Earnings in {dte_earn:.0f}d but Actual_DTE unknown — '
-                    f'cannot confirm earnings are outside trade window'
+    # ── Signal Trajectory Multiplier ─────────────────────────────────────────
+    _traj_mult = 1.0
+    _traj_label = str(row.get('Signal_Trajectory') or 'UNKNOWN')
+    _traj_raw = row.get('Trajectory_Multiplier')
+    if _traj_raw is not None and pd.notna(_traj_raw):
+        try:
+            _traj_mult = float(_traj_raw)
+        except (TypeError, ValueError):
+            _traj_mult = 1.0
+
+    if _traj_mult != 1.0:
+        _pre_traj_dqs = row.get('DQS_Score')
+        if pd.notna(_pre_traj_dqs):
+            row = row.copy() if not isinstance(row, dict) else row.copy()
+            row['DQS_Score'] = float(_pre_traj_dqs) * _traj_mult
+            logger.debug(
+                f"  [Trajectory] {row.get('Ticker')}: DQS {float(_pre_traj_dqs):.0f} "
+                f"→ {float(row['DQS_Score']):.0f} (×{_traj_mult:.2f}, {_traj_label})"
+            )
+    decision['Signal_Trajectory'] = _traj_label
+    decision['Trajectory_Multiplier'] = round(_traj_mult, 4)
+    decision['Score_Acceleration'] = row.get('Score_Acceleration', 0.0)
+
+    # ── IV Headwind Multiplier (long vega only) ───────────────────────────────
+    # Natenberg: "If IV is high, look for negative vega spreads"
+    # Passarelli: "Buy with IV in the lower third of its range"
+    # Jabbour: "significant IV Crush" risk when buying at peak
+    #
+    # Macro-cluster attenuation (Sinclair: structural vol vs event premium):
+    # When macro_density ≥ 2 (e.g., CPI + FOMC within 14d), IV elevation is
+    # structural — crush is less likely because uncertainty persists across
+    # sequential events.  Attenuate penalty, don't remove it: IV is still
+    # expensive, but the floor is higher than post-earnings collapse.
+    _iv_hw_mult = 1.0
+    _iv_hw_note = ''
+    _long_vega_strats = ('LONG CALL', 'LONG PUT', 'LONG STRADDLE', 'LONG STRANGLE',
+                         'LONG CALL LEAP', 'LONG PUT LEAP')
+    _short_vega_strats = ('CASH SECURED PUT', 'COVERED CALL', 'BUY-WRITE',
+                          'SHORT PUT', 'SHORT CALL', 'IRON CONDOR')
+    if _strat_name in _long_vega_strats:
+        _ivr_raw = pd.to_numeric(row.get('IV_Rank_20D'), errors='coerce')
+        _gap_raw = pd.to_numeric(row.get('IVHV_gap_30D'), errors='coerce')
+        _surf    = str(row.get('Surface_Shape', '') or '').upper()
+        _ivr = float(_ivr_raw) if pd.notna(_ivr_raw) else None
+        _gap = float(_gap_raw) if pd.notna(_gap_raw) else 0.0
+
+        # Macro density: structural vol regime detection
+        # Use snapshot date from the row (not today) so tests are deterministic.
+        _macro_cluster = False
+        try:
+            from config.macro_calendar import get_macro_proximity
+            from datetime import date as _date_cls
+            _snap_raw = None
+            for _ts_col in ('snapshot_ts', 'Snapshot_TS', 'snapshot_date'):
+                _v = row.get(_ts_col)
+                if _v is not None and not (isinstance(_v, float) and pd.isna(_v)):
+                    _snap_raw = _v
+                    break
+            _snap_date = pd.to_datetime(_snap_raw).date() if _snap_raw is not None and pd.notna(_snap_raw) else _date_cls.today()
+            _macro_prox = get_macro_proximity(_snap_date)
+            _macro_cluster = _macro_prox.macro_density >= 2
+        except Exception:
+            pass
+
+        # Penalty: buying long vol at IV_Rank > 80 AND positive IV/HV gap
+        # Attenuated when macro clustering creates a structural vol floor
+        if _ivr is not None and _ivr > 80 and _gap > 5:
+            if _macro_cluster:
+                _iv_hw_mult *= 0.90
+                _iv_hw_note = f'IV_Rank {_ivr:.0f} + gap +{_gap:.1f}% (expensive vol, macro cluster → attenuated)'
+            else:
+                _iv_hw_mult *= 0.85
+                _iv_hw_note = f'IV_Rank {_ivr:.0f} + gap +{_gap:.1f}% (buying expensive vol)'
+        # Additional penalty: INVERTED surface = short-term fear spike
+        # Macro cluster attenuates: inversion may reflect event sequencing, not panic
+        if _ivr is not None and _ivr > 80 and _surf == 'INVERTED':
+            if _macro_cluster:
+                _iv_hw_mult *= 0.95
+                _iv_hw_note += ('; ' if _iv_hw_note else '') + 'INVERTED surface (macro cluster → attenuated)'
+            else:
+                _iv_hw_mult *= 0.90
+                _iv_hw_note += ('; ' if _iv_hw_note else '') + 'INVERTED surface (fear premium spike)'
+        # LEAP amplifier: LEAPs carry 2-3x vega — IV mean-reversion exposure amplified
+        # Natenberg: "The vega of a LEAP makes IV rank the single most important entry criterion"
+        if 'LEAP' in _strat_name and _ivr is not None and _ivr > 80:
+            _iv_hw_mult *= 0.90
+            _iv_hw_note += ('; ' if _iv_hw_note else '') + f'LEAP at IV_Rank {_ivr:.0f} (amplified vega risk)'
+
+        # Inverted surface LEAP bonus: buying cheap back-month vol on inverted term structure.
+        # Natenberg: inverted surface means front-month IV >> back-month IV. LEAP buyers purchase
+        # the cheap end of the curve — structural edge when surface normalizes.
+        # Narrowly scoped: only LEAP buyers, meaningful inversion, IV_Rank ≤ 60 (not expensive).
+        if 'LEAP' in _strat_name and _surf == 'INVERTED' and _ivr is not None and _ivr <= 60:
+            _iv_hw_mult *= 1.05
+            _iv_hw_note += ('; ' if _iv_hw_note else '') + f'INVERTED surface LEAP bonus (back-month IV cheap, IV_Rank {_ivr:.0f})'
+
+        if _iv_hw_mult != 1.0:
+            _pre_hw_dqs = row.get('DQS_Score')
+            if pd.notna(_pre_hw_dqs):
+                row = row.copy() if not isinstance(row, dict) else row.copy()
+                row['DQS_Score'] = float(_pre_hw_dqs) * _iv_hw_mult
+                logger.debug(
+                    f"  [IV_Headwind] {row.get('Ticker')}: DQS {float(_pre_hw_dqs):.0f} "
+                    f"→ {float(row['DQS_Score']):.0f} (×{_iv_hw_mult:.2f}, {_iv_hw_note})"
                 )
-            if dte_earn <= float(actual_dte):
-                return False, f'BLOCK: Earnings in {dte_earn:.0f}d inside trade window ({actual_dte:.0f} DTE) — binary risk'
-    except (TypeError, ValueError):
-        pass  # Unknown earnings date → proceed (don't block on missing data)
+    elif _strat_name in _short_vega_strats:
+        # Tailwind: selling vol at high IV is the sweet spot — no penalty (informational only)
+        _ivr_raw = pd.to_numeric(row.get('IV_Rank_20D'), errors='coerce')
+        _ivr = float(_ivr_raw) if pd.notna(_ivr_raw) else None
+        if _ivr is not None and _ivr > 80:
+            _iv_hw_note = f'IV_Rank {_ivr:.0f} — selling at premium (tailwind)'
 
-    # ── All conditions met ───────────────────────────────────────────────────
-    if rank is not None:
-        rank_str = f'{rank_src}={rank:.0f}'
-    else:
-        rank_str = f'gap_proxy={gap:.1f}pts'
-    shape_str = surface_shape if surface_shape else 'UNKNOWN'
-    return True, f'OK: gap_30d={gap:.1f}, {rank_str}, shape={shape_str}'
+    decision['IV_Headwind_Multiplier'] = round(_iv_hw_mult, 4)
+    decision['IV_Headwind_Note'] = _iv_hw_note
+
+    # ── Blind-Spot Multiplier (divergence, BB extremes, OBV conflict) ────────
+    # Penalizes directional trades where chart signals contradict the thesis.
+    # Annotation-only for Keltner squeeze (direction unknown until fired).
+    _bs_mult = 1.0
+    _bs_notes = []
+    _is_bullish_strat = _strat_name in ('LONG CALL', 'LONG CALL LEAP')
+    _is_bearish_strat = _strat_name in ('LONG PUT', 'LONG PUT LEAP')
+
+    if _is_bullish_strat or _is_bearish_strat:
+        _rsi_div = str(row.get('RSI_Divergence', '') or '')
+        _macd_div = str(row.get('MACD_Divergence', '') or '')
+
+        # Divergence opposing direction (Murphy Ch.10)
+        _div_count = 0
+        if _is_bullish_strat and _rsi_div == 'Bearish_Divergence':
+            _div_count += 1
+        if _is_bullish_strat and _macd_div == 'Bearish_Divergence':
+            _div_count += 1
+        if _is_bearish_strat and _rsi_div == 'Bullish_Divergence':
+            _div_count += 1
+        if _is_bearish_strat and _macd_div == 'Bullish_Divergence':
+            _div_count += 1
+
+        if _div_count >= 2:
+            _bs_mult *= 0.90
+            _bs_notes.append(f'Double divergence opposes direction (Murphy Ch.10: serious warning)')
+        elif _div_count == 1:
+            _bs_mult *= 0.95
+            _bs_notes.append(f'Divergence opposes direction (Murphy Ch.10)')
+
+        # BB extremes on directional entries (Murphy: overextended band touch)
+        # Trend-adjusted: ADX ≥ 40 = band-walking expected (Bollinger), skip penalty
+        #                 ADX 30-39 = trending, raise threshold to 90/10
+        #                 ADX < 30 = ranging, standard threshold 85/15
+        _bb = pd.to_numeric(row.get('BB_Position'), errors='coerce')
+        _adx_val = pd.to_numeric(row.get('ADX'), errors='coerce')
+        if pd.notna(_bb):
+            _bb_skip = pd.notna(_adx_val) and _adx_val >= 40  # Strong trend: band-walk
+            _bb_bull_thresh = 90 if (pd.notna(_adx_val) and _adx_val >= 30) else 85
+            _bb_bear_thresh = 10 if (pd.notna(_adx_val) and _adx_val >= 30) else 15
+
+            if _bb_skip:
+                if (_is_bullish_strat and _bb > 90) or (_is_bearish_strat and _bb < 10):
+                    _bs_notes.append(f'BB={_bb:.0f}% in strong trend (ADX={_adx_val:.0f}) — band-walk, annotation only')
+            elif _is_bullish_strat and _bb > _bb_bull_thresh:
+                _bs_mult *= 0.95
+                _bs_notes.append(f'BB={_bb:.0f}% — buying calls at upper band extreme (thresh={_bb_bull_thresh})')
+            elif _is_bearish_strat and _bb < _bb_bear_thresh:
+                _bs_mult *= 0.95
+                _bs_notes.append(f'BB={_bb:.0f}% — buying puts at lower band extreme (thresh={_bb_bear_thresh})')
+
+        # OBV slope conflicts with direction (Murphy Ch.7: smart money flow)
+        _obv = pd.to_numeric(row.get('OBV_Slope'), errors='coerce')
+        if pd.notna(_obv):
+            if _is_bullish_strat and _obv < -15:
+                _bs_mult *= 0.95
+                _bs_notes.append(f'OBV={_obv:+.0f}% distribution contradicts bullish (Murphy Ch.7)')
+            elif _is_bearish_strat and _obv > 15:
+                _bs_mult *= 0.95
+                _bs_notes.append(f'OBV={_obv:+.0f}% accumulation contradicts bearish (Murphy Ch.7)')
+
+        # Structure conflict: directional trade fighting the swing structure (Murphy Ch.4)
+        # Long Call on Downtrend or Long Put on Uptrend = buying against prevailing HH/HL or LH/LL
+        _mkt_struct = str(row.get('Market_Structure', '') or '').strip()
+        if (_is_bullish_strat and _mkt_struct == 'Downtrend') or \
+           (_is_bearish_strat and _mkt_struct == 'Uptrend'):
+            _bs_mult *= 0.90
+            _direction = 'calls' if _is_bullish_strat else 'puts'
+            _bs_notes.append(f'Structure conflict: buying {_direction} against {_mkt_struct} swings (Murphy Ch.4)')
+
+        # Weekly trend conflict (Murphy: "weekly signals filter daily noise")
+        # Applies to ALL directionals — weekly timeframe disagreeing with daily
+        # weakens conviction. LEAPs get heavier penalty (longer horizon = weekly matters more).
+        _is_leap = 'LEAP' in _strat_name
+        _weekly_bias = str(row.get('Weekly_Trend_Bias', '') or '').strip()
+        if _weekly_bias == 'CONFLICTING':
+            if _is_leap:
+                _bs_mult *= 0.95
+                _bs_notes.append('Weekly trend conflicts with LEAP direction (Murphy: weekly filters daily)')
+            else:
+                _bs_mult *= 0.95
+                _bs_notes.append('Weekly trend CONFLICTING — higher timeframe does not confirm directional thesis (Murphy)')
+
+        # ADX conviction gate (Murphy 0.764: "trade markets with highest trend ratings")
+        # Short-dated directionals in flat markets burn theta with no price movement.
+        # ADX < 15: no trend exists (hard penalty). ADX 15–19: trend unconfirmed (soft penalty).
+        if not _is_leap:  # LEAPs have longer horizon, less sensitive to short-term ADX
+            if pd.notna(_adx_val) and _adx_val < 15:
+                _bs_mult *= 0.90
+                _bs_notes.append(f'ADX={_adx_val:.0f} — no trend conviction for directional trade (Murphy: nontrending)')
+            elif pd.notna(_adx_val) and _adx_val < 20:
+                _bs_mult *= 0.95
+                _bs_notes.append(f'ADX={_adx_val:.0f} — weak trend, directional risk elevated (Murphy Ch.14)')
+
+        # Earnings IV crush on short-dated directionals (Augen 0.754)
+        # Buying non-LEAP options near earnings = paying inflated IV that collapses post-announcement
+        # Track record context: beat_rate, avg_iv_crush, avg_move_ratio from earnings_stats
+        if not _is_leap:
+            _dte_earn = pd.to_numeric(row.get('days_to_earnings'), errors='coerce')
+            if pd.notna(_dte_earn) and _dte_earn <= 5 and _dte_earn >= 0:
+                _bs_mult *= 0.90
+                _earn_ctx_parts = [f'Earnings in {int(_dte_earn)}d — IV crush risk on short-dated directional (Augen)']
+
+                # Enrich with track-record context from earnings_stats replay data
+                _e_move_ratio = pd.to_numeric(row.get('Earnings_Move_Ratio'), errors='coerce')
+                _e_beat_rate = pd.to_numeric(row.get('Earnings_Beat_Rate'), errors='coerce')
+                _e_avg_crush = pd.to_numeric(row.get('Earnings_Avg_IV_Crush'), errors='coerce')
+                _e_consec_beats = pd.to_numeric(row.get('Earnings_Consecutive_Beats'), errors='coerce')
+                _e_consec_misses = pd.to_numeric(row.get('Earnings_Consecutive_Misses'), errors='coerce')
+
+                _track_parts = []
+                if pd.notna(_e_beat_rate):
+                    _track_parts.append(f'beat_rate={_e_beat_rate:.0f}%')
+                if pd.notna(_e_avg_crush):
+                    # DB stores as decimal fraction (0.30 = 30%); display as whole %
+                    _crush_display = _e_avg_crush * 100 if _e_avg_crush <= 1.0 else _e_avg_crush
+                    _track_parts.append(f'avg_crush={_crush_display:.0f}%')
+                if pd.notna(_e_consec_beats) and _e_consec_beats >= 3:
+                    _track_parts.append(f'{int(_e_consec_beats)} consecutive beats')
+                if pd.notna(_e_consec_misses) and _e_consec_misses >= 2:
+                    _track_parts.append(f'{int(_e_consec_misses)} consecutive misses')
+
+                if _track_parts:
+                    _earn_ctx_parts.append(f'Track record: {", ".join(_track_parts)}')
+
+                # Stacking: severe IV crush history + market overpricing = extra penalty
+                if pd.notna(_e_move_ratio) and _e_move_ratio < 0.6:
+                    _bs_mult *= 0.95
+                    _earn_ctx_parts.append(f'Move_Ratio={_e_move_ratio:.2f} — market overprices moves (×0.95 stacked)')
+                elif pd.notna(_e_move_ratio) and _e_move_ratio > 1.2:
+                    _earn_ctx_parts.append(f'Move_Ratio={_e_move_ratio:.2f} — stock moves more than implied (favorable)')
+
+                _bs_notes.append('; '.join(_earn_ctx_parts))
+
+        # Keltner squeeze — annotation only (direction unknown until fired)
+        _squeeze_on = row.get('Keltner_Squeeze_On', False)
+        _squeeze_fired = row.get('Keltner_Squeeze_Fired', False)
+        if _squeeze_on and not _squeeze_fired:
+            _bs_notes.append('Keltner squeeze active — breakout direction unconfirmed (Raschke)')
+
+    if _bs_mult != 1.0:
+        _pre_bs_dqs = row.get('DQS_Score')
+        if pd.notna(_pre_bs_dqs):
+            row = row.copy() if not isinstance(row, dict) else row.copy()
+            row['DQS_Score'] = float(_pre_bs_dqs) * _bs_mult
+            logger.debug(
+                f"  [BlindSpot] {row.get('Ticker')}: DQS "
+                f"→ {float(row['DQS_Score']):.0f} (×{_bs_mult:.2f})"
+            )
+
+    decision['Blind_Spot_Multiplier'] = round(_bs_mult, 4)
+    decision['Blind_Spot_Notes'] = '; '.join(_bs_notes) if _bs_notes else ''
+
+    # ── Feedback calibration (read-only from closed-trade outcomes) ───────────
+    _fb_strategy = _strat_name
+    _timing_ctx = str(row.get('entry_timing_context', '') or '').upper()
+    _fb_multiplier, _fb_meta = get_feedback_calibration(
+        strategy=_fb_strategy,
+        entry_timing_context=_timing_ctx,
+    )
+    if _fb_multiplier != 1.0:
+        _pre_fb_dqs = row.get('DQS_Score')
+        if pd.notna(_pre_fb_dqs):
+            row = row.copy() if not isinstance(row, dict) else row.copy()
+            row['DQS_Score'] = float(_pre_fb_dqs) * _fb_multiplier
+    decision['Calibrated_Confidence'] = _fb_meta.get('win_rate')
+    decision['Feedback_Win_Rate'] = _fb_meta.get('win_rate')
+    decision['Feedback_Sample_N'] = _fb_meta.get('sample_n', 0)
+    decision['Feedback_Action'] = _fb_meta.get('suggested_action', 'INSUFFICIENT_SAMPLE')
+    decision['Feedback_Note'] = _fb_meta.get('note', '')
+
+    # ── Behavioral Memory Multiplier (YTD scan arc + v2 intelligence) ────────
+    # Base: score-driven (Murphy Ch.1: "the trend is your friend").
+    # v2 overlays: contradiction flags, data maturity, event proximity.
+    # Sinclair (Volatility Trading): high contradiction = hold to higher standard.
+    # Chan/Harris: thin data = don't trust the signal.
+    _bm_mult = 1.0
+    _bm_score = row.get('Behavioral_Score')
+    _bm_note_parts = []
+    if _bm_score is not None and pd.notna(_bm_score):
+        _bm_score = float(_bm_score)
+        if _bm_score >= 70:
+            _bm_mult = 1.05   # strong behavioral arc — boost
+        elif _bm_score < 40:
+            _bm_mult = 0.90   # hostile behavioral arc — stronger penalty
+
+        # v2: Contradiction dampening — if market evidence conflicts with
+        # portfolio evidence, reduce trust in the base score.
+        _bm_contras = str(row.get('Contradiction_Flags', '') or '')
+        if _bm_contras and _bm_contras not in ('', 'nan'):
+            _contra_count = len([c for c in _bm_contras.split(',') if c.strip()])
+            if _contra_count >= 2:
+                _bm_mult *= 0.95  # multiple contradictions — significant concern
+                _bm_note_parts.append(f'{_contra_count} contradictions')
+            elif _contra_count == 1:
+                _bm_mult *= 0.97  # single contradiction — minor concern
+                _bm_note_parts.append('1 contradiction')
+
+        # v2: Data maturity guard — don't boost thin-data tickers.
+        # A NEW_TICKER with score 75 shouldn't get the same boost as a
+        # MATURE ticker with score 75.
+        _bm_maturity = str(row.get('Data_Maturity', '') or '')
+        if _bm_maturity == 'NEW_TICKER' and _bm_mult > 1.0:
+            _bm_mult = 1.0  # suppress boost for new tickers
+            _bm_note_parts.append('new ticker — boost suppressed')
+        elif _bm_maturity == 'DEVELOPING' and _bm_mult > 1.0:
+            _bm_mult = 1.0 + (_bm_mult - 1.0) * 0.5  # halve the boost
+            _bm_note_parts.append('developing — boost halved')
+
+        # v2: Worst-event proximity check — if ticker's worst macro event
+        # is within 3 days, apply caution penalty.
+        _bm_worst_evt = str(row.get('Worst_Event_Type', '') or '')
+        if _bm_worst_evt and _bm_worst_evt not in ('', 'nan'):
+            try:
+                from config.macro_calendar import get_macro_proximity
+                from datetime import date
+                _today = date.today()
+                _macro_prox = get_macro_proximity(_today)
+                if _macro_prox.events_within_5d:
+                    for _evt in _macro_prox.events_within_5d:
+                        if _evt.event_type == _bm_worst_evt:
+                            _days_to = (_evt.event_date - _today).days
+                            if 0 <= _days_to <= 3:
+                                _bm_mult *= 0.97
+                                _bm_note_parts.append(
+                                    f'{_bm_worst_evt} in {_days_to}d (worst event)')
+                                break
+            except Exception:
+                pass
+
+    if _bm_mult != 1.0:
+        _pre_bm_dqs = row.get('DQS_Score')
+        if pd.notna(_pre_bm_dqs):
+            row = row.copy() if not isinstance(row, dict) else row.copy()
+            row['DQS_Score'] = float(_pre_bm_dqs) * _bm_mult
+    decision['Behavioral_Multiplier'] = round(_bm_mult, 4)
+    decision['Behavioral_Score'] = round(float(_bm_score), 0) if _bm_score is not None and pd.notna(_bm_score) else 50
+    decision['Behavioral_Note'] = '; '.join(_bm_note_parts) if _bm_note_parts else ''
+
+    # ── Market Regime Multiplier ─────────────────────────────────────────────
+    # Modest DQS penalty for elevated regimes. Non-blocking: influences ranking,
+    # never vetoes. CRISIS ×0.85, RISK_OFF ×0.90, CAUTIOUS ×0.95, else ×1.00.
+    _mkt_regime = str(row.get('Market_Regime', 'UNKNOWN') or 'UNKNOWN')
+    _MKT_REGIME_MULT = {
+        'CRISIS': 0.85, 'RISK_OFF': 0.90, 'CAUTIOUS': 0.95,
+        'NORMAL': 1.0, 'RISK_ON': 1.0, 'UNKNOWN': 1.0,
+    }
+    _mkt_mult = _MKT_REGIME_MULT.get(_mkt_regime, 1.0)
+
+    # Regime-strategy annotations (non-blocking, informational)
+    _regime_notes = []
+    _mkt_term = str(row.get('Market_Term_Structure', '') or '')
+    _mkt_breadth = str(row.get('Market_Breadth_State', '') or '')
+    _is_income = _strat_name in ('COVERED CALL', 'BUY-WRITE', 'CASH SECURED PUT',
+                                  'SHORT PUT', 'SHORT CALL', 'IRON CONDOR', 'PMCC')
+    _is_directional_long = _strat_name in ('LONG CALL', 'LONG PUT',
+                                            'LONG CALL LEAP', 'LONG PUT LEAP')
+
+    if _mkt_term == 'BACKWARDATION' and _is_income:
+        _regime_notes.append('CAUTION: Backwardation — front-month IV elevated, rolls expensive')
+    if _mkt_breadth == 'NARROW' and _is_directional_long:
+        _regime_notes.append('CAUTION: Narrow breadth — directional conviction reduced')
+    if _mkt_regime == 'CRISIS':
+        _regime_notes.append('CAUTION: CRISIS regime — elevated risk across all strategies')
+
+    if _mkt_mult != 1.0:
+        _pre_mkt_dqs = row.get('DQS_Score')
+        if pd.notna(_pre_mkt_dqs):
+            row = row.copy() if not isinstance(row, dict) else row.copy()
+            row['DQS_Score'] = float(_pre_mkt_dqs) * _mkt_mult
+            logger.debug(
+                f"  [MarketRegime] {row.get('Ticker')}: DQS {float(_pre_mkt_dqs):.0f} "
+                f"→ {float(row['DQS_Score']):.0f} (×{_mkt_mult:.2f}, {_mkt_regime})"
+            )
+    decision['Market_Regime_Multiplier'] = round(_mkt_mult, 4)
+    decision['Regime_Strategy_Note'] = '; '.join(_regime_notes) if _regime_notes else ''
+
+    # ── CBOE SKEW Multiplier ───────────────────────────────────────────────
+    # Direct strategy-aware SKEW signal. Elevated SKEW = market pricing tail
+    # risk via OTM puts. Penalises long-vega (buying into expensive tails),
+    # rewards income sellers (collecting richer premium).
+    # Complements the composite regime multiplier which only weighs SKEW at 5%.
+    _skew_mult = 1.0
+    _skew_val = row.get('CBOE_SKEW')
+    _skew_note = ''
+    if _skew_val is not None and pd.notna(_skew_val):
+        _skew_f = float(_skew_val)
+        from config.indicator_settings import MARKET_REGIME_THRESHOLDS as _SKEW_THRESHOLDS
+        _skew_long_thresh = _SKEW_THRESHOLDS.get('SKEW_DQS_LONG_PENALTY_THRESHOLD', 140)
+        _skew_long_mild = _SKEW_THRESHOLDS.get('SKEW_DQS_LONG_PENALTY_MILD', 0.97)
+        _skew_long_severe = _SKEW_THRESHOLDS.get('SKEW_DQS_LONG_PENALTY_SEVERE', 0.93)
+        _skew_income_thresh = _SKEW_THRESHOLDS.get('SKEW_DQS_INCOME_BOOST_THRESHOLD', 135)
+        _skew_income_boost = _SKEW_THRESHOLDS.get('SKEW_DQS_INCOME_BOOST', 1.03)
+
+        if _is_directional_long and _skew_f >= _skew_long_thresh:
+            if _skew_f >= 150:
+                _skew_mult = _skew_long_severe
+                _skew_note = f'SKEW {_skew_f:.0f} ≥ 150 — elevated tail risk, long-vega penalised ×{_skew_long_severe}'
+            else:
+                _skew_mult = _skew_long_mild
+                _skew_note = f'SKEW {_skew_f:.0f} ≥ {_skew_long_thresh} — mild tail risk, long-vega ×{_skew_long_mild}'
+        elif _is_income and _skew_f >= _skew_income_thresh:
+            _skew_mult = _skew_income_boost
+            _skew_note = f'SKEW {_skew_f:.0f} ≥ {_skew_income_thresh} — richer premium for income ×{_skew_income_boost}'
+
+        if _skew_mult != 1.0:
+            _pre_skew_dqs = row.get('DQS_Score')
+            if pd.notna(_pre_skew_dqs):
+                row = row.copy() if not isinstance(row, dict) else row.copy()
+                row['DQS_Score'] = float(_pre_skew_dqs) * _skew_mult
+                logger.debug(
+                    f"  [SKEW] {row.get('Ticker')}: DQS {float(_pre_skew_dqs):.0f} "
+                    f"→ {float(row['DQS_Score']):.0f} (×{_skew_mult:.2f}, SKEW={_skew_f:.0f})"
+                )
+    decision['SKEW_Multiplier'] = round(_skew_mult, 4)
+    decision['SKEW_Note'] = _skew_note
+
+    # ── Multiplier Clamp ─────────────────────────────────────────────────────
+    _raw_dqs = row.get('DQS_Score')
+    _timing_mult = 0.85 if (_timing_ctx in ('LATE_SHORT', 'LATE_LONG') and pd.notna(_raw_dqs)) else 1.0
+    _staleness_mult = 0.85 if iv_data_stale else 1.0
+    _combined_mult = _timing_mult * _staleness_mult * _fb_multiplier * _cal_dqs_multiplier * _traj_mult * _iv_hw_mult * _bs_mult * _bm_mult * _mkt_mult * _skew_mult
+    _MULT_FLOOR = 0.40
+    _MULT_CEILING = 1.35
+    _was_clamped = False
+
+    if _combined_mult < _MULT_FLOOR or _combined_mult > _MULT_CEILING:
+        _clamped_mult = max(_MULT_FLOOR, min(_MULT_CEILING, _combined_mult))
+        _was_clamped = True
+        _combined_mult = _clamped_mult
+
+    decision['DQS_Combined_Multiplier'] = round(_combined_mult, 4)
+    decision['DQS_Multiplier_Clamped'] = _was_clamped
+
+    return row
 
 
 # ============================================================
@@ -709,6 +999,45 @@ def apply_execution_gate(
             })
             return decision
 
+    # R2.2d: Deep ITM LEAP guard — block when essentially synthetic stock.
+    # A deep ITM LEAP (|delta| > 0.70, time value < 5% of premium) is capital-inefficient:
+    # you're paying $20,000+ of intrinsic value for stock-like exposure with no optionality.
+    # Hull Ch.10: LEAPS provide leverage through time value, not intrinsic.
+    # If time_value / premium < 5%, the option is just expensive synthetic stock.
+    _sn_r22d = str(row.get('Strategy_Name', '') or '').upper()
+    if 'LEAP' in _sn_r22d:
+        try:
+            _delta_raw = pd.to_numeric(row.get('Delta'), errors='coerce')
+            _delta_abs = abs(float(_delta_raw)) if pd.notna(_delta_raw) else 0.0
+            _strike_r = float(row.get('Strike', 0) or 0)
+            _ul_price = float(row.get('UL_Price', 0) or row.get('Stock_Price', 0) or 0)
+            _mid_r22d = float(row.get('Mid_Price', 0) or 0)
+
+            if _delta_abs > 0.70 and _strike_r > 0 and _ul_price > 0 and _mid_r22d > 0:
+                # Compute intrinsic value
+                if 'PUT' in _sn_r22d:
+                    _intrinsic = max(0.0, _strike_r - _ul_price)
+                else:
+                    _intrinsic = max(0.0, _ul_price - _strike_r)
+                _time_value = _mid_r22d - _intrinsic
+                _tv_pct = _time_value / _mid_r22d if _mid_r22d > 0 else 0.0
+
+                if _tv_pct < 0.05 and _intrinsic > 0:
+                    decision.update({
+                        'Execution_Status': 'CONDITIONAL',
+                        'Gate_Reason': (
+                            f'R2.2d: Deep ITM LEAP — |delta|={_delta_abs:.2f}, '
+                            f'time value ${_time_value:.2f} ({_tv_pct:.1%} of premium). '
+                            f'Capital ${_mid_r22d*100:,.0f} buys synthetic stock, not optionality. '
+                            f'Hull Ch.10: use ATM/OTM strike for leverage.'
+                        ),
+                        'confidence_band': 'LOW',
+                        'execution_adjustment': 'WRONG_STRIKE',
+                    })
+                    return decision
+        except (TypeError, ValueError):
+            pass
+
     # R2.2b: Critically low absolute OI — exit liquidity trap
     # Natenberg Ch.9 / Passarelli: spread-to-premium ratio alone is insufficient when OI is
     # critically low. With OI < 10, you may be the entire market on exit, especially for
@@ -743,19 +1072,65 @@ def apply_execution_gate(
         except (TypeError, ValueError, ZeroDivisionError):
             spread_cost_ratio = 1.0
 
+        # R2.3-OI: Hard OI floor scaled by contract dollar size.
+        # OI=11 on a $20,000 contract = no real market depth regardless of spread ratio.
+        # Minimum: OI ≥ 50 for contracts ≤ $5,000; OI ≥ 100 for contracts > $5,000.
+        # LEAP exception (DTE ≥ 270): OI ≥ 25 flat. LEAPs structurally have lower OI
+        # than near-term contracts — they're held-to-maturity instruments, not day-traded.
+        # The spread gate (R2.3b/c) already catches genuinely illiquid LEAPs.
+        _oi_raw = pd.to_numeric(row.get('Open_Interest'), errors='coerce')
+        _oi_val = float(_oi_raw) if pd.notna(_oi_raw) else 0.0
+        _oi_dte_raw = pd.to_numeric(row.get('Actual_DTE') or row.get('DTE'), errors='coerce')
+        _oi_dte = float(_oi_dte_raw) if pd.notna(_oi_dte_raw) else 0.0
+        _is_leap_oi = _oi_dte >= 270
+        _oi_floor = 25 if _is_leap_oi else (100 if mid_v > 50.0 else 50)
+        if _oi_val < _oi_floor:
+            decision.update({
+                'Execution_Status': 'CONDITIONAL',
+                'Gate_Reason': (
+                    f'R2.3-OI: OI={int(_oi_val)} below minimum {_oi_floor} for '
+                    f'${mid_v*100:,.0f} contract — insufficient market depth for reliable fills'
+                ),
+                'confidence_band': 'LOW',
+                'execution_adjustment': 'AVOID_THIN_OI',
+            })
+            row = _apply_dqs_multiplier_chain(row, decision, iv_data_stale)
+            return decision
+
         if spread_cost_ratio <= 0.05 and strategy_type in ('DIRECTIONAL', 'VOLATILITY'):
             # Natenberg: <5% spread = institutional standard. Directional and
             # volatility trades don't require rolling — entry cost is the only
             # concern. READY but enforce limit-order-only discipline.
             # Confidence is DQS-driven (capped at MEDIUM for Acceptable/Thin liq):
             #   DQS >= 75 (Strong) → MEDIUM  |  DQS 50-74 (Eligible) → LOW
+            _r2_3a_gate_reason = (
+                f'R2.3a: {liquidity_grade} liquidity but spread cost {spread_cost_ratio*100:.1f}% '
+                f'of premium — Natenberg: tradable, use limit order at mid only'
+            )
             _r2_3a_band = _dqs_confidence_band(row.get('DQS_Score'), max_band='MEDIUM')
+
+            # R4.1 inline: thesis quality check before admitting directional trades.
+            # Without this, R2.3a returns READY before R3.2 (which has its own R4.1).
+            if strategy_type == 'DIRECTIONAL':
+                try:
+                    _tq_pass_23a, _tq_issues_23a, _tq_conds_23a = check_thesis_quality(row)
+                    if not _tq_pass_23a:
+                        _tq_reason_23a = '; '.join(_tq_issues_23a)
+                        decision.update({
+                            'Execution_Status': 'CONDITIONAL',
+                            'Gate_Reason': f'R4.1: Thesis quality — {_tq_reason_23a} [original: {_r2_3a_gate_reason}]',
+                            'confidence_band': _r2_3a_band,
+                            'Operating_Mode': _operating_mode(iv_maturity_level),
+                            'execution_adjustment': 'LIMIT_ORDER_ONLY',
+                        })
+                        row = _apply_dqs_multiplier_chain(row, decision, iv_data_stale)
+                        return decision
+                except Exception as _tq_23a_err:
+                    logger.debug(f"[R4.1-R2.3a] Thesis quality check failed: {_tq_23a_err}")
+
             decision.update({
                 'Execution_Status': 'READY',
-                'Gate_Reason': (
-                    f'R2.3a: {liquidity_grade} liquidity but spread cost {spread_cost_ratio*100:.1f}% '
-                    f'of premium — Natenberg: tradable, use limit order at mid only'
-                ),
+                'Gate_Reason': _r2_3a_gate_reason,
                 'confidence_band': _r2_3a_band,
                 'Operating_Mode': _operating_mode(iv_maturity_level),
                 'execution_adjustment': 'LIMIT_ORDER_ONLY'
@@ -784,6 +1159,7 @@ def apply_execution_gate(
                 'confidence_band': 'LOW',
                 'execution_adjustment': 'AVOID_MARKET_ORDER'
             })
+        row = _apply_dqs_multiplier_chain(row, decision, iv_data_stale)
         return decision
 
     # R2.4: Minor Data Gaps
@@ -798,6 +1174,23 @@ def apply_execution_gate(
 
     # --- Rule Set 3: READY ---
 
+    # R3.0p: PMCC LEAP leg validation — must have found a liquid LEAP before READY
+    _strategy_name_r3 = str(row.get('Strategy_Name', '') or '').upper()
+    if _strategy_name_r3 == 'PMCC':
+        _pmcc_leap_status = str(row.get('PMCC_LEAP_Status', '') or '').upper()
+        if _pmcc_leap_status != 'OK':
+            decision.update({
+                'Execution_Status': 'BLOCKED',
+                'Gate_Reason': (
+                    f'R3.0p: PMCC requires liquid LEAP leg (PMCC_LEAP_Status={_pmcc_leap_status}). '
+                    'No LEAP with DTE≥270 and delta 0.70-0.85 found with OI≥10. '
+                    'Hull Ch.10: diagonal requires both legs to have structural validity.'
+                ),
+                'confidence_band': 'LOW',
+                'execution_adjustment': 'AVOID_SIZE',
+            })
+            return decision
+
     # R3.1: Income with demonstrated volatility edge and good liquidity
     if strategy_type == 'INCOME' and liquidity_grade in ['Good', 'Excellent']:
         eligible, elig_reason = check_income_eligibility(row, actual_dte)
@@ -809,6 +1202,7 @@ def apply_execution_gate(
                 'Operating_Mode': _operating_mode(iv_maturity_level),
                 'execution_adjustment': 'NORMAL'
             })
+            row = _apply_dqs_multiplier_chain(row, decision, iv_data_stale)
             return decision
 
     # R3.2: Directional with sufficient IV and good liquidity
@@ -877,29 +1271,8 @@ def apply_execution_gate(
         else:
             decision['Data_Staleness_Penalty'] = 1.0
 
-        # Feedback calibration: adjust DQS using closed-trade outcomes from doctrine_feedback.
-        # READ-ONLY — only fires when N >= 15 in the (strategy, momentum_state) bucket.
-        # Graceful: any DB error → multiplier=1.0 (neutral), no log noise.
-        _fb_strategy = str(row.get('Strategy_Name', '') or row.get('Strategy', '') or '').upper()
-        _fb_multiplier, _fb_meta = get_feedback_calibration(
-            strategy=_fb_strategy,
-            entry_timing_context=_timing_ctx,
-        )
-        if _fb_multiplier != 1.0:
-            _pre_fb_dqs = row.get('DQS_Score')
-            if pd.notna(_pre_fb_dqs):
-                row = row.copy() if not isinstance(row, dict) else row.copy()
-                row['DQS_Score'] = float(_pre_fb_dqs) * _fb_multiplier
-                logger.debug(
-                    f"  [FeedbackCalibration] {_fb_strategy}: DQS {float(_pre_fb_dqs):.0f} "
-                    f"→ {float(row['DQS_Score']):.0f} (×{_fb_multiplier:.2f}, "
-                    f"{_fb_meta.get('suggested_action','')})"
-                )
-        # Always write feedback columns (even when neutral — audit trail)
-        decision['Feedback_Win_Rate']  = _fb_meta.get('win_rate')
-        decision['Feedback_Sample_N']  = _fb_meta.get('sample_n', 0)
-        decision['Feedback_Action']    = _fb_meta.get('suggested_action', 'INSUFFICIENT_SAMPLE')
-        decision['Feedback_Note']      = _fb_meta.get('note', '')
+        # Apply DQS multiplier chain (feedback, calendar, trajectory, clamp)
+        row = _apply_dqs_multiplier_chain(row, decision, iv_data_stale)
 
         # Confidence tier: IV maturity >= 4 always HIGH (full 120d history).
         # When IV history is short (levels 2-3), compensate with signal conviction:
@@ -939,22 +1312,17 @@ def apply_execution_gate(
             iv_note = iv_note + ' [NEAR_LEAP_FALLBACK: 180-269 DTE has reduced LEAP-like properties — Hull Ch.10]'
 
         # Apply feedback confidence cap/promotion (only when bucket has sufficient sample)
-        _conf_adj = _fb_meta.get('confidence_adjustment')
-        if _conf_adj == "MEDIUM" and confidence == "HIGH":
-            confidence = "MEDIUM"
-            iv_note = iv_note + f" [feedback-capped: {_fb_meta.get('suggested_action','')}]"
-        elif _conf_adj == "HIGH" and confidence == "MEDIUM":
-            confidence = "HIGH"
-            iv_note = iv_note + f" [feedback-promoted: {_fb_meta.get('suggested_action','')}]"
+        # Feedback columns already set by _apply_dqs_multiplier_chain.
+        _fb_action = decision.get('Feedback_Action', '')
+        if _fb_action == 'TIGHTEN' and confidence == 'HIGH':
+            confidence = 'MEDIUM'
+            iv_note = iv_note + f' [feedback-capped: {_fb_action}]'
+        elif _fb_action == 'WIDEN' and confidence == 'MEDIUM':
+            confidence = 'HIGH'
+            iv_note = iv_note + f' [feedback-promoted: {_fb_action}]'
 
-        # Calendar risk flag: long premium on Friday/pre-holiday bleeds theta over weekend
-        # with no offsetting stock movement. Short premium on same days collects extra theta.
-        # Passarelli Ch.6, Natenberg Ch.11. Does NOT block READY — conviction can override.
-        _strat_name = str(row.get('Strategy_Name', '') or row.get('Strategy', '') or '').upper()
-        _cal_flag, _cal_note = calendar_risk_flag(_strat_name)
-        decision['Calendar_Risk_Flag'] = _cal_flag
-        decision['Calendar_Risk_Note'] = _cal_note
-        if _cal_flag in ('HIGH_BLEED',) and confidence == 'HIGH':
+        # Calendar risk confidence cap (belt + suspenders — helper already sets Calendar_Risk_Flag).
+        if decision.get('Calendar_Risk_Flag') in ('HIGH_BLEED',) and confidence == 'HIGH':
             confidence = 'MEDIUM'
             iv_note = iv_note + ' [calendar-capped: pre-holiday long premium entry]'
 
@@ -1001,7 +1369,7 @@ def apply_execution_gate(
             else:
                 _timing_gate = 'DEFER'
         else:
-            _timing_gate = 'EXECUTE'   # no TQS → don't block, data gap
+            _timing_gate = 'WAIT_PULLBACK'   # no TQS → conservative; missing timing ≠ safe timing
         decision['Timing_Gate']      = _timing_gate
         decision['Timing_Gate_TQS']  = float(_tqs_val) if pd.notna(_tqs_val) else None
 
@@ -1022,7 +1390,7 @@ def apply_execution_gate(
             else:
                 _price_gate = 'WAIT_PRICE'
         else:
-            _price_gate = 'AT_FAIR_VALUE'  # no BS data → don't block, data gap
+            _price_gate = 'UNKNOWN_PRICING'  # no BS data → flag for review, missing ≠ fair
         decision['Price_Gate']              = _price_gate
         decision['Price_Gate_FV_Pct']       = float(_fv_pct) if pd.notna(_fv_pct) else None
         decision['Price_Gate_Band_Lower']   = float(_bs_lower) if pd.notna(_bs_lower) else None
@@ -1043,10 +1411,16 @@ def apply_execution_gate(
                     f'Murphy Ch.4: wait for mean reversion before entry.'
                 )
             elif _timing_gate == 'WAIT_PULLBACK':
-                _block_parts.append(
-                    f'TQS={_tqs_f:.0f} (40-59) — entry extended. '
-                    f'Bulkowski: chasing extended move reduces edge. Wait for RSI/price pullback.'
-                )
+                if pd.notna(_tqs_val):
+                    _block_parts.append(
+                        f'TQS={float(_tqs_val):.0f} (40-59) — entry extended. '
+                        f'Bulkowski: chasing extended move reduces edge. Wait for RSI/price pullback.'
+                    )
+                else:
+                    _block_parts.append(
+                        'TQS missing — timing unknown. '
+                        'Conservative: wait for pullback confirmation before entry.'
+                    )
             if _price_gate == 'WAIT_PRICE':
                 _block_parts.append(
                     f'Paying {_fv_f:.1f}% above BS fair value '
@@ -1091,9 +1465,101 @@ def apply_execution_gate(
             )
             return decision
 
+        # Earnings formation context (informational, not blocking)
+        _earnings_phase_d = str(row.get('Earnings_Formation_Phase', '') or '').upper()
+        _move_ratio_d = row.get('Earnings_Move_Ratio')
+        _earnings_ctx_d = ''
+
+        if _earnings_phase_d in ('EARLY_POSITIONING', 'LATE_POSITIONING') and _move_ratio_d is not None and pd.notna(_move_ratio_d):
+            _mr_d = float(_move_ratio_d)
+            _dte_d = row.get('days_to_earnings')
+            _dte_str = f'D-{int(float(_dte_d))}' if _dte_d is not None and pd.notna(_dte_d) else 'D-?'
+            if _mr_d < 0.6:
+                _earnings_ctx_d = (
+                    f' [EARNINGS: Move_Ratio={_mr_d:.2f} — market consistently overprices '
+                    f'earnings moves ({_dte_str}, {_earnings_phase_d}). Consider reduced size.]'
+                )
+            elif _mr_d > 1.2:
+                _earnings_ctx_d = (
+                    f' [EARNINGS: Move_Ratio={_mr_d:.2f} — market underprices '
+                    f'earnings moves ({_dte_str}, {_earnings_phase_d}). Stock tends to move more than implied.]'
+                )
+
+        # MC Earnings Event Simulation (Augen 0.754)
+        # If near earnings, simulate hold-through vs close-before to give trader EV context
+        _mc_earn_ctx = ''
+        _dte_earn_mc = pd.to_numeric(row.get('days_to_earnings'), errors='coerce')
+        if pd.notna(_dte_earn_mc) and 0 <= _dte_earn_mc <= 10:
+            try:
+                from scan_engine.mc_earnings_event import mc_earnings_event
+                _mc_earn = mc_earnings_event(row)
+                if _mc_earn.get('MC_Earn_Verdict') != 'SKIP':
+                    decision.update(_mc_earn)
+                    _mc_earn_ctx = f' [MC_EARNINGS: {_mc_earn.get("MC_Earn_Note", "")}]'
+            except Exception as _mc_e:
+                logger.debug(f"MC earnings sim skipped: {_mc_e}")
+
+        # MC Variance Premium Scoring (Sinclair 0.738)
+        # Score whether the option buyer is overpaying relative to realized vol
+        try:
+            from scan_engine.mc_variance_premium import mc_variance_premium
+            _mc_vp = mc_variance_premium(row)
+            if _mc_vp.get('MC_VP_Verdict') != 'SKIP':
+                decision.update(_mc_vp)
+                if _mc_vp.get('MC_VP_Verdict') == 'EXPENSIVE':
+                    _mc_earn_ctx += f' [VP: {_mc_vp.get("MC_VP_Note", "")}]'
+        except Exception as _vp_e:
+            logger.debug(f"MC variance premium skipped: {_vp_e}")
+
+        # ── MC Verdict → DQS Integration (Sinclair Ch.3, Augen Ch.7) ────────
+        # Penalize DQS when MC evidence conflicts with directional entry:
+        #   VP EXPENSIVE = option buyer overpaying relative to realized vol
+        #   CLOSE_BEFORE = hold-through EV worse than closing before earnings
+        _mc_vp_verdict = decision.get('MC_VP_Verdict', 'SKIP')
+        _mc_earn_verdict = decision.get('MC_Earn_Verdict', 'SKIP')
+        _mc_dqs_adj = 1.0
+        if _mc_vp_verdict == 'EXPENSIVE':
+            _mc_dqs_adj *= 0.95
+            _mc_earn_ctx += ' [VP_GATE: ×0.95 — buying expensive vol (Sinclair Ch.3)]'
+        if _mc_earn_verdict == 'CLOSE_BEFORE':
+            _mc_dqs_adj *= 0.95
+            _mc_earn_ctx += ' [EARN_GATE: ×0.95 — close-before EV > hold-through (Augen Ch.7)]'
+        if _mc_dqs_adj < 1.0:
+            _pre_mc_dqs = row.get('DQS_Score')
+            if pd.notna(_pre_mc_dqs):
+                row = row.copy() if not isinstance(row, dict) else row.copy()
+                row['DQS_Score'] = float(_pre_mc_dqs) * _mc_dqs_adj
+                logger.debug(
+                    f"  [MC_Verdict] {row.get('Ticker')}: DQS "
+                    f"{float(_pre_mc_dqs):.0f} → {float(row['DQS_Score']):.0f} "
+                    f"(×{_mc_dqs_adj:.2f})"
+                )
+            decision['MC_Verdict_DQS_Adj'] = round(_mc_dqs_adj, 4)
+
+        # R4.1 inline: thesis quality check BEFORE assigning READY.
+        # Prevents surfacing directional trades with structural signal conflicts
+        # that would be immediately contradicted by management doctrine.
+        # (Post-loop R4.1 at line ~1461 remains as safety net for edge cases.)
+        _r32_gate_reason = f'R3.2: Directional strategy — {iv_note} — {liquidity_grade} liquidity{_earnings_ctx_d}{_mc_earn_ctx}'
+        try:
+            _tq_pass, _tq_issues, _tq_conds = check_thesis_quality(row)
+            if not _tq_pass:
+                _tq_reason = '; '.join(_tq_issues)
+                decision.update({
+                    'Execution_Status': 'CONDITIONAL',
+                    'Gate_Reason': f'R4.1: Thesis quality — {_tq_reason} [original: {_r32_gate_reason}]',
+                    'confidence_band': confidence,
+                    'Operating_Mode': _operating_mode(iv_maturity_level),
+                    'execution_adjustment': 'NORMAL',
+                    '_thesis_wait_conditions': _tq_conds,
+                })
+                return decision
+        except Exception as _tq_err:
+            logger.debug(f"Inline thesis quality check skipped: {_tq_err}")
+
         decision.update({
             'Execution_Status': 'READY',
-            'Gate_Reason': f'R3.2: Directional strategy — {iv_note} — {liquidity_grade} liquidity',
+            'Gate_Reason': _r32_gate_reason,
             'confidence_band': confidence,
             'Operating_Mode': _operating_mode(iv_maturity_level),
             'execution_adjustment': 'NORMAL'
@@ -1156,6 +1622,7 @@ def apply_execution_gate(
             'confidence_band': _vol_conf,
             'execution_adjustment': 'NORMAL',
         })
+        row = _apply_dqs_multiplier_chain(row, decision, iv_data_stale)
         return decision
 
     # R3.4: Neutral / Watch — no actionable signal from Step 6.
@@ -1381,6 +1848,265 @@ def apply_acceptance_logic(df: pd.DataFrame, expiry_intent: str = 'ANY', is_init
             df_result.at[idx, 'confidence_band'] = 'LOW'
             df_result.at[idx, 'execution_adjustment'] = 'AVOID_SIZE'
     
+    # ── R4.1: Thesis Quality Gate — demote READY with structural conflicts ──
+    # Catches cases where execution gates passed but thesis signals conflict
+    # (e.g., Long Put with ADX=9 and Uptrend structure). Demotes to CONDITIONAL
+    # so the wait loop can track until conditions clear.
+    _thesis_demoted = 0
+    _ready_directional = df_result[
+        (df_result['Execution_Status'] == 'READY') &
+        (df_result['Strategy_Type'].fillna('').str.upper() == 'DIRECTIONAL')
+    ].index if 'Strategy_Type' in df_result.columns else []
+
+    for idx in _ready_directional:
+        _row_dict = df_result.loc[idx].to_dict()
+        _tq_passed, _tq_issues, _tq_conditions = check_thesis_quality(_row_dict)
+        if not _tq_passed:
+            _tq_reason = '; '.join(_tq_issues)
+            _orig_gate = str(df_result.at[idx, 'Gate_Reason'] or '')
+            df_result.at[idx, 'Execution_Status'] = 'CONDITIONAL'
+            df_result.at[idx, 'Gate_Reason'] = (
+                f'R4.1: Thesis quality — {_tq_reason} '
+                f'[original: {_orig_gate}]'
+            )
+            # Store conditions for wait_condition_generator to pick up
+            df_result.at[idx, '_thesis_wait_conditions'] = _tq_conditions
+            _thesis_demoted += 1
+            logger.info(
+                f"[R4.1] {_row_dict.get('Ticker')} {_row_dict.get('Strategy_Name')}: "
+                f"demoted READY→CONDITIONAL — {_tq_reason}"
+            )
+
+    if _thesis_demoted > 0:
+        logger.info(f"[R4.1] Thesis quality gate: demoted {_thesis_demoted} READY→CONDITIONAL")
+
+    # ── R4.2: Evaluator Verdict Gate — demote READY that evaluator explicitly fails ──
+    # Step 8/11 evaluator sets Evaluation_Notes with "Fails directional/income requirements"
+    # when the strategy doesn't meet its own criteria. R2.3a admits purely on liquidity
+    # without checking this verdict. This gate enforces the evaluator's assessment.
+    _eval_demoted = 0
+    _ready_with_eval = df_result[
+        (df_result['Execution_Status'] == 'READY') &
+        df_result['Evaluation_Notes'].fillna('').str.contains('Fails', case=False, na=False)
+    ].index if 'Evaluation_Notes' in df_result.columns else []
+
+    for idx in _ready_with_eval:
+        _eval_notes = str(df_result.at[idx, 'Evaluation_Notes'] or '')
+        _orig_gate = str(df_result.at[idx, 'Gate_Reason'] or '')
+        df_result.at[idx, 'Execution_Status'] = 'CONDITIONAL'
+        df_result.at[idx, 'Gate_Reason'] = (
+            f'R4.2: Evaluator verdict — {_eval_notes[:120]} '
+            f'[original: {_orig_gate}]'
+        )
+        _eval_demoted += 1
+        logger.info(
+            f"[R4.2] {df_result.at[idx, 'Ticker']} {df_result.at[idx, 'Strategy_Name']}: "
+            f"demoted READY→CONDITIONAL — evaluator says fails requirements"
+        )
+
+    if _eval_demoted > 0:
+        logger.info(f"[R4.2] Evaluator verdict gate: demoted {_eval_demoted} READY→CONDITIONAL")
+
+    # ── R4.3: Effective DQS Floor — demote READY when multiplier-eroded DQS too low ──
+    # After all multipliers (timing, staleness, blind-spot, trajectory, feedback),
+    # a DQS below 45 means the quality chain has eroded the score beyond viability.
+    # Natenberg Ch.12: "Don't enter a trade that your own scoring system rejects."
+    _DQS_READY_FLOOR = 45.0
+    _dqs_demoted = 0
+    if 'DQS_Score' in df_result.columns:
+        _ready_with_dqs = df_result[
+            (df_result['Execution_Status'] == 'READY') &
+            (df_result['DQS_Score'].fillna(0.0) < _DQS_READY_FLOOR)
+        ].index
+
+        for idx in _ready_with_dqs:
+            _dqs_val = float(df_result.at[idx, 'DQS_Score'])
+            _mult_val = float(df_result.at[idx, 'DQS_Combined_Multiplier']) if pd.notna(df_result.at[idx, 'DQS_Combined_Multiplier']) else 1.0
+            _orig_gate = str(df_result.at[idx, 'Gate_Reason'] or '')
+            df_result.at[idx, 'Execution_Status'] = 'CONDITIONAL'
+            df_result.at[idx, 'Gate_Reason'] = (
+                f'R4.3: DQS={_dqs_val:.0f} below floor {_DQS_READY_FLOOR:.0f} '
+                f'(combined mult={_mult_val:.2f}) — quality eroded below READY threshold '
+                f'[original: {_orig_gate}]'
+            )
+            _dqs_demoted += 1
+            logger.info(
+                f"[R4.3] {df_result.at[idx, 'Ticker']} {df_result.at[idx, 'Strategy_Name']}: "
+                f"demoted READY→CONDITIONAL — DQS={_dqs_val:.0f} < {_DQS_READY_FLOOR:.0f}"
+            )
+
+        if _dqs_demoted > 0:
+            logger.info(f"[R4.3] Effective DQS floor: demoted {_dqs_demoted} READY→CONDITIONAL")
+
+    # ── R4.4: Income in Downtrend — demote income strategies in hostile structure ──
+    # Selling premium (CSP, CC, BW) in a Downtrend exposes the seller to accelerated
+    # assignment risk and cost-basis erosion. Murphy Ch.4: don't sell premium against the trend.
+    _income_trend_demoted = 0
+    _ready_income = df_result[
+        (df_result['Execution_Status'] == 'READY') &
+        (df_result['Strategy_Type'].fillna('').str.upper() == 'INCOME') &
+        (df_result['Market_Structure'].fillna('') == 'Downtrend')
+    ].index if ('Strategy_Type' in df_result.columns and 'Market_Structure' in df_result.columns) else []
+
+    for idx in _ready_income:
+        _orig_gate = str(df_result.at[idx, 'Gate_Reason'] or '')
+        df_result.at[idx, 'Execution_Status'] = 'CONDITIONAL'
+        df_result.at[idx, 'Gate_Reason'] = (
+            f'R4.4: Income strategy in Downtrend — selling premium against the trend '
+            f'increases assignment risk (Murphy Ch.4) [original: {_orig_gate}]'
+        )
+        _income_trend_demoted += 1
+        logger.info(
+            f"[R4.4] {df_result.at[idx, 'Ticker']} {df_result.at[idx, 'Strategy_Name']}: "
+            f"demoted READY→CONDITIONAL — income in Downtrend"
+        )
+
+    if _income_trend_demoted > 0:
+        logger.info(f"[R4.4] Income in Downtrend: demoted {_income_trend_demoted} READY→CONDITIONAL")
+
+    # ── R4.5: Oversold Chasing Gate — demote bearish directional at exhaustion ──
+    # Buying puts on already oversold stocks (RSI<30, BB<15) with bullish divergence
+    # is chasing the move. Murphy Ch.9: divergence at extremes is the strongest
+    # reversal signal — entering WITH the trend at that point is a mean-reversion trap.
+    _chase_demoted = 0
+    _ready_bearish = df_result[
+        (df_result['Execution_Status'] == 'READY') &
+        (df_result['Trade_Bias'].fillna('').str.upper().str.contains('BEAR', na=False))
+    ].index if 'Trade_Bias' in df_result.columns else []
+
+    for idx in _ready_bearish:
+        _rsi = pd.to_numeric(df_result.at[idx, 'RSI'] if 'RSI' in df_result.columns else None, errors='coerce')
+        _bb = pd.to_numeric(df_result.at[idx, 'BB_Position'] if 'BB_Position' in df_result.columns else None, errors='coerce')
+        _rsi_div = str(df_result.at[idx, 'RSI_Divergence'] if 'RSI_Divergence' in df_result.columns else '')
+
+        if (pd.notna(_rsi) and _rsi < 30
+                and pd.notna(_bb) and _bb < 15
+                and 'bullish' in _rsi_div.lower()):
+            _orig_gate = str(df_result.at[idx, 'Gate_Reason'] or '')
+            df_result.at[idx, 'Execution_Status'] = 'CONDITIONAL'
+            df_result.at[idx, 'Gate_Reason'] = (
+                f'R4.5: Oversold chasing — RSI={_rsi:.0f}, BB={_bb:.0f}% with '
+                f'bullish divergence signals mean-reversion risk (Murphy Ch.9) '
+                f'[original: {_orig_gate}]'
+            )
+            _chase_demoted += 1
+            logger.info(
+                f"[R4.5] {df_result.at[idx, 'Ticker']} {df_result.at[idx, 'Strategy_Name']}: "
+                f"demoted READY→CONDITIONAL — oversold chasing (RSI={_rsi:.0f})"
+            )
+
+    if _chase_demoted > 0:
+        logger.info(f"[R4.5] Oversold chasing: demoted {_chase_demoted} READY→CONDITIONAL")
+
+    # ── R5.0: Theory Compliance Floor — directional strategy quality gate ────
+    # Step 8 evaluates directional theory support (delta conviction, gamma floor,
+    # MACD/volume/candle confirmation). A score below 50 means multiple chart
+    # signals contradict the directional thesis. Demote to CONDITIONAL and let
+    # the wait loop monitor until signals align — zero capital risk while waiting.
+    #
+    # Natenberg Ch.5: "A position that initially seemed sensible may under new
+    # conditions represent a losing strategy." The evaluator found contradictions
+    # BEFORE entry — don't accept on liquidity alone.
+    #
+    # This is the gap that surfaced AMD LONG_PUT as READY with theory=42/100,
+    # Bullish Engulfing candle, positive MACD, weak volume, and ADX=18.
+    _THEORY_FLOOR_DIRECTIONAL = 50
+    _theory_demoted = 0
+    _ready_directional_theory = df_result[
+        (df_result['Execution_Status'] == 'READY') &
+        (df_result['Strategy_Type'].fillna('').str.upper() == 'DIRECTIONAL') &
+        (df_result['Theory_Compliance_Score'].fillna(999) < _THEORY_FLOOR_DIRECTIONAL) &
+        (df_result['Theory_Compliance_Score'].notna())
+    ].index if ('Strategy_Type' in df_result.columns
+                and 'Theory_Compliance_Score' in df_result.columns) else []
+
+    for idx in _ready_directional_theory:
+        _tc_score = float(df_result.at[idx, 'Theory_Compliance_Score'])
+        _tc_notes = str(df_result.at[idx, 'Evaluation_Notes'] or '')[:200]
+        _orig_gate = str(df_result.at[idx, 'Gate_Reason'] or '')
+        _tc_bias = str(df_result.at[idx, 'Trade_Bias'] or '').upper()
+        _tc_is_bearish = 'BEAR' in _tc_bias
+
+        # Build signal-specific wait conditions
+        _tc_conditions = []
+
+        # 1. Theory score must improve
+        _tc_conditions.append({
+            'condition_id': f'theory_score_{str(__import__("uuid").uuid4())[:8]}',
+            'type': 'technical',
+            'description': (
+                f'Theory compliance must reach ≥{_THEORY_FLOOR_DIRECTIONAL} '
+                f'(currently {_tc_score:.0f}/100) — Natenberg Ch.5'
+            ),
+            'config': {
+                'metric': 'Theory_Compliance_Score',
+                'operator': 'greater_than',
+                'threshold': _THEORY_FLOOR_DIRECTIONAL,
+            },
+        })
+
+        # 2. MACD must align with direction
+        _tc_macd = pd.to_numeric(
+            df_result.at[idx, 'MACD_Histogram'] if 'MACD_Histogram' in df_result.columns else None,
+            errors='coerce',
+        )
+        if pd.notna(_tc_macd):
+            _macd_contradicts = (_tc_is_bearish and _tc_macd > 0) or (not _tc_is_bearish and _tc_macd < 0)
+            if _macd_contradicts:
+                _tc_conditions.append({
+                    'condition_id': f'theory_macd_{str(__import__("uuid").uuid4())[:8]}',
+                    'type': 'technical',
+                    'description': (
+                        f'MACD histogram must align with {_tc_bias} direction '
+                        f'(currently {"+" if _tc_macd > 0 else ""}{_tc_macd:.3f}) — Murphy Ch.10'
+                    ),
+                    'config': {
+                        'metric': 'MACD_Histogram',
+                        'operator': 'less_than' if _tc_is_bearish else 'greater_than',
+                        'threshold': 0,
+                    },
+                })
+
+        # 3. ADX must show trend
+        _tc_adx = pd.to_numeric(
+            df_result.at[idx, 'ADX'] if 'ADX' in df_result.columns else None,
+            errors='coerce',
+        )
+        if pd.notna(_tc_adx) and _tc_adx < 20:
+            _tc_conditions.append({
+                'condition_id': f'theory_adx_{str(__import__("uuid").uuid4())[:8]}',
+                'type': 'technical',
+                'description': (
+                    f'ADX must rise above 20 confirming trend '
+                    f'(currently {_tc_adx:.0f}) — Murphy Ch.14'
+                ),
+                'config': {
+                    'metric': 'ADX',
+                    'operator': 'greater_than',
+                    'threshold': 20,
+                },
+            })
+
+        df_result.at[idx, 'Execution_Status'] = 'CONDITIONAL'
+        df_result.at[idx, 'Gate_Reason'] = (
+            f'R5.0: Theory compliance {_tc_score:.0f}/100 below floor '
+            f'{_THEORY_FLOOR_DIRECTIONAL} — chart signals contradict '
+            f'{_tc_bias} thesis. Monitoring via wait loop until signals '
+            f'align. {_tc_notes[:100]} [original: {_orig_gate}]'
+        )
+        df_result.at[idx, '_theory_compliance_conditions'] = _tc_conditions
+        _theory_demoted += 1
+        logger.info(
+            f"[R5.0] {df_result.at[idx, 'Ticker']} {df_result.at[idx, 'Strategy_Name']}: "
+            f"demoted READY→CONDITIONAL — theory={_tc_score:.0f} < {_THEORY_FLOOR_DIRECTIONAL}"
+        )
+
+    if _theory_demoted > 0:
+        logger.info(
+            f"[R5.0] Theory compliance floor: demoted {_theory_demoted} "
+            f"READY→CONDITIONAL (floor={_THEORY_FLOOR_DIRECTIONAL})"
+        )
+
     # ── BUG 4 FIX: Feedback_Calibration_Applied column ──────────────────────
     # Indicates whether feedback calibration was active for each row.
     # True  = doctrine_feedback table existed AND N >= _MIN_SAMPLE AND multiplier != 1.0
@@ -1394,67 +2120,72 @@ def apply_acceptance_logic(df: pd.DataFrame, expiry_intent: str = 'ANY', is_init
         df_result['Feedback_Calibration_Applied'] = False
 
     # ── IMP 5: Regime_Strategy_Fit column ────────────────────────────────────
-    # Natenberg Ch.19 / McMillan Ch.1 / Passarelli Ch.2 matrix lookup.
-    # Surfaces (Regime × Stress) → fit/caution/mismatch for the strategy's Capital_Bucket.
-    # Read-only derivation from existing columns — no logic change.
-    _REGIME_MATRIX_LOCAL = {
-        ('High Vol',    'CRISIS'):    {'fit': ['DEFENSIVE'],                          'caution': ['STRATEGIC'], 'mismatch': ['TACTICAL']},
-        ('High Vol',    'ELEVATED'):  {'fit': ['DEFENSIVE', 'STRATEGIC'],             'caution': ['TACTICAL'],  'mismatch': []},
-        ('High Vol',    'NORMAL'):    {'fit': ['DEFENSIVE', 'STRATEGIC'],             'caution': ['TACTICAL'],  'mismatch': []},
-        ('High Vol',    'LOW'):       {'fit': ['DEFENSIVE', 'STRATEGIC', 'TACTICAL'], 'caution': [],            'mismatch': []},
-        ('Compression', 'CRISIS'):    {'fit': ['DEFENSIVE'],                          'caution': ['STRATEGIC'], 'mismatch': ['TACTICAL']},
-        ('Compression', 'ELEVATED'):  {'fit': ['DEFENSIVE'],                          'caution': ['STRATEGIC'], 'mismatch': ['TACTICAL']},
-        ('Compression', 'NORMAL'):    {'fit': ['DEFENSIVE', 'STRATEGIC'],             'caution': ['TACTICAL'],  'mismatch': []},
-        ('Compression', 'LOW'):       {'fit': ['DEFENSIVE', 'STRATEGIC', 'TACTICAL'], 'caution': [],            'mismatch': []},
-        ('Low Vol',     'CRISIS'):    {'fit': ['DEFENSIVE'],                          'caution': ['STRATEGIC'], 'mismatch': ['TACTICAL']},
-        ('Low Vol',     'ELEVATED'):  {'fit': ['DEFENSIVE'],                          'caution': ['STRATEGIC'], 'mismatch': ['TACTICAL']},
-        ('Low Vol',     'NORMAL'):    {'fit': ['STRATEGIC', 'TACTICAL'],              'caution': ['DEFENSIVE'], 'mismatch': []},
-        ('Low Vol',     'LOW'):       {'fit': ['STRATEGIC', 'TACTICAL'],              'caution': ['DEFENSIVE'], 'mismatch': []},
-        ('Unknown',     'CRISIS'):    {'fit': ['DEFENSIVE'],                          'caution': [],            'mismatch': ['TACTICAL']},
-        ('Unknown',     'ELEVATED'):  {'fit': ['DEFENSIVE', 'STRATEGIC'],             'caution': ['TACTICAL'],  'mismatch': []},
-        ('Unknown',     'NORMAL'):    {'fit': ['DEFENSIVE', 'STRATEGIC', 'TACTICAL'], 'caution': [],            'mismatch': []},
-        ('Unknown',     'LOW'):       {'fit': ['DEFENSIVE', 'STRATEGIC', 'TACTICAL'], 'caution': [],            'mismatch': []},
-        # GAP 1: VVIX-driven regime overrides (step2 can produce these)
-        # 'Expansion'  = VVIX > 130  → treat like High Vol (defensive income only in crisis)
-        ('Expansion',   'CRISIS'):    {'fit': ['DEFENSIVE'],                          'caution': ['STRATEGIC'], 'mismatch': ['TACTICAL']},
-        ('Expansion',   'ELEVATED'):  {'fit': ['DEFENSIVE', 'STRATEGIC'],             'caution': ['TACTICAL'],  'mismatch': []},
-        ('Expansion',   'NORMAL'):    {'fit': ['DEFENSIVE', 'STRATEGIC'],             'caution': ['TACTICAL'],  'mismatch': []},
-        ('Expansion',   'LOW'):       {'fit': ['DEFENSIVE', 'STRATEGIC', 'TACTICAL'], 'caution': [],            'mismatch': []},
-        # 'Uncertain'  = VVIX > 100 + Compression → treat like Unknown (permissive but cautious)
-        ('Uncertain',   'CRISIS'):    {'fit': ['DEFENSIVE'],                          'caution': [],            'mismatch': ['TACTICAL']},
-        ('Uncertain',   'ELEVATED'):  {'fit': ['DEFENSIVE', 'STRATEGIC'],             'caution': ['TACTICAL'],  'mismatch': []},
-        ('Uncertain',   'NORMAL'):    {'fit': ['DEFENSIVE', 'STRATEGIC', 'TACTICAL'], 'caution': [],            'mismatch': []},
-        ('Uncertain',   'LOW'):       {'fit': ['DEFENSIVE', 'STRATEGIC', 'TACTICAL'], 'caution': [],            'mismatch': []},
-    }
-
-    def _lookup_regime_fit(row: pd.Series) -> str:
-        regime  = str(row.get('Regime') or 'Unknown')
-        # market_stress may be in different column names
-        stress  = str(row.get('market_stress') or row.get('Market_Stress') or 'NORMAL').upper()
-        bucket  = str(row.get('Capital_Bucket') or '').upper()
-        if not bucket:
-            return 'UNKNOWN'
-        entry = _REGIME_MATRIX_LOCAL.get((regime, stress))
-        if entry is None:
-            # Try normalizing stress to known values
-            for known_stress in ('CRISIS', 'ELEVATED', 'NORMAL', 'LOW'):
-                if known_stress in stress:
-                    entry = _REGIME_MATRIX_LOCAL.get((regime, known_stress))
-                    break
-        if entry is None:
-            return 'UNKNOWN'
-        if bucket in entry.get('fit', []):
-            return 'FIT'
-        if bucket in entry.get('caution', []):
-            return 'CAUTION'
-        if bucket in entry.get('mismatch', []):
-            return 'MISMATCH'
-        return 'UNKNOWN'
-
+    # Matrix + lookup extracted to scan_engine/scoring/filters.py
     if 'Capital_Bucket' in df_result.columns:
-        df_result['Regime_Strategy_Fit'] = df_result.apply(_lookup_regime_fit, axis=1)
+        df_result['Regime_Strategy_Fit'] = df_result.apply(lookup_regime_fit, axis=1)
     else:
         df_result['Regime_Strategy_Fit'] = 'UNKNOWN'
+
+    # ── DQS Multiplier Audit — drift monitoring ─────────────────────────────
+    # Persist per-candidate multiplier breakdown so we can detect long-term
+    # drift (e.g., a strategy consistently clamped).  Non-fatal on failure.
+    _audit_cols = ['Ticker', 'Strategy_Name', 'DQS_Combined_Multiplier',
+                   'DQS_Multiplier_Clamped', 'Calendar_DQS_Multiplier',
+                   'Calendar_Theta_Factor', 'Feedback_Action', 'DQS_Score']
+    _has_audit_cols = all(c in df_result.columns for c in _audit_cols)
+    if _has_audit_cols and not df_result.empty:
+        try:
+            from datetime import datetime as _audit_dt
+            _acon = get_domain_write_connection(DbDomain.SCAN)
+            _acon.execute("""
+                CREATE TABLE IF NOT EXISTS dqs_multiplier_audit (
+                    ticker              VARCHAR,
+                    strategy            VARCHAR,
+                    run_id              VARCHAR,
+                    scan_ts             TIMESTAMP,
+                    raw_dqs             DOUBLE,
+                    final_dqs           DOUBLE,
+                    timing_mult         DOUBLE,
+                    staleness_mult      DOUBLE,
+                    feedback_mult       DOUBLE,
+                    calendar_mult       DOUBLE,
+                    trajectory_mult     DOUBLE,
+                    combined_unclamped  DOUBLE,
+                    combined_clamped    DOUBLE,
+                    was_clamped         BOOLEAN
+                )
+            """)
+            _audit_ts = _audit_dt.utcnow()
+            for _, _ar in df_result.iterrows():
+                try:
+                    _acon.execute("""
+                        INSERT INTO dqs_multiplier_audit
+                        (ticker, strategy, run_id, scan_ts, raw_dqs, final_dqs,
+                         timing_mult, staleness_mult, feedback_mult, calendar_mult,
+                         trajectory_mult, combined_unclamped, combined_clamped, was_clamped)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, [
+                        str(_ar.get('Ticker', '')),
+                        str(_ar.get('Strategy_Name', '') or _ar.get('Strategy', '')),
+                        _run_id,
+                        _audit_ts,
+                        float(_ar['DQS_Score']) if pd.notna(_ar.get('DQS_Score')) else None,
+                        float(_ar['DQS_Score']) if pd.notna(_ar.get('DQS_Score')) else None,
+                        None,  # timing_mult — per-row not stored yet, reserved
+                        float(_ar['Data_Staleness_Penalty']) if pd.notna(_ar.get('Data_Staleness_Penalty')) else 1.0,
+                        None,  # feedback_mult — per-row not stored yet, reserved
+                        float(_ar['Calendar_DQS_Multiplier']) if pd.notna(_ar.get('Calendar_DQS_Multiplier')) else 1.0,
+                        float(_ar['Trajectory_Multiplier']) if pd.notna(_ar.get('Trajectory_Multiplier')) else 1.0,
+                        float(_ar['DQS_Combined_Multiplier']) if pd.notna(_ar.get('DQS_Combined_Multiplier')) else 1.0,
+                        float(_ar['DQS_Combined_Multiplier']) if pd.notna(_ar.get('DQS_Combined_Multiplier')) else 1.0,
+                        bool(_ar.get('DQS_Multiplier_Clamped', False)),
+                    ])
+                except Exception:
+                    pass  # per-row failures are non-critical
+            _acon.close()
+            logger.info(f"[MultiplierAudit] Persisted {len(df_result)} rows to dqs_multiplier_audit")
+        except Exception as _audit_err:
+            logger.debug(f"[MultiplierAudit] Write failed (non-critical): {_audit_err}")
 
     # ── GAP 7: Persist READY candidates to scan_candidates table ─────────────
     # Provides scan→management handshake: management can JOIN this table at entry
@@ -1463,11 +2194,8 @@ def apply_acceptance_logic(df: pd.DataFrame, expiry_intent: str = 'ANY', is_init
     _df_ready_candidates = df_result[df_result['Execution_Status'] == 'READY']
     if not _df_ready_candidates.empty:
         try:
-            import duckdb
             from datetime import datetime
-            _pipeline_db = os.path.join(os.path.dirname(__file__), '..', 'data', 'pipeline.duckdb')
-            _pipeline_db = os.path.abspath(_pipeline_db)
-            _con = duckdb.connect(_pipeline_db)
+            _con = get_domain_write_connection(DbDomain.SCAN)
             # GUARDRAIL 5: Use Run_ID (not Scan_TS) as part of PRIMARY KEY.
             # Scan_TS collides when two pipeline runs complete within the same second.
             # Run_ID is stable per pipeline invocation — unique rows guaranteed.
@@ -1516,7 +2244,7 @@ def apply_acceptance_logic(df: pd.DataFrame, expiry_intent: str = 'ANY', is_init
                 except Exception as _row_err:
                     logger.debug(f"[scan_candidates] Row insert failed for {_row.get('Ticker')}: {_row_err}")
             _con.close()
-            logger.info(f"[GAP7] scan_candidates: persisted {len(_df_ready_candidates)} READY rows to pipeline.duckdb")
+            logger.info(f"[GAP7] scan_candidates: persisted {len(_df_ready_candidates)} READY rows to scan.duckdb")
         except Exception as _db_err:
             logger.warning(f"[GAP7] scan_candidates write failed (non-critical): {_db_err}")
 
@@ -1543,53 +2271,9 @@ def apply_acceptance_logic(df: pd.DataFrame, expiry_intent: str = 'ANY', is_init
 
 
 # ============================================================
-# FILTERING UTILITIES
+# FILTERING UTILITIES — extracted to scan_engine/scoring/filters.py
+# filter_ready_contracts and sort_by_confidence imported at top.
 # ============================================================
-
-def filter_ready_contracts(df: pd.DataFrame, min_confidence: str = 'LOW') -> pd.DataFrame:
-    """
-    Filter for READY contracts.
-    
-    Args:
-        df: DataFrame from apply_acceptance_logic (now apply_execution_gate)
-        min_confidence: 'LOW' | 'MEDIUM' | 'HIGH'
-    
-    Returns:
-        Filtered DataFrame
-    """
-    confidence_hierarchy = {'LOW': 1, 'MEDIUM': 2, 'HIGH': 3}
-    min_level = confidence_hierarchy.get(min_confidence, 1)
-    
-    # Filter for READY only (excludes CONDITIONAL, BLOCKED, AWAIT_CONFIRMATION)
-    df_ready = df[df['Execution_Status'] == 'READY'].copy() # Renamed
-    
-    if not df_ready.empty:
-        df_ready['_confidence_level'] = df_ready['confidence_band'].map(confidence_hierarchy)
-        df_ready = df_ready[df_ready['_confidence_level'] >= min_level]
-        df_ready.drop(columns=['_confidence_level'], inplace=True)
-    
-    logger.info(f"🔍 Filtered for READY with {min_confidence}+ confidence: {len(df_ready)} contracts")
-    
-    return df_ready
-
-
-def sort_by_confidence(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Sort contracts by confidence band (HIGH → MEDIUM → LOW).
-
-    Args:
-        df: DataFrame from apply_acceptance_logic (now apply_execution_gate)
-
-    Returns:
-        Sorted DataFrame
-    """
-    confidence_order = {'HIGH': 1, 'MEDIUM': 2, 'LOW': 3, 'UNKNOWN': 4}
-    df_sorted = df.copy()
-    df_sorted['_confidence_sort'] = df_sorted['confidence_band'].map(confidence_order)
-    df_sorted = df_sorted.sort_values('_confidence_sort')
-    df_sorted.drop(columns=['_confidence_sort'], inplace=True)
-
-    return df_sorted
 
 
 # ============================================================
@@ -1615,7 +2299,7 @@ def persist_to_wait_list(df: pd.DataFrame, con) -> Dict[str, int]:
     RAG Source: docs/SMART_WAIT_DESIGN.md
     """
     try:
-        from core.wait_loop.schema import WaitListEntry, TradeStatus
+        from core.wait_loop.schema import WaitListEntry, TradeStatus, extract_contract_quality
         from core.wait_loop.persistence import save_wait_entry
         from core.wait_loop.ttl import calculate_expiry_deadline, get_ttl_config
         from .wait_condition_generator import (
@@ -1661,7 +2345,17 @@ def persist_to_wait_list(df: pd.DataFrame, con) -> Dict[str, int]:
             'Liquidity_Grade': row.get('Liquidity_Grade'),
             'Data_Completeness_Overall': row.get('Data_Completeness_Overall'),
             'chart_signal': row.get('Signal_Strength'),
-            'pcs_score': row.get('PCS_Score')
+            'pcs_score': row.get('PCS_Score'),
+            # R4.1 thesis quality: pre-generated conditions (if present)
+            '_thesis_wait_conditions': row.get('_thesis_wait_conditions'),
+            # Technical fields for R3.2 and R4.1 re-evaluation
+            'RSI': row.get('RSI'),
+            'SMA20': row.get('SMA20'),
+            'Last': row.get('Last') or row.get('last_price'),
+            'TQS_Score': row.get('TQS_Score'),
+            'Mid_Price': row.get('Mid_Price'),
+            'Entry_Band_Upper': row.get('Entry_Band_Upper'),
+            'Premium_vs_FairValue_Pct': row.get('Premium_vs_FairValue_Pct'),
         }
 
         # Check if should be permanently rejected
@@ -1686,9 +2380,10 @@ def persist_to_wait_list(df: pd.DataFrame, con) -> Dict[str, int]:
                 "config": {"delay_hours": 24}
             }]
 
-        # Calculate TTL
-        ttl_config = get_ttl_config(strategy_type)
-        wait_expires_at = calculate_expiry_deadline(now, strategy_type)
+        # Calculate TTL — LEAPs get LEAP TTL even though gated as DIRECTIONAL
+        _ttl_type = 'LEAP' if 'leap' in strategy_name.lower() else strategy_type
+        ttl_config = get_ttl_config(_ttl_type)
+        wait_expires_at = calculate_expiry_deadline(now, _ttl_type)
 
         # Create WaitListEntry
         # Strike may be a list [short, long] for spreads — DuckDB DOUBLE needs a scalar.
@@ -1733,6 +2428,7 @@ def persist_to_wait_list(df: pd.DataFrame, con) -> Dict[str, int]:
             invalidation_price=row.get('last_price', 0.0) * 0.90 if row.get('last_price') else None,  # 10% stop loss
             max_sessions_wait=ttl_config['max_sessions_wait'],
             max_days_wait=ttl_config['max_days_wait'],
+            contract_quality=extract_contract_quality(row),
             status=TradeStatus.ACTIVE,
             rejection_reason=None
         )
@@ -1778,3 +2474,150 @@ def persist_to_wait_list(df: pd.DataFrame, con) -> Dict[str, int]:
         'await_confirmation': await_confirmation_count,
         'rejected': rejected_count
     }
+
+
+def persist_verdict_skips_to_wait_list(df: pd.DataFrame, con) -> Dict[str, int]:
+    """
+    Persist verdict-SKIP candidates to the wait list with clearance conditions.
+
+    These are READY candidates that passed all step12 gates but were SKIP'd
+    by the execution verdict engine (interpreter weak, RSI overextended, etc.).
+    They get routed to the Smart WAIT Loop so the system monitors when their
+    blocking conditions clear.
+
+    Args:
+        df: DataFrame with Execution_Verdict == 'SKIP' rows
+        con: DuckDB connection
+
+    Returns:
+        Dict with counts: {'verdict_await': N}
+    """
+    try:
+        from core.wait_loop.schema import (
+            WaitListEntry, TradeStatus, ConfirmationCondition,
+            ConditionType, extract_contract_quality,
+        )
+        from core.wait_loop.persistence import save_wait_entry
+        from core.wait_loop.ttl import calculate_expiry_deadline, get_ttl_config
+        from scan_engine.execution_verdict import generate_verdict_wait_conditions
+        import uuid
+        from datetime import datetime
+    except ImportError as e:
+        logger.warning(f"[VERDICT_WAIT] Could not import modules: {e}")
+        return {'verdict_await': 0}
+
+    skip_df = df[df.get('Execution_Verdict', pd.Series(dtype=str)) == 'SKIP'].copy()
+    if skip_df.empty:
+        return {'verdict_await': 0}
+
+    logger.info(f"[VERDICT_WAIT] Processing {len(skip_df)} verdict-SKIP candidates for wait list")
+
+    verdict_await_count = 0
+    now = datetime.now()
+
+    for idx, row in skip_df.iterrows():
+        ticker = row.get('Ticker', 'UNKNOWN')
+        strategy_name = row.get('Strategy_Name', 'UNKNOWN')
+        strategy_type = row.get('Strategy_Type', 'UNKNOWN')
+        verdict_reason = row.get('Verdict_Reason', '')
+
+        # Generate clearance conditions from the verdict reason
+        try:
+            wait_conditions = generate_verdict_wait_conditions(verdict_reason, row)
+        except Exception as e:
+            logger.error(f"[VERDICT_WAIT] Error generating conditions for {ticker}: {e}")
+            wait_conditions = [{
+                "condition_id": f"verdict_time_{uuid.uuid4().hex[:8]}",
+                "type": "time_delay",
+                "description": "Wait for next scan to re-evaluate verdict",
+                "config": {"next_session": True}
+            }]
+
+        # TTL: LEAPs get LEAP TTL; directional gets shorter TTL than income
+        _ttl_type = 'LEAP' if 'leap' in strategy_name.lower() else strategy_type
+        ttl_config = get_ttl_config(_ttl_type)
+        wait_expires_at = calculate_expiry_deadline(now, _ttl_type)
+
+        # Handle strike serialization (same logic as persist_to_wait_list)
+        raw_strike = row.get('Strike')
+        if isinstance(raw_strike, (list, tuple)):
+            proposed_strike = float(raw_strike[0]) if raw_strike else None
+        elif isinstance(raw_strike, str) and raw_strike.strip().startswith('['):
+            import ast
+            try:
+                parsed = ast.literal_eval(raw_strike)
+                proposed_strike = float(parsed[0]) if parsed else None
+            except Exception:
+                proposed_strike = None
+        else:
+            proposed_strike = float(raw_strike) if raw_strike is not None else None
+
+        # Build WaitListEntry — gate_reason prefixed with VERDICT_SKIP for traceability
+        wait_entry = WaitListEntry(
+            wait_id=str(uuid.uuid4()),
+            ticker=ticker,
+            strategy_name=strategy_name,
+            strategy_type=strategy_type,
+            proposed_strike=proposed_strike,
+            proposed_expiration=row.get('Expiration'),
+            contract_symbol=row.get('Contract_Symbol'),
+            wait_started_at=now,
+            wait_expires_at=wait_expires_at,
+            last_evaluated_at=now,
+            evaluation_count=1,
+            wait_conditions=[],  # populated below
+            conditions_met=[],
+            wait_progress=0.0,
+            entry_price=row.get('last_price', 0.0),
+            entry_iv_30d=row.get('iv_30d'),
+            entry_hv_30=row.get('hv_30'),
+            entry_chart_signal=row.get('Signal_Strength'),
+            entry_pcs_score=row.get('PCS_Score'),
+            current_price=row.get('last_price'),
+            current_iv_30d=row.get('iv_30d'),
+            current_chart_signal=row.get('Signal_Strength'),
+            price_change_pct=0.0,
+            invalidation_price=(
+                row.get('last_price', 0.0) * 0.90
+                if row.get('last_price') else None
+            ),
+            max_sessions_wait=ttl_config['max_sessions_wait'],
+            max_days_wait=ttl_config['max_days_wait'],
+            contract_quality=extract_contract_quality(row),
+            status=TradeStatus.ACTIVE,
+            rejection_reason=f"VERDICT_SKIP: {verdict_reason}"
+        )
+
+        # Convert condition dicts to ConfirmationCondition objects
+        try:
+            wait_entry.wait_conditions = [
+                ConfirmationCondition(
+                    condition_id=c['condition_id'],
+                    condition_type=ConditionType(c['type']),
+                    description=c['description'],
+                    config=c['config'],
+                    is_met=False
+                )
+                for c in wait_conditions
+            ]
+
+            save_wait_entry(con, wait_entry)
+
+            # Update status in source DataFrame for dashboard visibility
+            df.at[idx, 'Execution_Status'] = 'AWAIT_VERDICT_CLEARANCE'
+            df.at[idx, 'Gate_Reason'] = f"VERDICT_SKIP: {verdict_reason} (monitoring {len(wait_conditions)} conditions)"
+
+            verdict_await_count += 1
+            logger.info(
+                f"[VERDICT_WAIT] {ticker} {strategy_name}: "
+                f"Saved to wait list ({len(wait_conditions)} conditions, "
+                f"TTL: {ttl_config['max_days_wait']}d)"
+            )
+        except Exception as e:
+            logger.error(f"[VERDICT_WAIT] Error saving {ticker} to wait list: {e}")
+            continue
+
+    logger.info(
+        f"[VERDICT_WAIT] Complete: {verdict_await_count} verdict-SKIP → wait list"
+    )
+    return {'verdict_await': verdict_await_count}

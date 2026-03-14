@@ -72,11 +72,44 @@ PIPELINE_DB_PATH = PROJECT_ROOT / "data" / "pipeline.duckdb"
 # Debug-mode isolated DuckDB (mini-production)
 DEBUG_PIPELINE_DB_PATH = PROJECT_ROOT / "data" / "pipeline_debug.duckdb"
 
+# === Domain-Split DuckDB Databases ===
+# Each engine writes to its own DB to eliminate single-writer lock contention.
+# Cross-domain reads use DuckDB ATTACH (read-only).
+SCAN_DB_PATH = get_env_path(
+    "SCAN_DB_PATH",
+    DATA_DIR / "scan.duckdb"
+)
+MANAGEMENT_DB_PATH = get_env_path(
+    "MANAGEMENT_DB_PATH",
+    DATA_DIR / "management.duckdb"
+)
+CHART_DB_PATH = get_env_path(
+    "CHART_DB_PATH",
+    DATA_DIR / "chart.duckdb"
+)
+WAIT_DB_PATH = get_env_path(
+    "WAIT_DB_PATH",
+    DATA_DIR / "wait.duckdb"
+)
+
+# === Known ETFs (excluded from earnings queries) ===
+KNOWN_ETFS = frozenset({
+    'SPY', 'QQQ', 'IWM', 'DIA', 'TLT', 'GLD', 'SLV', 'GDX',
+    'XLE', 'XLF', 'XLI', 'XLK', 'XLU', 'XLP', 'XLV', 'XLY',
+    'XLB', 'XLC', 'XRE', 'SMH', 'TECL',
+})
+
 # === Specialized DuckDB Ledgers ===
 # Historical IV time-series (ML/analysis use case)
 IV_HISTORY_DB_PATH = get_env_path(
     "IV_HISTORY_DB_PATH",
     DATA_DIR / "iv_history.duckdb"
+)
+
+# Market-wide context (VIX, VVIX, term structure, breadth, credit proxy)
+MARKET_DB_PATH = get_env_path(
+    "MARKET_DB_PATH",
+    DATA_DIR / "market.duckdb"
 )
 
 # Post-trade position tracking (Cycle 1/2/3 management engine)

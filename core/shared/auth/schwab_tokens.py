@@ -61,14 +61,30 @@ def load_tokens():
         logger.error(f"Failed to parse Schwab tokens: {e}")
         return None, "ERROR"
 
-def refresh_schwab_tokens():
+def _strip_quotes(val: str) -> str:
+    """Strip surrounding double/single quotes from credential values.
+
+    launchd plists can accidentally embed literal quotes, e.g.
+    ``<string>"abc123"</string>`` passes ``"abc123"`` (with quotes)
+    to the process.  This helper normalises to ``abc123``.
+    """
+    if val and len(val) >= 2:
+        if (val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'"):
+            return val[1:-1]
+    return val
+
+
+def refresh_schwab_tokens(*, _retry: int = 1):
     """
     Performs the refresh token flow and returns updated tokens.
     Uses environment variables for credentials.
+
+    Retries once on transient failures (network hiccup, Schwab flakiness).
+    Strips stray quotes from credentials (launchd plist defence).
     """
-    client_id = os.getenv("SCHWAB_APP_KEY") or os.getenv("SCHWAB_API_KEY")
-    client_secret = os.getenv("SCHWAB_APP_SECRET")
-    
+    client_id = _strip_quotes(os.getenv("SCHWAB_APP_KEY") or os.getenv("SCHWAB_API_KEY") or "")
+    client_secret = _strip_quotes(os.getenv("SCHWAB_APP_SECRET") or "")
+
     if not client_id or not client_secret:
         logger.error("Missing SCHWAB_APP_KEY or SCHWAB_APP_SECRET for token refresh.")
         return None
@@ -79,15 +95,15 @@ def refresh_schwab_tokens():
         return None
 
     logger.info("🔄 Refreshing Schwab access token...")
-    
+
     credentials = f"{client_id}:{client_secret}"
     encoded_creds = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
-    
+
     headers = {
         "Authorization": f"Basic {encoded_creds}",
         "Content-Type": "application/x-www-form-urlencoded"
     }
-    
+
     payload = {
         "grant_type": "refresh_token",
         "refresh_token": tokens["refresh_token"]
@@ -100,19 +116,31 @@ def refresh_schwab_tokens():
             data=payload,
             timeout=15
         )
-        
+
         if not response.ok:
             logger.error(f"❌ Refresh failed: {response.status_code} - {response.text}")
+            # Retry once on transient failure (network blip, Schwab rate limit)
+            if _retry > 0:
+                logger.info(f"🔁 Retrying token refresh in 3s ({_retry} retries left)...")
+                time.sleep(3)
+                return refresh_schwab_tokens(_retry=_retry - 1)
             return None
-            
+
         new_tokens = response.json()
         # Schwab rotates refresh tokens. If a new one isn't provided, keep the old one.
         if "refresh_token" not in new_tokens:
             new_tokens["refresh_token"] = tokens["refresh_token"]
-        
+
         save_tokens(new_tokens)
         logger.info("✅ Token refreshed and persisted.")
         return new_tokens
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Network error during token refresh: {e}")
+        if _retry > 0:
+            logger.info(f"🔁 Retrying token refresh in 3s ({_retry} retries left)...")
+            time.sleep(3)
+            return refresh_schwab_tokens(_retry=_retry - 1)
+        return None
     except Exception as e:
         logger.error(f"Unexpected error during token refresh: {e}", exc_info=True)
         return None

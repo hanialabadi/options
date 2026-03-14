@@ -578,39 +578,57 @@ def fetch_chain(
         "toDate":        to_date,
     }
 
-    try:
-        token = client._get_access_token()
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        }
+    for _attempt in range(2):  # attempt 0 = normal, attempt 1 = retry after 401 refresh
+        try:
+            token = client._get_access_token()
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            }
 
-        t0 = time.time()
-        response = requests.get(
-            f"{SCHWAB_API_BASE}/marketdata/v1/chains",
-            headers=headers,
-            params=params,
-            timeout=timeout,
-        )
-        elapsed = time.time() - t0
+            t0 = time.time()
+            response = requests.get(
+                f"{SCHWAB_API_BASE}/marketdata/v1/chains",
+                headers=headers,
+                params=params,
+                timeout=timeout,
+            )
+            elapsed = time.time() - t0
 
-        if response.status_code == 404:
-            logger.warning("[%s] Chain not found (404) — options may not trade", ticker)
+            if response.status_code == 404:
+                logger.warning("[%s] Chain not found (404) — options may not trade", ticker)
+                return None
+
+            # 401 mid-run: access token expired during long chain fetch loop.
+            # Reset the cached validation flag, refresh, and retry once.
+            if response.status_code == 401 and _attempt == 0:
+                logger.warning(
+                    "[%s] 401 Unauthorized — access token expired mid-run. "
+                    "Refreshing and retrying...", ticker,
+                )
+                if hasattr(client, "invalidate_token_cache"):
+                    client.invalidate_token_cache()
+                else:
+                    client._token_validated = False
+                continue  # retry with fresh token
+
+            response.raise_for_status()
+            data = response.json()
+
+            logger.debug("[%s] Chain fetched in %.2fs (status=%d)", ticker, elapsed, response.status_code)
+
+            return extract_iv_surface(data, ticker, spot)
+
+        except requests.exceptions.Timeout:
+            logger.warning("[%s] Chain fetch timed out after %ds", ticker, timeout)
+            return None
+        except requests.exceptions.HTTPError as exc:
+            logger.warning("[%s] Chain HTTP error: %s", ticker, exc)
+            return None
+        except Exception as exc:
+            logger.warning("[%s] Chain fetch failed: %s", ticker, exc)
             return None
 
-        response.raise_for_status()
-        data = response.json()
-
-        logger.debug("[%s] Chain fetched in %.2fs (status=%d)", ticker, elapsed, response.status_code)
-
-        return extract_iv_surface(data, ticker, spot)
-
-    except requests.exceptions.Timeout:
-        logger.warning("[%s] Chain fetch timed out after %ds", ticker, timeout)
-        return None
-    except requests.exceptions.HTTPError as exc:
-        logger.warning("[%s] Chain HTTP error: %s", ticker, exc)
-        return None
-    except Exception as exc:
-        logger.warning("[%s] Chain fetch failed: %s", ticker, exc)
-        return None
+    # Both attempts exhausted (should only reach here if 401 persisted after refresh)
+    logger.error("[%s] Chain fetch failed after token refresh retry", ticker)
+    return None

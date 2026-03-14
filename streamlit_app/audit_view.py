@@ -20,9 +20,10 @@ Read-only: nothing in this view writes to the DB.
 
 import streamlit as st
 import pandas as pd
-import duckdb
 import logging
 from pathlib import Path
+
+from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
 
 logger = logging.getLogger(__name__)
 
@@ -192,24 +193,8 @@ def render_audit_view(core_project_root: str, set_view=None) -> None:
         "which condition repeatedly causes losses."
     )
 
-    db_path = Path(core_project_root) / "data" / "pipeline.duckdb"
-    if not db_path.exists():
-        st.error(f"Pipeline DB not found at {db_path}")
-        return
-
     try:
-        # Attempt read-only; if stale lock from crashed writer, recover via checkpoint.
-        try:
-            con = duckdb.connect(str(db_path), read_only=True)
-        except Exception as lock_err:
-            if "Conflicting lock" in str(lock_err) or "lock" in str(lock_err).lower():
-                logger.warning(f"[AuditView] Stale DuckDB lock — attempting WAL recovery: {lock_err}")
-                _rc = duckdb.connect(str(db_path), read_only=False)
-                _rc.execute("CHECKPOINT")
-                _rc.close()
-                con = duckdb.connect(str(db_path), read_only=True)
-            else:
-                raise
+        con = get_domain_connection(DbDomain.PIPELINE, read_only=True)
     except Exception as e:
         st.error(f"Cannot open pipeline DB: {e}")
         return

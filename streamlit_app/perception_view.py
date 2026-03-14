@@ -4,30 +4,22 @@ import logging
 from pathlib import Path
 from datetime import datetime
 
+from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
+
 logger = logging.getLogger(__name__)
 
-try:
-    from core.shared.data_layer.duckdb_utils import connect_read_only as _connect_ro
-except ImportError:
-    import duckdb as _duckdb
-    def _connect_ro(path): return _duckdb.connect(path, read_only=True)
 
-def get_perception_db_path(core_project_root):
-    """Find the active DuckDB path."""
-    from core.shared.data_contracts.config import PIPELINE_DB_PATH
-    return PIPELINE_DB_PATH
+def _connect_pipeline_ro():
+    """Open a read-only connection to the PIPELINE domain DB."""
+    return get_domain_connection(DbDomain.PIPELINE, read_only=True)
 
 
 def get_perception_data(core_project_root, run_id=None):
     """
     Load Cycle 1 Perception data from DuckDB (Read-Only).
     """
-    db_path = get_perception_db_path(core_project_root)
-    if not db_path:
-        return pd.DataFrame()
-
     try:
-        with _connect_ro(str(db_path)) as con:
+        with _connect_pipeline_ro() as con:
             # Check for tables in order of authority
             tables = con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").df()['table_name'].tolist()
             
@@ -68,23 +60,21 @@ def render_perception_view(core_project_root, sanitize_func):
     st.title("📊 Cycle 1: Perception Loop")
     
     # --- Ingestion Status Panel ---
-    db_path = get_perception_db_path(core_project_root)
-    if db_path:
-        try:
-            with _connect_ro(str(db_path)) as con:
-                log_exists = con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'cycle1_ingest_log'").fetchone()[0] > 0
-                if log_exists:
-                    last_ingest = con.execute("SELECT * FROM cycle1_ingest_log ORDER BY ingestion_ts DESC LIMIT 1").df()
-                    if not last_ingest.empty:
-                        row = last_ingest.iloc[0]
-                        try:
-                            _ingest_ts = pd.to_datetime(row['ingestion_ts'])
-                            _ts_str = _ingest_ts.strftime("%b %d %Y  %I:%M %p")
-                        except Exception:
-                            _ts_str = str(row['ingestion_ts'])
-                        st.info(f"🧊 **Current Snapshot:** {_ts_str} | **File:** `{Path(row['source_file_path']).name}` | **Rows:** {row['row_count']}")
-        except Exception as e:
-            logger.warning(f"Could not load ingest log: {e}")
+    try:
+        with _connect_pipeline_ro() as con:
+            log_exists = con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'cycle1_ingest_log'").fetchone()[0] > 0
+            if log_exists:
+                last_ingest = con.execute("SELECT * FROM cycle1_ingest_log ORDER BY ingestion_ts DESC LIMIT 1").df()
+                if not last_ingest.empty:
+                    row = last_ingest.iloc[0]
+                    try:
+                        _ingest_ts = pd.to_datetime(row['ingestion_ts'])
+                        _ts_str = _ingest_ts.strftime("%b %d %Y  %I:%M %p")
+                    except Exception:
+                        _ts_str = str(row['ingestion_ts'])
+                    st.info(f"🧊 **Current Snapshot:** {_ts_str} | **File:** `{Path(row['source_file_path']).name}` | **Rows:** {row['row_count']}")
+    except Exception as e:
+        logger.warning(f"Could not load ingest log: {e}")
 
     # --- Cycle 1 Ingestion Controls ---
     with st.expander("📥 Ingestion Control Center", expanded=True):
@@ -187,25 +177,23 @@ def render_perception_view(core_project_root, sanitize_func):
     st.caption("Verbatim projection of the frozen broker-reported state. No interpretation, no enrichment.")
     
     # --- Run ID Selection ---
-    db_path = get_perception_db_path(core_project_root)
     run_ids = []
-    if db_path:
-        try:
-            with _connect_ro(str(db_path)) as con:
-                tables = con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").df()['table_name'].tolist()
-                
-                # We want to aggregate run_ids from all relevant tables
-                all_run_ids = pd.DataFrame()
-                for t in ['enriched_legs_v1', 'clean_legs_v2', 'clean_legs']:
-                    if t in tables:
-                        df = con.execute(f"SELECT DISTINCT run_id, MAX(Snapshot_TS) as ts FROM {t} GROUP BY run_id").df()
-                        all_run_ids = pd.concat([all_run_ids, df])
-                
-                if not all_run_ids.empty:
-                    run_ids_df = all_run_ids.groupby('run_id').agg({'ts': 'max'}).sort_values('ts', ascending=False).reset_index()
-                    run_ids = run_ids_df['run_id'].tolist()
-        except Exception as e:
-            logger.warning(f"Could not load run_ids: {e}")
+    try:
+        with _connect_pipeline_ro() as con:
+            tables = con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").df()['table_name'].tolist()
+
+            # We want to aggregate run_ids from all relevant tables
+            all_run_ids = pd.DataFrame()
+            for t in ['enriched_legs_v1', 'clean_legs_v2', 'clean_legs']:
+                if t in tables:
+                    df = con.execute(f"SELECT DISTINCT run_id, MAX(Snapshot_TS) as ts FROM {t} GROUP BY run_id").df()
+                    all_run_ids = pd.concat([all_run_ids, df])
+
+            if not all_run_ids.empty:
+                run_ids_df = all_run_ids.groupby('run_id').agg({'ts': 'max'}).sort_values('ts', ascending=False).reset_index()
+                run_ids = run_ids_df['run_id'].tolist()
+    except Exception as e:
+        logger.warning(f"Could not load run_ids: {e}")
 
     if not run_ids:
         st.warning("No perception data found in DuckDB. Run Cycle 1 to populate.")
@@ -230,8 +218,8 @@ def render_perception_view(core_project_root, sanitize_func):
         with d2:
             # Determine which table this run_id came from
             source_table = "Unknown"
-            if db_path:
-                with _connect_ro(str(db_path)) as con:
+            try:
+                with _connect_pipeline_ro() as con:
                     tables = con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").df()['table_name'].tolist()
                     for t in ['enriched_legs_v1', 'clean_legs_v2', 'clean_legs']:
                         if t in tables:
@@ -239,6 +227,8 @@ def render_perception_view(core_project_root, sanitize_func):
                             if count > 0:
                                 source_table = t
                                 break
+            except Exception:
+                pass
             st.markdown(f"**Table:** `{source_table}`")
         with d3:
             st.markdown(f"**Run ID:** `{selected_run_id}`")
@@ -258,52 +248,51 @@ def render_perception_view(core_project_root, sanitize_func):
     st.divider()
     st.subheader("🖥️ CLI Parity Verification")
     
-    if db_path:
-        try:
-            with _connect_ro(str(db_path)) as con:
-                # ARCHIVED count (Closed in this run or previously)
-                # For parity, we want to show what the CLI shows: ARCHIVED, ANCHORED, PRESERVED
-                # These are lifecycle events.
-                
-                # We need to look at the entry_anchors table for this run_id or around this time
-                # Actually, the CLI prints these based on the delta between DB and current snapshot.
-                # To show them in the dashboard, we should ideally have logged them.
-                # Since we have cycle1_ingest_log, let's see if we can derive them.
-                
-                # Find the max snapshot TS for this run across all tables
-                tables = con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").df()['table_name'].tolist()
-                max_ts = None
-                for t in ['enriched_legs_v1', 'clean_legs_v2', 'clean_legs']:
-                    if t in tables:
-                        ts = con.execute(f"SELECT MAX(Snapshot_TS) FROM {t} WHERE run_id = ?", [selected_run_id]).fetchone()[0]
-                        if ts:
-                            if max_ts is None or ts > max_ts:
-                                max_ts = ts
-                
-                # For now, let's show the counts from entry_anchors that are relevant.
-                anchored_count = 0
-                if max_ts:
-                    anchored_count = con.execute("SELECT COUNT(*) FROM entry_anchors WHERE Entry_Snapshot_TS = ?", [max_ts]).fetchone()[0]
-                
-                # Closed positions (Is_Active = FALSE)
-                # This is harder to attribute to a specific run without a join or better logging.
-                # But we can show total closed.
-                total_closed = con.execute("SELECT COUNT(*) FROM entry_anchors WHERE Is_Active = FALSE").fetchone()[0]
-                
-                # Preserved (Active and NOT new in this run)
-                total_active = con.execute("SELECT COUNT(*) FROM entry_anchors WHERE Is_Active = TRUE").fetchone()[0]
-                preserved_count = total_active - anchored_count
-                
-                p1, p2, p3 = st.columns(3)
-                with p1:
-                    st.metric("ANCHORED (New)", anchored_count)
-                with p2:
-                    st.metric("PRESERVED (Active)", preserved_count)
-                with p3:
-                    st.metric("ARCHIVED (Total Closed)", total_closed)
-                    
-        except Exception as e:
-            st.error(f"Error loading parity metrics: {e}")
+    try:
+        with _connect_pipeline_ro() as con:
+            # ARCHIVED count (Closed in this run or previously)
+            # For parity, we want to show what the CLI shows: ARCHIVED, ANCHORED, PRESERVED
+            # These are lifecycle events.
+
+            # We need to look at the entry_anchors table for this run_id or around this time
+            # Actually, the CLI prints these based on the delta between DB and current snapshot.
+            # To show them in the dashboard, we should ideally have logged them.
+            # Since we have cycle1_ingest_log, let's see if we can derive them.
+
+            # Find the max snapshot TS for this run across all tables
+            tables = con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").df()['table_name'].tolist()
+            max_ts = None
+            for t in ['enriched_legs_v1', 'clean_legs_v2', 'clean_legs']:
+                if t in tables:
+                    ts = con.execute(f"SELECT MAX(Snapshot_TS) FROM {t} WHERE run_id = ?", [selected_run_id]).fetchone()[0]
+                    if ts:
+                        if max_ts is None or ts > max_ts:
+                            max_ts = ts
+
+            # For now, let's show the counts from entry_anchors that are relevant.
+            anchored_count = 0
+            if max_ts:
+                anchored_count = con.execute("SELECT COUNT(*) FROM entry_anchors WHERE Entry_Snapshot_TS = ?", [max_ts]).fetchone()[0]
+
+            # Closed positions (Is_Active = FALSE)
+            # This is harder to attribute to a specific run without a join or better logging.
+            # But we can show total closed.
+            total_closed = con.execute("SELECT COUNT(*) FROM entry_anchors WHERE Is_Active = FALSE").fetchone()[0]
+
+            # Preserved (Active and NOT new in this run)
+            total_active = con.execute("SELECT COUNT(*) FROM entry_anchors WHERE Is_Active = TRUE").fetchone()[0]
+            preserved_count = total_active - anchored_count
+
+            p1, p2, p3 = st.columns(3)
+            with p1:
+                st.metric("ANCHORED (New)", anchored_count)
+            with p2:
+                st.metric("PRESERVED (Active)", preserved_count)
+            with p3:
+                st.metric("ARCHIVED (Total Closed)", total_closed)
+
+    except Exception as e:
+        st.error(f"Error loading parity metrics: {e}")
 
     # Position Table (Verbatim Projection)
     st.subheader("Cycle 1: Ground Truth Ledger")

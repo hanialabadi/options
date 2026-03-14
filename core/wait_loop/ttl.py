@@ -54,6 +54,18 @@ def get_ttl_config(strategy_type: str) -> Dict[str, Any]:
     return TTL_CONFIG.get(strategy_type.upper(), TTL_CONFIG["DEFAULT"])
 
 
+def _resolve_ttl_type(wait_entry: Dict[str, Any]) -> str:
+    """Resolve TTL type from a wait entry, detecting LEAPs from strategy_name.
+
+    LEAPs are classified as DIRECTIONAL for execution-gate routing but need
+    the longer LEAP TTL (10 sessions / 14 days instead of 3 / 5).
+    """
+    strategy_name = str(wait_entry.get("strategy_name", "") or "").lower()
+    if 'leap' in strategy_name:
+        return 'LEAP'
+    return wait_entry.get("strategy_type", "DEFAULT")
+
+
 def calculate_expiry_deadline(
     start_time: datetime,
     strategy_type: str
@@ -90,8 +102,8 @@ def should_expire(wait_entry: Dict[str, Any], now: Optional[datetime] = None) ->
     if now is None:
         now = datetime.now()
 
-    strategy_type = wait_entry.get("strategy_type", "DEFAULT")
-    ttl_config = get_ttl_config(strategy_type)
+    _ttl_type = _resolve_ttl_type(wait_entry)
+    ttl_config = get_ttl_config(_ttl_type)
 
     wait_started_at = wait_entry["wait_started_at"]
     wait_expires_at = wait_entry["wait_expires_at"]
@@ -123,10 +135,14 @@ def should_expire(wait_entry: Dict[str, Any], now: Optional[datetime] = None) ->
 
 def count_trading_sessions(start_time: datetime, end_time: datetime) -> int:
     """
-    Count number of trading sessions between two timestamps.
+    Count number of trading sessions *after* creation.
+
+    The creation day is not counted — an entry created Monday and evaluated
+    Wednesday has elapsed 2 sessions (Tuesday, Wednesday), not 3.  This
+    ensures ``max_sessions_wait=3`` gives 3 re-evaluation opportunities.
 
     Simplified implementation:
-    - Counts weekdays (Mon-Fri) between start and end
+    - Counts weekdays (Mon-Fri) between start and end, excluding start
     - Does not account for market holidays (acceptable approximation)
 
     Args:
@@ -134,12 +150,19 @@ def count_trading_sessions(start_time: datetime, end_time: datetime) -> int:
         end_time: End timestamp
 
     Returns:
-        Number of trading sessions
+        Number of trading sessions elapsed (excluding creation day)
     """
-    # Use pandas for efficient business day counting
+    start_date = start_time.date()
+    end_date = end_time.date()
+
+    if end_date <= start_date:
+        return 0
+
+    # Count business days from the day *after* creation to end (inclusive)
+    next_day = start_date + timedelta(days=1)
     date_range = pd.date_range(
-        start=start_time.date(),
-        end=end_time.date(),
+        start=next_day,
+        end=end_date,
         freq='B'  # Business days (Mon-Fri)
     )
 
@@ -166,8 +189,8 @@ def get_time_remaining(wait_entry: Dict[str, Any], now: Optional[datetime] = Non
 
     wait_started_at = wait_entry["wait_started_at"]
     wait_expires_at = wait_entry["wait_expires_at"]
-    strategy_type = wait_entry.get("strategy_type", "DEFAULT")
-    ttl_config = get_ttl_config(strategy_type)
+    _ttl_type = _resolve_ttl_type(wait_entry)
+    ttl_config = get_ttl_config(_ttl_type)
 
     # Time deltas
     time_remaining = wait_expires_at - now

@@ -452,19 +452,23 @@ def _calculate_history_penalties(row: pd.Series) -> Tuple[float, List[str]]:
     Returns:
         (total_penalty, list_of_reasons)
     """
-    iv_data_stale = row.get('iv_data_stale', False)
-    regime_confidence = row.get('regime_confidence', 1.0)
+    iv_data_stale = row.get('iv_data_stale')  # None = unknown, not "fresh"
+    regime_confidence = row.get('regime_confidence')  # None = unknown, not "100% confident"
     maturity_level = row.get('IV_Maturity_Level')
 
     penalties = []
     total_penalty = 0.0
 
-    if iv_data_stale:
+    if iv_data_stale is True:
         penalty = 15.0
         total_penalty += penalty
         penalties.append(f'Stale IV History (-{penalty:.0f} pts)')
+    elif iv_data_stale is None:
+        penalty = 10.0  # unknown staleness → partial penalty (less than confirmed stale)
+        total_penalty += penalty
+        penalties.append(f'IV staleness unknown (-{penalty:.0f} pts)')
 
-    if regime_confidence < 0.5:
+    if regime_confidence is not None and regime_confidence < 0.5:
         penalty = 10.0
         total_penalty += penalty
         penalties.append(f'Low Regime Confidence ({regime_confidence:.2f}, -{penalty:.0f} pts)')
@@ -508,8 +512,10 @@ def _calculate_premium_pricing_penalties(row: pd.Series) -> Tuple[float, List[st
     """
 
     strategy = row.get('Strategy', '') or row.get('Strategy_Name', '')
-    premium_vs_fv = row.get('Premium_vs_FairValue_Pct', 0)
-    iv_rank = row.get('IV_Rank_30D') or row.get('IV_Rank', 50)
+    _fv_raw = row.get('Premium_vs_FairValue_Pct')
+    premium_vs_fv = float(_fv_raw) if pd.notna(_fv_raw) else None
+    _ivr_raw = row.get('IV_Rank_30D') or row.get('IV_Rank')
+    iv_rank = float(_ivr_raw) if pd.notna(_ivr_raw) else None
     theta = row.get('Theta', 0)
     mid_price = row.get('Mid', 0)
 
@@ -550,30 +556,31 @@ def _calculate_premium_pricing_penalties(row: pd.Series) -> Tuple[float, List[st
                 penalties.append(f'Buy-Write low yield ({premium_yield_pct:.2f}% of capital, ideal >1%, -{penalty:.0f} pts)')
             # >= 1% yield: no penalty — worthwhile income for capital deployed
 
-    # 1. Premium vs Fair Value validation
-    if strategy in DIRECTIONAL_STRATEGIES:
-        # Buying premium - want discount (<0%), penalize premium (>5%)
-        if premium_vs_fv > 5:
-            penalty = (premium_vs_fv - 5) * 3.0  # -3 pts per % overpaying
-            total_penalty += penalty
-            penalties.append(f'Overpaying ({premium_vs_fv:+.1f}% vs fair value, -{penalty:.0f} pts)')
-        elif premium_vs_fv < -5:
-            # Getting discount - bonus
-            bonus = min(abs(premium_vs_fv) - 5, 10) * 0.5  # Up to +5 pts bonus (subtract from penalty)
-            total_penalty -= bonus  # Negative penalty = bonus
-            penalties.append(f'Discount pricing ({premium_vs_fv:+.1f}% vs fair value, +{bonus:.0f} pts)')
+    # 1. Premium vs Fair Value validation (skip if BS data missing)
+    if premium_vs_fv is not None:
+        if strategy in DIRECTIONAL_STRATEGIES:
+            # Buying premium - want discount (<0%), penalize premium (>5%)
+            if premium_vs_fv > 5:
+                penalty = (premium_vs_fv - 5) * 3.0  # -3 pts per % overpaying
+                total_penalty += penalty
+                penalties.append(f'Overpaying ({premium_vs_fv:+.1f}% vs fair value, -{penalty:.0f} pts)')
+            elif premium_vs_fv < -5:
+                # Getting discount - bonus
+                bonus = min(abs(premium_vs_fv) - 5, 10) * 0.5  # Up to +5 pts bonus (subtract from penalty)
+                total_penalty -= bonus  # Negative penalty = bonus
+                penalties.append(f'Discount pricing ({premium_vs_fv:+.1f}% vs fair value, +{bonus:.0f} pts)')
 
-    elif strategy in INCOME_STRATEGIES:
-        # Selling premium - want premium (>5%), penalize discount (<-5%)
-        if premium_vs_fv < -5:
-            penalty = (abs(premium_vs_fv) - 5) * 3.0  # -3 pts per % underselling
-            total_penalty += penalty
-            penalties.append(f'Underselling ({premium_vs_fv:+.1f}% vs fair value, -{penalty:.0f} pts)')
-        elif premium_vs_fv > 5:
-            # Selling at premium - bonus
-            bonus = min(premium_vs_fv - 5, 10) * 0.5  # Up to +5 pts bonus
-            total_penalty -= bonus
-            penalties.append(f'Premium pricing ({premium_vs_fv:+.1f}% vs fair value, +{bonus:.0f} pts)')
+        elif strategy in INCOME_STRATEGIES:
+            # Selling premium - want premium (>5%), penalize discount (<-5%)
+            if premium_vs_fv < -5:
+                penalty = (abs(premium_vs_fv) - 5) * 3.0  # -3 pts per % underselling
+                total_penalty += penalty
+                penalties.append(f'Underselling ({premium_vs_fv:+.1f}% vs fair value, -{penalty:.0f} pts)')
+            elif premium_vs_fv > 5:
+                # Selling at premium - bonus
+                bonus = min(premium_vs_fv - 5, 10) * 0.5  # Up to +5 pts bonus
+                total_penalty -= bonus
+                penalties.append(f'Premium pricing ({premium_vs_fv:+.1f}% vs fair value, +{bonus:.0f} pts)')
 
     # 2. IV Rank alignment (don't buy high IV, don't sell low IV)
     # RAG: Buying at IV Rank >80 = 2-sigma spike (Natenberg). Selling at <15 = cardinal sin (Cohen).

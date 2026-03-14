@@ -250,31 +250,15 @@ def recalibrate_and_filter(
     # ========================================
     logger.info("📈 Phase 4: Calculating enhanced PCS scores...")
     try:
-        # FIX 3: Disable PCS pre-maturity (Early Exit)
-        # PCS is illegal without mature IV.
+        # Log IV maturity distribution (informational only — no hard gate)
+        # Graduated penalties in _calculate_history_penalties handle quality discount:
+        #   Level 1 (<20d): -15 pts | Level 2 (20-60d): -10 pts | Level 3 (60-120d): -5 pts | Level 4+: 0
         if 'IV_Maturity_State' in df.columns:
-            immature_mask = df['IV_Maturity_State'] != 'MATURE'
-            if immature_mask.all():
-                logger.info("⚠️ Skipping PCS execution: All rows have IMMATURE IV")
-                df['PCS_Status'] = 'INACTIVE'
-                df['PCS_Score_V2'] = np.nan
-                df['PCS_Score'] = np.nan
-                df['Filter_Reason'] = 'IV_NOT_MATURE'
-                return _finalize_step10(df)  # DQS already applied above — safe to return
-            elif immature_mask.any():
-                logger.info(f"⚠️ Partial PCS execution: Skipping {immature_mask.sum()} immature IV rows")
-                # We will process the whole DF but overwrite immature rows after
-        
+            mat_counts = df['IV_Maturity_State'].value_counts().to_dict()
+            logger.info(f"   IV maturity distribution: {mat_counts}")
+
         df = calculate_pcs_score_v2(df)
-        
-        if 'IV_Maturity_State' in df.columns:
-            immature_mask = df['IV_Maturity_State'] != 'MATURE'
-            if immature_mask.any():
-                df.loc[immature_mask, 'PCS_Status'] = 'INACTIVE'
-                df.loc[immature_mask, 'PCS_Score_V2'] = np.nan
-                df.loc[immature_mask, 'PCS_Score'] = np.nan
-                df.loc[immature_mask, 'Filter_Reason'] = 'IV_NOT_MATURE'
-        
+
         analysis = analyze_pcs_distribution(df)
         logger.info(f"   ✅ PCS scoring complete")
         logger.info(f"      Mean score: {analysis.get('mean_score', 0):.1f}")
@@ -300,7 +284,53 @@ def recalibrate_and_filter(
         df['PCS_Score'] = 0.0
     
     df['Execution_Ready'] = False
-    
+
+    # ========================================
+    # PHASE 4B: STRATEGY INTERPRETER SCORING
+    # ========================================
+    # Runs ALONGSIDE existing DQS/TQS/PCS — does not replace them.
+    # Each strategy family gets a transparent component-by-component score.
+    # Adds: Interp_Score, Interp_Max, Interp_Status, Interp_Breakdown, Interp_Family
+    try:
+        from scan_engine.interpreters import get_interpreter
+        df['Interp_Score'] = np.nan
+        df['Interp_Max'] = np.nan
+        df['Interp_Status'] = ''
+        df['Interp_Breakdown'] = ''
+        df['Interp_Family'] = ''
+        df['Interp_Vol_Edge'] = ''
+        df['Interp_Interpretation'] = ''
+
+        _interp_count = 0
+        for idx, row in df.iterrows():
+            strategy = str(row.get('Strategy_Name', row.get('Strategy', '')) or '')
+            if not strategy:
+                continue
+            interp = get_interpreter(strategy)
+            result = interp.score(row)
+            vol_ctx = interp.interpret_volatility(row)
+
+            df.at[idx, 'Interp_Score'] = result.score
+            df.at[idx, 'Interp_Max'] = result.max_possible
+            df.at[idx, 'Interp_Status'] = result.status
+            df.at[idx, 'Interp_Breakdown'] = result.to_breakdown_str()
+            df.at[idx, 'Interp_Family'] = interp.family
+            df.at[idx, 'Interp_Vol_Edge'] = vol_ctx.edge_direction
+            df.at[idx, 'Interp_Interpretation'] = result.interpretation
+            _interp_count += 1
+
+        if _interp_count > 0:
+            _mean = df['Interp_Score'].dropna().mean()
+            _max_mean = df['Interp_Max'].dropna().mean()
+            _pct = (_mean / _max_mean * 100) if _max_mean > 0 else 0
+            logger.info(
+                f"   ✅ Interpreter scoring: {_interp_count} rows | "
+                f"mean {_mean:.1f}/{_max_mean:.0f} ({_pct:.0f}%) | "
+                f"families: {df['Interp_Family'].value_counts().to_dict()}"
+            )
+    except Exception as e:
+        logger.warning(f"   ⚠️ Interpreter scoring failed (non-blocking): {e}")
+
     # ========================================
     # PHASE 5: LEGACY VALIDATION (IF NEEDED)
     # ========================================

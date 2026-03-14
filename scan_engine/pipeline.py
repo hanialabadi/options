@@ -15,7 +15,10 @@ import json # Import the json module
 import duckdb # Import duckdb globally
 
 from core.shared.data_contracts.config import SCAN_OUTPUT_DIR
-from core.shared.data_layer.duckdb_utils import get_duckdb_write_connection, get_duckdb_connection, PIPELINE_DB_PATH
+from core.shared.data_layer.duckdb_utils import (
+    get_duckdb_write_connection, get_duckdb_connection, PIPELINE_DB_PATH,
+    get_domain_connection, get_domain_write_connection, DbDomain,
+)
 from .step2_load_and_enrich_snapshot import load_ivhv_snapshot
 from .step3_ivhv_gap_analysis import filter_ivhv_gap
 from .step4_chart_signals import compute_chart_signals
@@ -28,7 +31,7 @@ from .step10_fetch_contracts_schwab import fetch_and_select_contracts_schwab  # 
 from .step11_pcs_recalibration import recalibrate_and_filter
 from .step8_independent_evaluation import evaluate_strategies_independently
 from .step12_acceptance import (
-    apply_acceptance_logic, filter_ready_contracts, apply_execution_gate, # Phase 3 acceptance logic, and new Execution Gate
+    apply_acceptance_logic, filter_ready_contracts, apply_execution_gate, apply_post_gate_demotions, # Phase 3 acceptance logic, and new Execution Gate
     detect_directional_bias, detect_structure_bias, evaluate_timing_quality, # For calculating these within pipeline
     classify_strategy_type, # Import for Strategy_Type default
     persist_to_wait_list # Smart WAIT Loop integration
@@ -187,6 +190,7 @@ class PipelineContext:
         self.results = {}
         self.debug_manager = get_debug_manager()
         self.execution_monitor = ExecutionMonitor() # Instantiate ExecutionMonitor
+        self.missing_tracker = None  # initialized after run_ts is known
         
         logger.debug(f"DEBUG: PipelineContext init - output_dir param: {output_dir}, self.output_dir: {self.output_dir}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -417,6 +421,10 @@ def run_full_scan_pipeline(
     # Define run_ts at the beginning of the function
     run_ts = datetime.now()
 
+    # Missing-data diagnosis tracker — tags NaN fields with causal reasons
+    from core.shared.governance.missing_data_tracker import MissingDataTracker
+    ctx.missing_tracker = MissingDataTracker(run_id=run_ts.strftime('%Y%m%d_%H%M%S'))
+
     # Initialize Schwab client once here so it can be shared by Step 2 (OHLC)
     # and _finalize_results (market stress) — avoids duplicate auth calls.
     schwab_client = None
@@ -438,6 +446,10 @@ def run_full_scan_pipeline(
 
         # Initialize technical indicators table once per pipeline run
         initialize_technical_indicators_table(con=db_con)
+
+        # Signal Hub: prune stale signals (>365d) — retain YTD for behavioral memory
+        from core.shared.data_layer.technical_data_repository import prune_stale_signals
+        prune_stale_signals(max_age_days=365, con=db_con)
 
         # Initialize Smart WAIT Loop schema
         if WAIT_LOOP_AVAILABLE:
@@ -744,6 +756,11 @@ def _step2_load_data(ctx: PipelineContext, con: duckdb.DuckDBPyConnection, schwa
 
     ctx.results['snapshot'] = df
 
+    # Missing-data diagnosis: tag NaN fields with causal reasons
+    if ctx.missing_tracker:
+        ctx.missing_tracker.diagnose(df, step_num=2)
+        ctx.missing_tracker.audit_stage("step2", None, df)
+
     # FAIL-FAST VALIDATION: Ensure Step 2 outputs meet data contract
     validate_step_output(df, step_num=2, contract=STEP_2_OUTPUTS)
 
@@ -764,6 +781,8 @@ def _step3_filter_tickers(ctx: PipelineContext) -> bool:
     audit.profile("step3", df, (time.time()-t0)*1000)
     audit.save_df("step3_output", df)
     ctx.results['filtered'] = df
+    if ctx.missing_tracker:
+        ctx.missing_tracker.audit_stage("step3", ctx.results['snapshot'], df)
     ctx.debug_manager.record_step('step3_filtered', len(df), df)
     
     if ctx.audit_mode:
@@ -786,6 +805,9 @@ def _step5_6_enrich_and_validate(ctx: PipelineContext) -> bool:
     audit.profile("step5", df_charted, (time.time()-t0)*1000)
     audit.save_df("step5_output", df_charted)
     ctx.results['charted'] = df_charted
+    if ctx.missing_tracker:
+        ctx.missing_tracker.diagnose(df_charted, step_num=5)
+        ctx.missing_tracker.audit_stage("step5", ctx.results['filtered'], df_charted)
     ctx.debug_manager.record_step('step5_charted', len(df_charted), df_charted)
     
     if df_charted.empty:
@@ -851,7 +873,10 @@ def _pre_screen_before_chain_fetch(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    _INCOME_STRATS = {'csp', 'cc', 'buy_write', 'covered_call', 'cash_secured_put', 'buy-write'}
+    _INCOME_STRATS = {
+        'buy-write', 'buy_write', 'covered call', 'covered_call',
+        'cash-secured put', 'cash_secured_put', 'csp', 'pmcc',
+    }
 
     before_count = len(df)
     keep_mask = pd.Series(True, index=df.index)
@@ -899,17 +924,19 @@ def _pre_screen_before_chain_fetch(df: pd.DataFrame) -> pd.DataFrame:
             logger.info(f"[PreScreen] R4 (Unknown signal, non-income): dropping {r4_count} rows")
         keep_mask &= ~r4
 
-    # R5: IV_Maturity_Level == 1 — ALL strategies blocked at Step 12 maturity gate
-    # Step 12 hard-blocks every strategy when IV_Maturity_Level < 2 (insufficient history).
-    # This rule prevents new/immature tickers from consuming Schwab API budget for
-    # a guaranteed BLOCKED outcome. Supersedes R2 (which was income-only Level-1).
-    # Critical for S&P500 expansion: 300 new tickers start at Level 1 for ~20 trading days.
+    # R5: IV_Maturity_Level == 1 AND income strategy — income BLOCKED at Step 12.
+    # Income strategies require IV_Maturity_Level >= 4 at Step 12 (R0.3/R1.4).
+    # Directional/vol strategies with Level 1 are NOT blocked — Step 12 routes them
+    # to CONDITIONAL (R2.2/R2.2c), which is valid and feeds the wait list.
+    # Dropping directional Level-1 here killed 473+ valid chart-signal setups that
+    # Step 12 would have surfaced as CONDITIONAL candidates.
     if 'IV_Maturity_Level' in df.columns:
-        r5 = pd.to_numeric(df['IV_Maturity_Level'], errors='coerce').fillna(2) == 1
+        lv1 = pd.to_numeric(df['IV_Maturity_Level'], errors='coerce').fillna(2) == 1
+        r5 = lv1 & is_income
         r5_count = r5.sum()
         if r5_count:
-            logger.info(f"[PreScreen] R5 (Level-1 all strategies): dropping {r5_count} rows — "
-                        f"Step 12 maturity gate blocks these regardless of strategy type")
+            logger.info(f"[PreScreen] R5 (Level-1 income): dropping {r5_count} rows — "
+                        f"Step 12 income gate requires IV_Maturity_Level >= 4")
         keep_mask &= ~r5
 
     # R6: Leveraged ETF + LEAP strategy — belt-and-suspenders after Step 6 gate.
@@ -973,7 +1000,34 @@ def _step10_recalibrate_pcs(ctx: PipelineContext) -> bool:
         df['Primary_Strategy'] = df['Strategy_Name']
         
     recalibrated = recalibrate_and_filter(df)
+
+    # Fix Capital_Requirement for long options — Step 6 uses a $500 placeholder
+    # because actual premium is unknown pre-contract-fetch.  Now we have Mid_Price.
+    if 'Mid_Price' in recalibrated.columns and 'Strategy_Name' in recalibrated.columns:
+        recalibrated['Mid_Price'] = pd.to_numeric(recalibrated['Mid_Price'], errors='coerce')
+        _long_mask = recalibrated['Strategy_Name'].isin(['Long Call', 'Long Put'])
+        _has_mid   = recalibrated['Mid_Price'].notna() & (recalibrated['Mid_Price'] > 0)
+        _fix_mask  = _long_mask & _has_mid
+        if _fix_mask.any():
+            recalibrated.loc[_fix_mask, 'Capital_Requirement'] = recalibrated.loc[_fix_mask, 'Mid_Price'] * 100
+            logger.debug(f"   Corrected Capital_Requirement for {_fix_mask.sum()} long options using actual premium")
+
+    # Fix Capital_Requirement for CSP — Step 6 uses stock_price × 100 as proxy
+    # because actual strike is unknown pre-contract-fetch.  Now we have Selected_Strike.
+    # CSP collateral = strike × 100 (cash to secure 100 shares at strike).
+    if 'Selected_Strike' in recalibrated.columns and 'Strategy_Name' in recalibrated.columns:
+        recalibrated['Selected_Strike'] = pd.to_numeric(recalibrated['Selected_Strike'], errors='coerce')
+        _csp_mask = recalibrated['Strategy_Name'] == 'Cash-Secured Put'
+        _has_strike = recalibrated['Selected_Strike'].notna() & (recalibrated['Selected_Strike'] > 0)
+        _csp_fix = _csp_mask & _has_strike
+        if _csp_fix.any():
+            recalibrated.loc[_csp_fix, 'Capital_Requirement'] = recalibrated.loc[_csp_fix, 'Selected_Strike'] * 100
+            logger.debug(f"   Corrected Capital_Requirement for {_csp_fix.sum()} CSPs using actual strike")
+
     ctx.results['recalibrated_contracts'] = recalibrated
+    if ctx.missing_tracker:
+        ctx.missing_tracker.diagnose(recalibrated, step_num=10)
+        ctx.missing_tracker.audit_stage("step10", ctx.results.get('selected_contracts'), recalibrated)
     ctx.debug_manager.record_step('step10_recalibrated', len(recalibrated), recalibrated)
     return not recalibrated.empty
 
@@ -1016,14 +1070,20 @@ def _step_insert_technical_indicators(ctx: PipelineContext, con: duckdb.DuckDBPy
     desired_cols = [
         'Ticker', 'timestamp', 'RSI', 'ADX', 'SMA20', 'SMA50', 'EMA9', 'EMA21', 'Atr_Pct',
         'MACD', 'MACD_Signal', 'UpperBand_20', 'MiddleBand_20', 'LowerBand_20',
-        'SlowK_5_3', 'SlowD_5_3', 'IV_Rank_30D', 'PCS_Score_V2'
+        'SlowK_5_3', 'SlowD_5_3', 'IV_Rank_30D', 'PCS_Score_V2',
+        # Signal Hub v2 — institutional signals
+        'Market_Structure', 'OBV_Slope', 'Volume_Ratio',
+        'RSI_Divergence', 'MACD_Divergence', 'Weekly_Trend_Bias',
+        'Keltner_Squeeze_On', 'Keltner_Squeeze_Fired', 'RS_vs_SPY_20d',
+        # Signal Hub v2 — derived chart analytics
+        'Chart_Regime', 'BB_Position', 'ATR_Rank', 'MACD_Histogram', 'Trend_Slope',
     ]
     available_cols = [col for col in desired_cols if col in df_with_indicators.columns]
     missing_indicator_cols = set(desired_cols) - set(available_cols)
     if missing_indicator_cols:
         logger.warning(f"⚠️ Technical indicators step: {len(missing_indicator_cols)} columns missing from recalibrated_contracts, skipping: {sorted(missing_indicator_cols)}")
     indicators_to_insert = df_with_indicators[available_cols].copy()
-    
+
     indicators_to_insert = indicators_to_insert.rename(columns={
         'timestamp': 'Snapshot_TS',
         'RSI': 'RSI_14',
@@ -1034,7 +1094,7 @@ def _step_insert_technical_indicators(ctx: PipelineContext, con: duckdb.DuckDBPy
         'EMA21': 'EMA_21',
         'Atr_Pct': 'ATR_14'
     })
-    
+
     insert_technical_indicators(indicators_to_insert, con=con) # Pass connection
     logger.info(f"✅ Inserted {len(indicators_to_insert)} rows of technical indicators into DuckDB.")
 
@@ -1080,8 +1140,6 @@ def _step12_8_acceptance_and_sizing(ctx: PipelineContext, run_ts: datetime, con:
     audit.save_df("step12_input", input_df)
     t0 = time.time()
 
-    # GAP 5 FIX: Populate market_stress from Step 0 VIX/SPY data for step12_5 gate.
-    # Previously market_data=None made VIX/SPY gates inert in validate_market_context().
     # VIX and SPY_Change_Pct flow from Step 0 → Step 2 → downstream as columns.
     # Build market_stress column from available data; Step 9B uses this for spread thresholds.
     if 'market_stress' not in input_df.columns:
@@ -1107,6 +1165,211 @@ def _step12_8_acceptance_and_sizing(ctx: PipelineContext, run_ts: datetime, con:
             for v, s in zip(_vix_series, _spy_series)
         ]
         logger.info(f"[GAP5] market_stress populated: {input_df['market_stress'].value_counts().to_dict()}")
+
+    # ── Market Context Injection ─────────────────────────────────────────────
+    # Query composite market regime from market_context_daily and inject columns.
+    # If unavailable or low confidence, safe defaults are used. Non-blocking.
+    try:
+        from core.shared.data_layer.market_context import get_latest_market_context
+        from core.shared.data_layer.market_regime_classifier import classify_market_regime
+
+        _mkt_ctx = get_latest_market_context()
+        if _mkt_ctx is not None:
+            _mkt_regime = classify_market_regime(_mkt_ctx)
+            if _mkt_regime.confidence >= 0.5:
+                input_df["Market_Regime"] = _mkt_regime.regime
+                input_df["Market_Regime_Score"] = _mkt_regime.score
+                input_df["Market_Vol_Regime"] = _mkt_regime.vol_regime
+                input_df["Market_Term_Structure"] = _mkt_regime.term_structure
+                input_df["Market_Breadth_State"] = _mkt_regime.breadth_state
+                input_df["Market_Regime_Confidence"] = _mkt_regime.confidence
+                input_df["VIX_Percentile"] = _mkt_ctx.get("vix_percentile_252d", float("nan"))
+                input_df["CBOE_SKEW"] = _mkt_ctx.get("skew", float("nan"))
+                # Override market_stress with composite if confidence is high
+                input_df["market_stress"] = _mkt_regime.stress_level
+                logger.info(
+                    f"[MarketCtx] Injected: regime={_mkt_regime.regime} "
+                    f"score={_mkt_regime.score:.1f} conf={_mkt_regime.confidence:.2f}"
+                )
+            else:
+                logger.info(
+                    f"[MarketCtx] Low confidence ({_mkt_regime.confidence:.2f}) — using defaults"
+                )
+        else:
+            logger.debug("[MarketCtx] No market context data — using defaults")
+    except Exception as _mkt_err:
+        logger.debug(f"[MarketCtx] Injection failed (non-fatal): {_mkt_err}")
+
+    # Set safe defaults for any missing market context columns
+    _mkt_defaults = {
+        "Market_Regime": "UNKNOWN", "Market_Regime_Score": float("nan"),
+        "Market_Vol_Regime": "UNKNOWN", "Market_Term_Structure": "UNKNOWN",
+        "Market_Breadth_State": "UNKNOWN", "Market_Regime_Confidence": 0.0,
+        "VIX_Percentile": float("nan"), "CBOE_SKEW": float("nan"),
+    }
+    for _mc_col, _mc_default in _mkt_defaults.items():
+        if _mc_col not in input_df.columns:
+            input_df[_mc_col] = _mc_default
+
+    # ── Signal Trajectory (Scan Memory) ─────────────────────────────────────
+    # Pre-compute trajectory cache from scan_candidates + technical_indicators
+    # history and inject columns into the input DataFrame before Step 12.
+    # Graceful: if computation fails, all tickers get STABLE (×1.00).
+    try:
+        from scan_engine.signal_trajectory import compute_signal_trajectory
+        _traj_tickers = input_df['Ticker'].dropna().unique().tolist()
+        _traj_cache = compute_signal_trajectory(_traj_tickers, con=con)
+        input_df['Signal_Trajectory'] = input_df['Ticker'].map(
+            lambda t: _traj_cache.get(t, {}).get('trajectory', 'STABLE'))
+        input_df['Trajectory_Multiplier'] = input_df['Ticker'].map(
+            lambda t: _traj_cache.get(t, {}).get('multiplier', 1.0))
+        input_df['Score_Acceleration'] = input_df['Ticker'].map(
+            lambda t: _traj_cache.get(t, {}).get('score_acceleration', 0.0))
+        _non_stable = (input_df['Signal_Trajectory'] != 'STABLE').sum()
+        if _non_stable > 0:
+            logger.info(f"[Trajectory] {_non_stable}/{len(input_df)} candidates with non-STABLE trajectory")
+    except Exception as _traj_err:
+        logger.debug(f"[Trajectory] Pre-compute failed (non-fatal): {_traj_err}")
+        for _col, _default in [('Signal_Trajectory', 'STABLE'), ('Trajectory_Multiplier', 1.0), ('Score_Acceleration', 0.0)]:
+            if _col not in input_df.columns:
+                input_df[_col] = _default
+
+    # ── Behavioral Memory (30-Day Scan History) ─────────────────────────────
+    # Reads full 30-day arc from technical_indicators + scan_candidates.
+    # Tells step 12 *how the stock behaved* — not just where it is now.
+    # Produces: Regime_Duration, Regime_Path, ADX_30D_Trend,
+    #           Volume_Accumulation, DQS_30D_Trend, Behavioral_Score, etc.
+    try:
+        from scan_engine.behavioral_memory import compute_behavioral_memory
+        _bm_tickers = input_df['Ticker'].dropna().unique().tolist()
+        _bm_cache = compute_behavioral_memory(_bm_tickers, con=con)
+        _bm_cols = [
+            ('Regime_Duration', 0), ('Regime_Path', ''),
+            ('ADX_Trend', 'UNKNOWN'), ('RSI_Range', 0.0),
+            ('Volume_Accumulation', 'UNKNOWN'), ('Scan_Frequency', 0),
+            ('DQS_Trend', 'UNKNOWN'), ('Signal_Age', 0),
+            ('IV_Arc', 'UNKNOWN'), ('Earnings_Context', 'NO_DATA'),
+            ('Mgmt_Track_Record', 'NO_DATA'), ('Prior_Trades', 0),
+            ('Mgmt_Confidence', 'NONE'), ('Mgmt_Strategy_Detail', ''),
+            ('Mgmt_Recency_Factor', 1.0), ('Fault_Pattern', 'INSUFFICIENT_DATA'),
+            ('Contradiction_Flags', ''),
+            ('Move_Drivers', ''), ('Last_Dip_Context', ''),
+            ('Event_Reactions', ''), ('Worst_Event_Type', ''),
+            ('Data_Maturity', 'NEW_TICKER'),
+            ('History_Depth', 0), ('Behavioral_Score', 50),
+        ]
+        for _col, _default in _bm_cols:
+            input_df[_col] = input_df['Ticker'].map(
+                lambda t, c=_col, d=_default: _bm_cache.get(t, {}).get(c, d))
+        _bm_enriched = sum(1 for t in _bm_tickers
+                           if _bm_cache.get(t, {}).get('Behavioral_Score', 50) != 50)
+        if _bm_enriched > 0:
+            logger.info(
+                f"[BehavioralMemory] {_bm_enriched}/{len(_bm_tickers)} tickers "
+                f"enriched with YTD behavioral context")
+    except Exception as _bm_err:
+        logger.debug(f"[BehavioralMemory] Pre-compute failed (non-fatal): {_bm_err}")
+        for _col, _default in [('Regime_Duration', 0), ('Regime_Path', ''),
+                                ('ADX_Trend', 'UNKNOWN'), ('RSI_Range', 0.0),
+                                ('Volume_Accumulation', 'UNKNOWN'), ('Scan_Frequency', 0),
+                                ('DQS_Trend', 'UNKNOWN'), ('Signal_Age', 0),
+                                ('IV_Arc', 'UNKNOWN'), ('Earnings_Context', 'NO_DATA'),
+                                ('Mgmt_Track_Record', 'NO_DATA'), ('Prior_Trades', 0),
+                                ('Mgmt_Confidence', 'NONE'), ('Mgmt_Strategy_Detail', ''),
+                                ('Mgmt_Recency_Factor', 1.0), ('Fault_Pattern', 'INSUFFICIENT_DATA'),
+                                ('Contradiction_Flags', ''),
+                                ('Move_Drivers', ''), ('Last_Dip_Context', ''),
+                                ('Event_Reactions', ''), ('Worst_Event_Type', ''),
+                                ('Data_Maturity', 'NEW_TICKER'),
+                                ('History_Depth', 0), ('Behavioral_Score', 50)]:
+            if _col not in input_df.columns:
+                input_df[_col] = _default
+
+    # ── Wait List Deferral Patterns: enrich with historical wait list data ──
+    # Surfaces: how many times this ticker was deferred, promotion rate,
+    # common blocking conditions — so step 12 and the user aren't blind.
+    _deferral_cols = [
+        ('Deferral_Count_90d', 0), ('Deferral_Promotion_Rate', 0.0),
+        ('Deferral_Avg_Wait_Days', 0.0), ('Deferral_Common_Block', ''),
+    ]
+    try:
+        from core.wait_loop.schema import query_deferral_patterns
+        _def_cache = {}
+        for _t in input_df['Ticker'].dropna().unique():
+            _dp = query_deferral_patterns(con, str(_t), lookback_days=90)
+            if _dp.get('deferral_count', 0) > 0:
+                _common = _dp.get('common_conditions', [])
+                _common_str = '; '.join(f"{k} ({v})" for k, v in _common[:3]) if _common else ''
+                _def_cache[str(_t)] = {
+                    'Deferral_Count_90d': _dp['deferral_count'],
+                    'Deferral_Promotion_Rate': round(_dp['promotion_rate'], 2),
+                    'Deferral_Avg_Wait_Days': _dp['avg_wait_days'],
+                    'Deferral_Common_Block': _common_str,
+                }
+        for _col, _default in _deferral_cols:
+            input_df[_col] = input_df['Ticker'].map(
+                lambda t, c=_col, d=_default: _def_cache.get(str(t), {}).get(c, d))
+        _def_enriched = len(_def_cache)
+        if _def_enriched > 0:
+            logger.info(
+                f"[DeferralPatterns] {_def_enriched} tickers enriched "
+                f"with wait list history (90d)")
+    except Exception as _dp_err:
+        logger.debug(f"[DeferralPatterns] Enrichment failed (non-fatal): {_dp_err}")
+        for _col, _default in _deferral_cols:
+            if _col not in input_df.columns:
+                input_df[_col] = _default
+
+    # ── Scale-Up Bridge: read pending management requests ───────────────────
+    # Inject into context so Step 12 can match READY/CONDITIONAL candidates.
+    _scale_up_requests = pd.DataFrame()
+    try:
+        from core.shared.data_layer.scale_up_requests import read_pending_scale_up_requests
+        _scale_up_requests = read_pending_scale_up_requests(con, limit=5)
+        if not _scale_up_requests.empty:
+            logger.info(f"[ScaleUp] Loaded {len(_scale_up_requests)} pending scale-up requests")
+    except Exception as _su_read_err:
+        logger.debug(f"[ScaleUp] Read failed (non-fatal): {_su_read_err}")
+    ctx.results['scale_up_requests'] = _scale_up_requests
+
+    # ── Calendar Deferral: read prior-day deferrals and tag returning candidates ──
+    _deferred_set = set()  # (ticker, strategy) pairs deferred from prior session
+    _deferred_info = {}    # (ticker, strategy) → {dqs_score, deferred_date, ...}
+    try:
+        from scan_engine.calendar_deferral import read_pending_deferrals, expire_stale_deferrals
+        _def_con = get_domain_write_connection(DbDomain.SCAN)
+        expire_stale_deferrals(_def_con)
+        _pending = read_pending_deferrals(_def_con)
+        _def_con.close()
+        if not _pending.empty:
+            for _, _dr in _pending.iterrows():
+                _key = (str(_dr.get('ticker', '')), str(_dr.get('strategy_name', '')))
+                _deferred_set.add(_key)
+                _deferred_info[_key] = {
+                    'dqs_score': _dr.get('dqs_score'),
+                    'deferred_date': str(_dr.get('deferred_date', '')),
+                    'entry_price': _dr.get('entry_price'),
+                    'calendar_flag': _dr.get('calendar_flag', ''),
+                }
+            logger.info(f"[CalendarDeferral] {len(_deferred_set)} candidates returning from prior deferral")
+            # Tag returning candidates in input_df
+            input_df['Calendar_Deferred_Return'] = input_df.apply(
+                lambda r: (str(r.get('Ticker', '')), str(r.get('Strategy_Name', '') or r.get('Strategy', ''))) in _deferred_set,
+                axis=1,
+            )
+            input_df['Deferred_From_Date'] = input_df.apply(
+                lambda r: _deferred_info.get(
+                    (str(r.get('Ticker', '')), str(r.get('Strategy_Name', '') or r.get('Strategy', ''))), {}
+                ).get('deferred_date', ''),
+                axis=1,
+            )
+    except Exception as _def_read_err:
+        logger.debug(f"[CalendarDeferral] Read failed (non-fatal): {_def_read_err}")
+    if 'Calendar_Deferred_Return' not in input_df.columns:
+        input_df['Calendar_Deferred_Return'] = False
+        input_df['Deferred_From_Date'] = ''
+    ctx.results['calendar_deferred_set'] = _deferred_set
+    ctx.results['calendar_deferred_info'] = _deferred_info
 
     # Apply the Execution Gate row by row
     # First, ensure necessary columns for the gate are present, defaulting if not
@@ -1154,7 +1417,9 @@ def _step12_8_acceptance_and_sizing(ctx: PipelineContext, run_ts: datetime, con:
         lambda row: detect_structure_bias(
             row.get('compression_tag', 'UNKNOWN'),
             row.get('52w_regime_tag', 'UNKNOWN'),
-            row.get('momentum_tag', 'UNKNOWN')
+            row.get('momentum_tag', 'UNKNOWN'),
+            adx=row.get('ADX', 0),
+            chart_regime=row.get('Chart_Regime', '')
         ), axis=1
     )
     input_df['timing_quality'] = input_df.apply(
@@ -1206,13 +1471,45 @@ def _step12_8_acceptance_and_sizing(ctx: PipelineContext, run_ts: datetime, con:
     
     # Merge the decision back into the original DataFrame
     df_with_decisions = input_df.copy()
-    for col in ['Execution_Status', 'Gate_Reason', 'confidence_band', 'directional_bias', 'structure_bias', 'timing_quality', 'execution_adjustment',
-                'Calibrated_Confidence', 'Feedback_Win_Rate', 'Feedback_Sample_N', 'Feedback_Action', 'Feedback_Note',
-                'Calendar_Risk_Flag', 'Calendar_Risk_Note']:
+    _decision_cols_to_merge = [
+        'Execution_Status', 'Gate_Reason', 'confidence_band', 'directional_bias', 'structure_bias', 'timing_quality', 'execution_adjustment',
+        'Calibrated_Confidence', 'Feedback_Win_Rate', 'Feedback_Sample_N', 'Feedback_Action', 'Feedback_Note',
+        'Calendar_Risk_Flag', 'Calendar_Risk_Note',
+        'Calendar_DQS_Multiplier', 'Calendar_Theta_Factor', 'DQS_Combined_Multiplier', 'DQS_Multiplier_Clamped',
+        'Signal_Trajectory', 'Trajectory_Multiplier', 'Score_Acceleration',
+        # Blind-spot detection (directional only)
+        'Blind_Spot_Multiplier', 'Blind_Spot_Notes',
+        # IV Headwind (long vega only)
+        'IV_Headwind_Multiplier', 'IV_Headwind_Note',
+        # Behavioral memory
+        'Behavioral_Multiplier', 'Behavioral_Note',
+        # MC extensions (directional gate)
+        'MC_VP_Score', 'MC_VP_Edge', 'MC_VP_Premium_Fair', 'MC_VP_Verdict', 'MC_VP_Note',
+        'MC_Earn_EV_Hold', 'MC_Earn_EV_Close', 'MC_Earn_P_Profit', 'MC_Earn_Verdict', 'MC_Earn_Edge', 'MC_Earn_Note',
+        # Action Priority
+        'Trade_Edge_Score',
+        # LEAP rate sensitivity (Rho annotation)
+        'LEAP_Rate_Sensitivity',
+    ]
+    for col in _decision_cols_to_merge:
         if col in all_acceptance_pass.columns:
-            df_with_decisions[col] = all_acceptance_pass[col]
-        else:
-            df_with_decisions[col] = np.nan # Ensure column exists even if apply_execution_gate didn't return it
+            # Only overwrite if the gate actually returned values for this column.
+            # For the initial pass, some columns (Calendar, Trajectory) won't be in the
+            # gate output — preserve the pipeline-injected values from input_df.
+            if col in input_df.columns and all_acceptance_pass[col].isna().all():
+                # Gate returned all-NaN for this column — keep original input_df values
+                pass
+            else:
+                df_with_decisions[col] = all_acceptance_pass[col]
+        elif col not in df_with_decisions.columns:
+            # String-valued columns must be object dtype so pass-2 merge doesn't coerce strings to NaN
+            if col in {'MC_VP_Verdict', 'MC_VP_Note', 'MC_Earn_Verdict', 'MC_Earn_Note',
+                        'Feedback_Action', 'Feedback_Note', 'Calendar_Risk_Flag',
+                        'Calendar_Risk_Note', 'Signal_Trajectory',
+                        'Blind_Spot_Notes', 'IV_Headwind_Note', 'Behavioral_Note'}:
+                df_with_decisions[col] = pd.Series([np.nan] * len(df_with_decisions), dtype=object)
+            else:
+                df_with_decisions[col] = np.nan  # Ensure column exists even if apply_execution_gate didn't return it
 
     # Update the main 'acceptance_all' in ctx.results
     if is_initial_pass:
@@ -1226,7 +1523,29 @@ def _step12_8_acceptance_and_sizing(ctx: PipelineContext, run_ts: datetime, con:
         # multiple strategies per ticker without cross-contaminating decisions.
         decision_cols = ['Execution_Status', 'Gate_Reason', 'confidence_band', 'directional_bias', 'structure_bias', 'timing_quality', 'execution_adjustment',
                          'Calibrated_Confidence', 'Feedback_Win_Rate', 'Feedback_Sample_N', 'Feedback_Action', 'Feedback_Note',
-                         'Calendar_Risk_Flag', 'Calendar_Risk_Note']
+                         'Calendar_Risk_Flag', 'Calendar_Risk_Note',
+                         'Calendar_DQS_Multiplier', 'Calendar_Theta_Factor', 'DQS_Combined_Multiplier', 'DQS_Multiplier_Clamped',
+                         'Signal_Trajectory', 'Trajectory_Multiplier', 'Score_Acceleration',
+                         'Blind_Spot_Multiplier', 'Blind_Spot_Notes',
+                         'IV_Headwind_Multiplier', 'IV_Headwind_Note',
+                         'Behavioral_Multiplier', 'Behavioral_Note',
+                         'MC_VP_Score', 'MC_VP_Edge', 'MC_VP_Premium_Fair', 'MC_VP_Verdict', 'MC_VP_Note',
+                         'MC_Earn_EV_Hold', 'MC_Earn_EV_Close', 'MC_Earn_P_Profit', 'MC_Earn_Verdict', 'MC_Earn_Edge', 'MC_Earn_Note',
+                         'Trade_Edge_Score',
+                         'LEAP_Rate_Sensitivity']
+        # Ensure string-valued columns have object dtype (not float64 from NaN-only pass 1)
+        _string_decision_cols = {'Execution_Status', 'Gate_Reason', 'confidence_band', 'directional_bias',
+                                 'structure_bias', 'timing_quality', 'execution_adjustment',
+                                 'Feedback_Action', 'Feedback_Note', 'Calendar_Risk_Flag',
+                                 'Calendar_Risk_Note', 'Signal_Trajectory',
+                                 'Blind_Spot_Notes', 'IV_Headwind_Note', 'Behavioral_Note',
+                                 'MC_VP_Verdict', 'MC_VP_Note',
+                                 'MC_Earn_Verdict', 'MC_Earn_Note',
+                                 'LEAP_Rate_Sensitivity'}
+        for _sc in _string_decision_cols:
+            if _sc in original_acceptance_all.columns and pd.api.types.is_float_dtype(original_acceptance_all[_sc].dtype):
+                original_acceptance_all[_sc] = original_acceptance_all[_sc].astype(object)
+
         for _, dec_row in df_with_decisions.iterrows():
             mask = (
                 (original_acceptance_all['Ticker'] == dec_row['Ticker']) &
@@ -1254,6 +1573,42 @@ def _step12_8_acceptance_and_sizing(ctx: PipelineContext, run_ts: datetime, con:
 
     all_acceptance = ctx.results['acceptance_all'] # Reference the updated DataFrame
 
+    # ── Scale-Up Bridge: match READY/CONDITIONAL candidates to management requests ──
+    _su_requests = ctx.results.get('scale_up_requests', pd.DataFrame())
+    if not _su_requests.empty and not all_acceptance.empty:
+        try:
+            _su_matched = 0
+            for _, _su_req in _su_requests.iterrows():
+                _su_t = str(_su_req.get('ticker', ''))
+                _su_s = str(_su_req.get('strategy', ''))
+                _m = (
+                    (all_acceptance['Ticker'] == _su_t) &
+                    (all_acceptance['Execution_Status'].isin(['READY', 'CONDITIONAL']))
+                )
+                if _m.any():
+                    all_acceptance.loc[_m, 'Scale_Up_Candidate'] = True
+                    all_acceptance.loc[_m, 'Scale_Up_Trigger_Price'] = _su_req.get('trigger_price')
+                    all_acceptance.loc[_m, 'Scale_Up_Add_Contracts'] = _su_req.get('add_contracts', 1)
+                    all_acceptance.loc[_m, 'Scale_Up_Priority'] = _su_req.get('priority', 3)
+                    _su_matched += int(_m.sum())
+                    try:
+                        from core.shared.data_layer.scale_up_requests import mark_request_filled
+                        mark_request_filled(con, _su_t, _su_s, filled_run_id=ctx.results.get('run_id'))
+                    except Exception:
+                        pass
+            if _su_matched > 0:
+                logger.info(f"[ScaleUp] Tagged {_su_matched} READY/CONDITIONAL rows as scale-up candidates")
+            ctx.results['acceptance_all'] = all_acceptance
+        except Exception as _su_err:
+            logger.debug(f"[ScaleUp] Matching failed (non-fatal): {_su_err}")
+
+    # ── R4.2–R4.5: Post-gate demotion sweep ─────────────────────────────────
+    # These gates require the full DataFrame (not per-row) to check cross-row
+    # properties like evaluator verdicts, DQS floors, and regime conflicts.
+    # Previously lived in apply_acceptance_logic() (dead code path).
+    all_acceptance = apply_post_gate_demotions(all_acceptance)
+    ctx.results['acceptance_all'] = all_acceptance
+
     audit.profile("step12", all_acceptance, (time.time()-t0)*1000)
     audit.save_df("step12_output", all_acceptance)
     # === CANONICAL ACCEPTANCE STATUS GUARANTEE ===
@@ -1264,6 +1619,71 @@ def _step12_8_acceptance_and_sizing(ctx: PipelineContext, run_ts: datetime, con:
 
     logger.info("✅ acceptance_status column created from Execution_Status for audit layer")
     audit.export_ready_now_evidence(all_acceptance) # Uses Execution_Status
+
+    # ── Trade Edge Score: composite quality metric for Action Priority ranking ──────
+    # Combines DQS (40%), TQS (25%), Structure Confluence (20%), VP Edge (15%)
+    # into a single 0-100 score. APS = Edge × 0.70 + Timing × 0.30 in scan_view.
+    try:
+        def _compute_trade_edge(row):
+            _exec_st = str(row.get('Execution_Status', '') or '').upper()
+            if _exec_st not in ('READY', 'AWAIT_CONFIRMATION'):
+                return np.nan
+
+            # DQS (40% weight) — 0-100
+            _dqs = pd.to_numeric(row.get('DQS_Score'), errors='coerce')
+            _dqs_contrib = (float(_dqs) / 100.0 * 40.0) if pd.notna(_dqs) else 0.0
+
+            # TQS (25% weight) — 0-100
+            _tqs = pd.to_numeric(row.get('TQS_Score'), errors='coerce')
+            _tqs_contrib = (float(_tqs) / 100.0 * 25.0) if pd.notna(_tqs) else 0.0
+
+            # Structure Confluence (20% weight) — count aligned signals
+            _confluence = 0
+            _strat = str(row.get('Strategy_Name', '') or '').upper()
+            _is_bearish = 'PUT' in _strat
+            _is_bullish = 'CALL' in _strat and 'COVERED' not in _strat
+
+            _struct = str(row.get('Market_Structure', '') or '').upper()
+            if (_is_bullish and 'UPTREND' in _struct) or (_is_bearish and 'DOWNTREND' in _struct):
+                _confluence += 1
+            _weekly = str(row.get('Weekly_Trend_Bias', '') or '').upper()
+            if 'ALIGNED' in _weekly:
+                _confluence += 1
+            _adx = pd.to_numeric(row.get('ADX'), errors='coerce')
+            if pd.notna(_adx) and float(_adx) >= 25:
+                _confluence += 1
+            _obv = pd.to_numeric(row.get('OBV_Slope'), errors='coerce')
+            if pd.notna(_obv):
+                if (_is_bullish and float(_obv) > 5) or (_is_bearish and float(_obv) < -5):
+                    _confluence += 1
+            _rs = pd.to_numeric(row.get('RS_vs_SPY_20d'), errors='coerce')
+            if pd.notna(_rs):
+                if (_is_bullish and float(_rs) > 2) or (_is_bearish and float(_rs) < -2):
+                    _confluence += 1
+            # 5 possible signals → 0-20 points
+            _conf_contrib = (_confluence / 5.0) * 20.0
+
+            # VP Edge (15% weight) — MC_VP_Score: >1.15 = full credit, <0.75 = zero
+            _vp = pd.to_numeric(row.get('MC_VP_Score'), errors='coerce')
+            if pd.notna(_vp):
+                _vp_norm = min(1.0, max(0.0, (float(_vp) - 0.75) / 0.60))  # 0.75→0, 1.35→1.0
+                _vp_contrib = _vp_norm * 15.0
+            else:
+                _vp_contrib = 7.5  # neutral when no VP data
+
+            return round(_dqs_contrib + _tqs_contrib + _conf_contrib + _vp_contrib, 1)
+
+        all_acceptance['Trade_Edge_Score'] = all_acceptance.apply(_compute_trade_edge, axis=1)
+        _edge_valid = all_acceptance['Trade_Edge_Score'].dropna()
+        if not _edge_valid.empty:
+            logger.info(
+                f"📊 Trade Edge Score: {len(_edge_valid)} scored | "
+                f"mean={_edge_valid.mean():.0f} | max={_edge_valid.max():.0f} | "
+                f"≥75: {(_edge_valid >= 75).sum()} | ≥50: {(_edge_valid >= 50).sum()}"
+            )
+    except Exception as _edge_err:
+        logger.debug(f"Trade Edge Score computation failed (non-fatal): {_edge_err}")
+        all_acceptance['Trade_Edge_Score'] = np.nan
 
     ctx.results['acceptance_all'] = all_acceptance
     ctx.debug_manager.record_step('step12_acceptance_all', len(all_acceptance), all_acceptance)
@@ -1286,8 +1706,7 @@ def _step12_8_acceptance_and_sizing(ctx: PipelineContext, run_ts: datetime, con:
                 import uuid as _uuid
                 _run_id = run_ts.strftime('%Y%m%d_%H%M%S')
                 _scan_ts = run_ts
-                _pipeline_db = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'pipeline.duckdb'))
-                _sc_con = duckdb.connect(_pipeline_db)
+                _sc_con = get_domain_write_connection(DbDomain.SCAN)
                 _sc_con.execute("""
                     CREATE TABLE IF NOT EXISTS scan_candidates (
                         Ticker              VARCHAR NOT NULL,
@@ -1351,10 +1770,128 @@ def _step12_8_acceptance_and_sizing(ctx: PipelineContext, run_ts: datetime, con:
             except Exception as _sc_err:
                 logger.warning(f"[GAP7] scan_candidates write failed (non-critical): {_sc_err}")
 
+    # ── Calendar Deferral: persist READY candidates blocked by Friday/holiday theta ──
+    if not is_initial_pass and not _df_ready.empty:
+        try:
+            from scan_engine.calendar_deferral import persist_deferred_candidates, mark_deferrals_filled
+            _def_con = get_domain_write_connection(DbDomain.SCAN)
+            _def_count = persist_deferred_candidates(_df_ready, _def_con, deferred_date=run_ts)
+            # Mark prior deferrals as FILLED if they reappeared as READY today
+            _deferred_set = ctx.results.get('calendar_deferred_set', set())
+            if _deferred_set:
+                _ready_pairs = [
+                    (str(r.get('Ticker', '')), str(r.get('Strategy_Name', '') or r.get('Strategy', '')))
+                    for _, r in _df_ready.iterrows()
+                ]
+                _matched = [p for p in _ready_pairs if p in _deferred_set]
+                if _matched:
+                    mark_deferrals_filled(_matched, _def_con)
+            _def_con.close()
+            if _def_count:
+                logger.info(f"[CalendarDeferral] {_def_count} READY candidates deferred (Friday/holiday theta bleed)")
+        except Exception as _def_err:
+            logger.debug(f"[CalendarDeferral] Persist failed (non-critical): {_def_err}")
+
     # Smart WAIT Loop: Persist CONDITIONAL and AWAIT_CONFIRMATION trades
+    # For ticker+strategy combos already ACTIVE in the wait list:
+    #   - Preserve the wait clock (don't re-persist)
+    #   - BUT compare the new contract vs existing — refresh if materially better
+    #     (thesis-level memory + contract-level adaptability)
     if WAIT_LOOP_AVAILABLE and not is_initial_pass:
         try:
-            persist_counts = persist_to_wait_list(all_acceptance, con)
+            _still_waiting = ctx.results.get('wait_list_still_waiting', [])
+            # Build lookup: (ticker, strategy) → {wait_id, contract_quality}
+            _already_waiting_map = {}
+            for e in _still_waiting:
+                _key = (str(e.get('ticker', '')), str(e.get('strategy_name', '')))
+                _already_waiting_map[_key] = {
+                    'wait_id': e.get('wait_id', ''),
+                    'contract_quality': e.get('contract_quality'),
+                }
+            _already_waiting_set = set(_already_waiting_map.keys())
+
+            if _already_waiting_set and not all_acceptance.empty:
+                _cond_mask = all_acceptance['Execution_Status'].isin(['CONDITIONAL', 'AWAIT_CONFIRMATION'])
+                _wait_skip_mask = all_acceptance.apply(
+                    lambda r: (str(r.get('Ticker', '')), str(r.get('Strategy_Name', '') or r.get('Strategy', '')))
+                    in _already_waiting_set,
+                    axis=1,
+                ) & _cond_mask
+
+                # ── Contract refresh: compare instead of blindly skipping ──
+                _refreshed = 0
+                _backfilled = 0
+                if _wait_skip_mask.any():
+                    try:
+                        from core.wait_loop.schema import (
+                            extract_contract_quality, compare_contract_quality,
+                        )
+                        from core.wait_loop.persistence import refresh_contract
+                        import json as _json
+                        for _idx in all_acceptance[_wait_skip_mask].index:
+                            _row = all_acceptance.loc[_idx]
+                            _tk = str(_row.get('Ticker', ''))
+                            _st = str(_row.get('Strategy_Name', '') or _row.get('Strategy', ''))
+                            _existing = _already_waiting_map.get((_tk, _st))
+                            if not _existing:
+                                continue
+                            _new_quality = extract_contract_quality(_row)
+                            _old_cq = _existing.get('contract_quality')
+                            # Backfill: if no baseline or baseline has null DQS,
+                            # store current quality as the baseline for future
+                            # comparisons (not logged as CONTRACT_REFRESHED).
+                            if not _old_cq or _old_cq.get('dqs') is None:
+                                _wid = _existing.get('wait_id', '')
+                                if _wid and any(v is not None for v in _new_quality.values()):
+                                    try:
+                                        con.execute(
+                                            "UPDATE wait_list SET contract_quality = ?, "
+                                            "updated_at = CURRENT_TIMESTAMP WHERE wait_id = ?",
+                                            (_json.dumps(_new_quality), _wid),
+                                        )
+                                        con.commit()
+                                        _backfilled += 1
+                                    except Exception:
+                                        pass
+                                continue
+                            _is_better, _reasons = compare_contract_quality(
+                                _old_cq, _new_quality,
+                            )
+                            if _is_better:
+                                refresh_contract(
+                                    con,
+                                    _existing['wait_id'],
+                                    proposed_strike=_row.get('Strike'),
+                                    proposed_expiration=_row.get('Expiration'),
+                                    contract_symbol=_row.get('Contract_Symbol'),
+                                    contract_quality=_new_quality,
+                                    reasons=_reasons,
+                                )
+                                _refreshed += 1
+                                logger.info(
+                                    f"[WaitList] Contract refreshed for {_tk}/{_st}: "
+                                    f"{'; '.join(_reasons)}"
+                                )
+                        if _backfilled:
+                            logger.info(f"[WaitList] Backfilled contract_quality on {_backfilled} entries")
+                    except Exception as _refresh_err:
+                        logger.debug(f"[WaitList] Contract refresh failed (non-fatal): {_refresh_err}")
+
+                _skipped = int(_wait_skip_mask.sum())
+                if _skipped > 0:
+                    _skipped_tickers = all_acceptance.loc[_wait_skip_mask, 'Ticker'].tolist()
+                    _msg = f"[WaitList] {_skipped} already-waiting (preserving wait clock)"
+                    if _refreshed > 0:
+                        _msg += f", {_refreshed} contracts refreshed with better candidates"
+                    _msg += f": {_skipped_tickers}"
+                    logger.info(_msg)
+                    _persist_df = all_acceptance[~_wait_skip_mask]
+                else:
+                    _persist_df = all_acceptance
+            else:
+                _persist_df = all_acceptance
+
+            persist_counts = persist_to_wait_list(_persist_df, con)
             logger.info(
                 f"✅ Wait list updated: {persist_counts['await_confirmation']} saved, "
                 f"{persist_counts['rejected']} rejected"
@@ -1482,6 +2019,43 @@ def _step12_8_acceptance_and_sizing(ctx: PipelineContext, run_ts: datetime, con:
         logger.warning(f"⚠️ Open-position conflict check failed (non-fatal): {_e}")
         all_acceptance['Position_Conflict'] = ""
 
+    # ── Execution Verdict: triage READY into EXECUTE/SKIP/ALTERNATIVE ─────
+    try:
+        from scan_engine.execution_verdict import compute_execution_verdicts
+        _ready_for_verdict = all_acceptance[all_acceptance['Execution_Status'] == 'READY'].copy()
+        if not _ready_for_verdict.empty:
+            # Collect tickers with pending scale-up requests
+            _su_tickers = set()
+            if 'Scale_Up_Candidate' in _ready_for_verdict.columns:
+                _su_tickers = set(
+                    _ready_for_verdict.loc[
+                        _ready_for_verdict['Scale_Up_Candidate'] == True, 'Ticker'
+                    ].unique()
+                )
+            _verdicted = compute_execution_verdicts(_ready_for_verdict, scale_up_tickers=_su_tickers)
+            # Merge verdict columns back
+            for _vc in ['Execution_Verdict', 'Verdict_Reason', 'Execution_Rank']:
+                if _vc in _verdicted.columns:
+                    all_acceptance.loc[_verdicted.index, _vc] = _verdicted[_vc]
+    except Exception as _ev_err:
+        logger.warning(f"⚠️ Execution verdict failed (non-fatal): {_ev_err}")
+
+    # ── Verdict-SKIP → Smart WAIT Loop ──────────────────────────────────────
+    # Route SKIP verdicts to the wait list so the system monitors when their
+    # blocking conditions clear (IV_Rank drops, RSI recovers, etc.).
+    if WAIT_LOOP_AVAILABLE and not is_initial_pass:
+        try:
+            from scan_engine.step12_acceptance import persist_verdict_skips_to_wait_list
+            _verdict_counts = persist_verdict_skips_to_wait_list(all_acceptance, con)
+            _n_verdict = _verdict_counts.get('verdict_await', 0)
+            if _n_verdict > 0:
+                logger.info(
+                    f"✅ Verdict-SKIP → wait list: {_n_verdict} candidates monitoring clearance conditions"
+                )
+            ctx.results['verdict_wait_counts'] = _verdict_counts
+        except Exception as _vw_err:
+            logger.warning(f"⚠️ Verdict-SKIP wait list persistence failed (non-fatal): {_vw_err}")
+
     ctx.results['acceptance_all'] = all_acceptance
 
     # Action 1: Enforce READY Exclusivity
@@ -1512,15 +2086,23 @@ def _step12_8_acceptance_and_sizing(ctx: PipelineContext, run_ts: datetime, con:
 
     ctx.results['acceptance_ready'] = ready
 
-    if not ready.empty:
-        logger.info(f"💰 Step 8: Computing thesis capacity...")
-        audit.save_df("step8_input", ready)
+    if not all_acceptance.empty:
+        logger.info(f"💰 Step 8: Computing thesis capacity on all {len(all_acceptance)} candidates...")
+        audit.save_df("step8_input", all_acceptance)
         t0 = time.time()
-        envelopes = compute_thesis_capacity(ready, account_balance=ctx.account_balance, sizing_method=ctx.sizing_method, conn=con)
+        envelopes = compute_thesis_capacity(all_acceptance, account_balance=ctx.account_balance, sizing_method=ctx.sizing_method, conn=con)
         audit.profile("step8", envelopes, (time.time()-t0)*1000)
         audit.save_df("step8_output", envelopes)
         ctx.results['thesis_envelopes'] = envelopes
         ctx.debug_manager.record_step('step8_thesis_envelopes', len(envelopes), envelopes)
+
+        # Merge MC/sizing columns back into acceptance_all so the dashboard sees them
+        _mc_cols = [c for c in envelopes.columns if c not in all_acceptance.columns]
+        if _mc_cols:
+            all_acceptance = all_acceptance.join(envelopes[_mc_cols], how='left')
+            ctx.results['acceptance_all'] = all_acceptance
+            ctx.results['acceptance_ready'] = all_acceptance[all_acceptance['Execution_Status'] == 'READY'].copy()
+            logger.info(f"   Merged {len(_mc_cols)} MC/sizing columns into acceptance_all")
 
     # NEW: Ingest scan results into ExecutionMonitor
     ctx.execution_monitor.update_market_context(run_ts)
@@ -1640,18 +2222,33 @@ def _finalize_results(ctx: PipelineContext, run_ts: datetime, db_con: duckdb.Duc
     elif market_status == "UNKNOWN":
         clock_state = "PAUSED_DATA_GAP"
     
-    # Regime_Gate: broadcast to all acceptance rows (market-level scalar — same value for all)
-    _REGIME_GATE_MAP = {
-        'LOW':      'OPEN',
-        'NORMAL':   'OPEN',
-        'ELEVATED': 'RESTRICTED',
-        'CRISIS':   'LOCKED',
-        'UNKNOWN':  'OPEN',    # fail-open: don't block when stress data unavailable
+    # Regime_Gate: per-row, strategy-aware.
+    # Income strategies (premium sellers) benefit from elevated vol — keep OPEN under ELEVATED.
+    # Directional long-premium strategies stay RESTRICTED under ELEVATED.
+    # CRISIS restricts both. LOW/NORMAL/UNKNOWN → OPEN for all.
+    _INCOME_STRATEGIES = {
+        'COVERED CALL', 'BUY-WRITE', 'CASH SECURED PUT', 'SHORT PUT',
+        'SHORT CALL', 'IRON CONDOR', 'PMCC',
     }
-    _regime_gate_val = _REGIME_GATE_MAP.get(stress_level, 'OPEN')
+
+    def _compute_regime_gate(row_strat_name: str, sl: str) -> str:
+        _is_income = str(row_strat_name).upper().strip() in _INCOME_STRATEGIES
+        if sl == 'CRISIS':
+            return 'LOCKED'
+        elif sl == 'ELEVATED':
+            return 'OPEN' if _is_income else 'RESTRICTED'
+        elif sl in ('LOW', 'NORMAL', 'UNKNOWN'):
+            return 'OPEN'
+        return 'OPEN'
+
     if 'acceptance_all' in res and not res['acceptance_all'].empty:
-        res['acceptance_all']['Regime_Gate'] = _regime_gate_val
-    logger.info(f"📊 Regime_Gate set to '{_regime_gate_val}' (stress_level={stress_level})")
+        res['acceptance_all']['Regime_Gate'] = res['acceptance_all']['Strategy_Name'].apply(
+            lambda s: _compute_regime_gate(s, stress_level)
+        )
+        _gate_counts = res['acceptance_all']['Regime_Gate'].value_counts().to_dict()
+        logger.info(f"📊 Regime_Gate (stress_level={stress_level}): {_gate_counts}")
+    else:
+        logger.info(f"📊 Regime_Gate: no acceptance rows (stress_level={stress_level})")
 
     # Regime_Strategy_Fit: per-row compatibility of Capital_Bucket with (Regime, stress_level)
     # Natenberg Ch.19, McMillan Ch.1, Passarelli Ch.2
@@ -1764,6 +2361,22 @@ def _finalize_results(ctx: PipelineContext, run_ts: datetime, db_con: duckdb.Duc
     
     # Add ExecutionMonitor summary to results
     res['execution_monitor_summary'] = ctx.execution_monitor.get_monitoring_summary()
+
+    # Missing-data health report: diagnose final DataFrame, check impossible, persist
+    if ctx.missing_tracker:
+        try:
+            df_final = res.get('acceptance_all', pd.DataFrame())
+            if not df_final.empty:
+                ctx.missing_tracker.diagnose(df_final, step_num=12)
+                ctx.missing_tracker.audit_stage("step12", None, df_final)
+                ctx.missing_tracker.check_impossible(df_final, step_num=12)
+            from dataclasses import asdict as _asdict
+            _md_report = ctx.missing_tracker.generate_report()
+            res['missing_data_health'] = _asdict(_md_report)
+            if db_con is not None:
+                ctx.missing_tracker.persist(db_con)
+        except Exception as e:
+            logger.warning(f"[MissingData] finalize failed: {e}")
 
     _log_pipeline_health_summary(res)
 

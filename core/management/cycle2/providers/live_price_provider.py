@@ -1,20 +1,17 @@
 """
-Live Price Provider (Smart Schwab Refresh)
-==========================================
-Fetches live position prices during market hours only, and only when the price
-has moved enough to change doctrine outcomes.
+Live Price Provider
+===================
+Overlays fresh prices on top of broker CSV position data.
 
-Design principles:
-  1. Market hours gate  — Schwab is only called 9:30–16:00 ET (weekdays).
-  2. Context gate       — Only fetch if price moved >0.5% vs broker CSV, OR Greeks
-                          are stale (last Schwab fetch was >4h ago).
-  3. Single batch call  — All underlying tickers in one get_quotes() call (≤100 symbols).
-  4. Three-tier fallback:
-       a. Live Schwab quote           (market hours + context added)
-       b. scan_results_latest DuckDB  (Schwab failed, or off-hours but scan fresh ≤2h)
+Design:
+  1. Market open  → always call Schwab get_quotes() (one lightweight batch call).
+  2. Market closed → use scan_results_latest if fresh (≤2h), else broker CSV.
+  3. Three-tier fallback:
+       a. Live Schwab quote           (market hours)
+       b. scan_results_latest DuckDB  (off-hours, scan ran recently)
        c. Broker CSV UL Last          (always available — original baseline)
-  5. No chain calls     — quotes only; options IV handled by governed_iv_provider.
-  6. Audit log          — price_refresh_log table for every run.
+  4. No chain calls — quotes only; options IV handled by governed_iv_provider.
+  5. Audit log    — price_refresh_log table for every run.
 """
 
 from __future__ import annotations
@@ -29,11 +26,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-_PIPELINE_DB_PATH = "data/pipeline.duckdb"
-
 # Thresholds
-_MOVE_THRESHOLD_PCT   = 0.005   # 0.5% — minimum price move to justify Schwab call
-_GREEKS_MAX_AGE_HOURS = 4       # refresh if last Schwab IV fetch was >4h ago
 _SCAN_MAX_AGE_HOURS   = 2       # scan_results_latest is stale after 2h
 
 _CREATE_LOG_TABLE_SQL = """
@@ -61,41 +54,28 @@ class LivePriceProvider:
             df_enriched = provider.apply_to_df(df_enriched, live_prices)
     """
 
-    def __init__(self, db_path: str = _PIPELINE_DB_PATH):
-        self.db_path = db_path
+    def __init__(self):
         self._ensure_log_table()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def should_refresh(self, df: pd.DataFrame, last_fetch_ts: Optional[datetime] = None) -> bool:
         """
-        Returns True if a live price call adds context:
-          - Market is currently open (9:30–16:00 ET, weekdays)
-          - AND at least one of:
-              a. Any position's UL Last has moved >0.5% vs last_known_price in pipeline.duckdb
-              b. Greeks are stale (last_fetch_ts > 4h ago)
-        Off-hours: returns False → broker CSV is used, no API call.
+        Returns True when live prices should be fetched:
+          - Market open → always True (one lightweight get_quotes() call)
+          - Market closed → True only if scan cache is fresh (≤2h) as Tier 2 fallback
         """
         from core.shared.data_layer.market_time import is_market_open
-        if not is_market_open():
-            logger.debug("[LivePriceProvider] Market closed — skipping live price refresh.")
-            return False
-
-        # Greek staleness gate
-        if last_fetch_ts is None:
-            last_fetch_ts = self._get_last_schwab_fetch_ts()
-
-        if last_fetch_ts is not None:
-            age_h = (datetime.now(tz=timezone.utc) - last_fetch_ts).total_seconds() / 3600
-            if age_h > _GREEKS_MAX_AGE_HOURS:
-                logger.info(f"[LivePriceProvider] Greeks stale ({age_h:.1f}h) — refresh triggered.")
-                return True
-
-        # Price move gate
-        if self._any_significant_price_move(df):
+        if is_market_open():
+            logger.info("[LivePriceProvider] Market open — refreshing live prices.")
             return True
 
-        logger.debug("[LivePriceProvider] No significant move and Greeks fresh — skipping refresh.")
+        # Off-hours: check if scan cache has fresh data worth pulling
+        if self._scan_cache_is_fresh():
+            logger.info("[LivePriceProvider] Market closed but scan cache fresh — refreshing from cache.")
+            return True
+
+        logger.debug("[LivePriceProvider] Market closed, no fresh cache — using broker CSV.")
         return False
 
     def fetch_live_prices(
@@ -160,6 +140,7 @@ class LivePriceProvider:
 
             df.loc[mask, 'UL Last']      = new_price
             df.loc[mask, 'Price_Source'] = source
+            df.loc[mask, 'Price_TS']    = now.isoformat()
 
             if old_price is not None and old_price > 0:
                 delta_pct = (new_price - old_price) / old_price
@@ -177,7 +158,7 @@ class LivePriceProvider:
                 'market_open': True,
             })
 
-            if abs(delta_pct) >= _MOVE_THRESHOLD_PCT:
+            if abs(delta_pct) >= 0.005:
                 logger.info(
                     f"[LivePriceProvider] {ticker}: {old_price:.2f} → {new_price:.2f} "
                     f"({delta_pct:+.1%}) [{source}]"
@@ -226,15 +207,15 @@ class LivePriceProvider:
 
     def _fetch_from_scan_cache(self, tickers: List[str]) -> Dict[str, Dict]:
         """
-        Read scan_results_latest from pipeline.duckdb (freshness ≤2h).
+        Read scan_results_latest from scan domain DB (freshness ≤2h).
         Returns {ticker: {ul_last, source}}.
         """
         prices: Dict[str, Dict] = {}
         try:
-            import duckdb
+            from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
             cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=_SCAN_MAX_AGE_HOURS)
-            with duckdb.connect(self.db_path, read_only=True) as con:
-                # scan_results_latest has 'Ticker' and 'UL Last' (or similar)
+            con = get_domain_connection(DbDomain.SCAN, read_only=True)
+            try:
                 rows = con.execute("""
                     SELECT Ticker, "UL Last"
                     FROM scan_results_latest
@@ -251,6 +232,8 @@ class LivePriceProvider:
                             }
                         except (TypeError, ValueError):
                             pass
+            finally:
+                con.close()
 
             if prices:
                 logger.info(
@@ -260,75 +243,35 @@ class LivePriceProvider:
             logger.debug(f"[LivePriceProvider] scan_results_latest query failed: {e}")
         return prices
 
-    # ── Move Detection ────────────────────────────────────────────────────────
+    # ── Cache Freshness ──────────────────────────────────────────────────────
 
-    def _any_significant_price_move(self, df: pd.DataFrame) -> bool:
-        """
-        Compare current df 'UL Last' against last persisted price in management_recommendations.
-        Returns True if any ticker moved > MOVE_THRESHOLD_PCT.
-        """
-        ticker_col = 'Underlying_Ticker' if 'Underlying_Ticker' in df.columns else 'Ticker'
-        if ticker_col not in df.columns or 'UL Last' not in df.columns:
-            return False
-
+    def _scan_cache_is_fresh(self) -> bool:
+        """Check if scan_results_latest has data within the last 2 hours."""
         try:
-            import duckdb
-            tickers = df[ticker_col].dropna().unique().tolist()
-            if not tickers:
-                return False
-
-            with duckdb.connect(self.db_path, read_only=True) as con:
-                rows = con.execute("""
-                    SELECT Underlying_Ticker, "UL Last"
-                    FROM v_latest_recommendations
-                    WHERE Underlying_Ticker = ANY(?)
-                """, [tickers]).fetchall()
-
-            last_known = {r[0]: r[1] for r in rows if r[1] is not None}
-
-            for ticker, group in df.groupby(ticker_col):
-                current = group['UL Last'].dropna().iloc[0] if not group['UL Last'].dropna().empty else None
-                previous = last_known.get(ticker)
-                if current and previous and previous > 0:
-                    move = abs(current - previous) / previous
-                    if move > _MOVE_THRESHOLD_PCT:
-                        logger.info(
-                            f"[LivePriceProvider] {ticker} moved {move:+.1%} since last run — refresh needed."
-                        )
-                        return True
-        except Exception as e:
-            logger.debug(f"[LivePriceProvider] Move detection failed: {e}")
-            # When in doubt (no history), refresh during market hours
-            return True
-
-        return False
-
-    def _get_last_schwab_fetch_ts(self) -> Optional[datetime]:
-        """Read last successful Schwab IV fetch from iv_metadata."""
-        try:
-            import duckdb
-            with duckdb.connect(self.db_path, read_only=True) as con:
-                row = con.execute("""
-                    SELECT MAX(computed_ts)
-                    FROM iv_metadata
-                    WHERE last_status = 'success'
-                """).fetchone()
-            if row and row[0]:
-                ts = row[0]
-                if not ts.tzinfo:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                return ts
+            from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
+            cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=_SCAN_MAX_AGE_HOURS)
+            con = get_domain_connection(DbDomain.SCAN, read_only=True)
+            try:
+                row = con.execute(
+                    "SELECT COUNT(*) FROM scan_results_latest WHERE scan_timestamp >= ?",
+                    [cutoff],
+                ).fetchone()
+                return row is not None and row[0] > 0
+            finally:
+                con.close()
         except Exception:
-            pass
-        return None
+            return False
 
     # ── Audit Log ─────────────────────────────────────────────────────────────
 
     def _ensure_log_table(self) -> None:
         try:
-            import duckdb
-            with duckdb.connect(self.db_path) as con:
+            from core.shared.data_layer.duckdb_utils import get_domain_write_connection, DbDomain
+            con = get_domain_write_connection(DbDomain.MANAGEMENT)
+            try:
                 con.execute(_CREATE_LOG_TABLE_SQL)
+            finally:
+                con.close()
         except Exception as e:
             logger.debug(f"[LivePriceProvider] Log table init: {e}")
 
@@ -336,8 +279,9 @@ class LivePriceProvider:
         if not rows:
             return
         try:
-            import duckdb
-            with duckdb.connect(self.db_path) as con:
+            from core.shared.data_layer.duckdb_utils import get_domain_write_connection, DbDomain
+            con = get_domain_write_connection(DbDomain.MANAGEMENT)
+            try:
                 for r in rows:
                     con.execute("""
                         INSERT INTO price_refresh_log
@@ -347,5 +291,7 @@ class LivePriceProvider:
                     """, [r['log_id'], r['fetch_ts'], r['ticker'],
                           r['old_price'], r['new_price'], r['delta_pct'],
                           r['source'], r['market_open']])
+            finally:
+                con.close()
         except Exception as e:
             logger.debug(f"[LivePriceProvider] Log write failed: {e}")

@@ -8,6 +8,7 @@ States:
     OPEN      — Normal operation, entries allowed
     WARNING   — Approaching distress threshold (75% of trigger), caution
     TRIPPED   — Portfolio-level distress, force EXIT CRITICAL on all positions
+    COOLDOWN  — Trigger cleared but within 24h window, block new entries only
 
 Triggers (any one trips the breaker):
     1. Drawdown > 8% from peak equity
@@ -75,16 +76,56 @@ def check_circuit_breaker(
     reasons_warn = []
 
     # --- Trigger 1: Drawdown from peak equity ---
+    # Forward-economics offset: if portfolio has meaningful net theta carry
+    # (income positions collecting premium), the drawdown threshold shifts up.
+    # Theta income partially offsets paper drawdown.
     if peak_equity is not None and peak_equity > 0:
         drawdown_pct = (peak_equity - account_balance) / peak_equity
-        if drawdown_pct >= DRAWDOWN_TRIP_PCT:
+        _effective_trip = DRAWDOWN_TRIP_PCT
+        _effective_warn = DRAWDOWN_WARNING_PCT
+        _theta_note = ""
+        try:
+            from core.management.cycle3.doctrine.thresholds import (
+                FORWARD_ECON_DRAWDOWN_THETA_OFFSET,
+                FORWARD_ECON_THETA_ANNUAL_FLOOR,
+            )
+            _theta_col = (
+                "Portfolio_Net_Theta" if "Portfolio_Net_Theta" in df_positions.columns
+                else "Theta" if "Theta" in df_positions.columns
+                else None
+            )
+            if _theta_col is not None:
+                if _theta_col == "Portfolio_Net_Theta":
+                    _net_theta_daily = float(
+                        df_positions[_theta_col].dropna().iloc[0]
+                    ) if df_positions[_theta_col].notna().any() else 0.0
+                else:
+                    _net_theta_daily = float(
+                        pd.to_numeric(df_positions["Theta"], errors="coerce").fillna(0).sum()
+                    )
+                if _net_theta_daily > 0 and account_balance > 0:
+                    _theta_annual = (_net_theta_daily * 252) / account_balance
+                    if _theta_annual >= FORWARD_ECON_THETA_ANNUAL_FLOOR:
+                        _effective_trip += FORWARD_ECON_DRAWDOWN_THETA_OFFSET
+                        _effective_warn = _effective_trip * 0.75
+                        _theta_note = (
+                            f" (theta-adjusted from {DRAWDOWN_TRIP_PCT:.0%}: "
+                            f"${_net_theta_daily:.0f}/day carry = "
+                            f"{_theta_annual:.1%} annualized)"
+                        )
+        except Exception:
+            pass  # Graceful fallback: use original thresholds
+
+        if drawdown_pct >= _effective_trip:
             reasons_trip.append(
-                f"Drawdown {drawdown_pct:.1%} exceeds {DRAWDOWN_TRIP_PCT:.0%} threshold "
+                f"Drawdown {drawdown_pct:.1%} exceeds {_effective_trip:.0%} threshold"
+                f"{_theta_note} "
                 f"(peak=${peak_equity:,.0f}, current=${account_balance:,.0f})"
             )
-        elif drawdown_pct >= DRAWDOWN_WARNING_PCT:
+        elif drawdown_pct >= _effective_warn:
             reasons_warn.append(
-                f"Drawdown {drawdown_pct:.1%} approaching trip at {DRAWDOWN_TRIP_PCT:.0%}"
+                f"Drawdown {drawdown_pct:.1%} approaching trip at {_effective_trip:.0%}"
+                f"{_theta_note}"
             )
 
     # --- Trigger 2: Simultaneous CRITICAL exits ---
@@ -212,8 +253,11 @@ def check_circuit_breaker(
         logger.critical(f"🚨 {reason}")
         return state, reason
 
-    # Cooldown check: if previously tripped, stay TRIPPED until cooldown expires
-    if prior_breaker_state == "TRIPPED" and prior_breaker_tripped_at is not None:
+    # Cooldown check: if previously tripped but no active trigger, enter COOLDOWN
+    # (block new entries but don't force EXIT CRITICAL on all positions —
+    # a LEAP with 312 DTE and intact thesis should not be panic-exited
+    # because the breaker tripped 16h ago and has since cleared).
+    if prior_breaker_state in ("TRIPPED", "COOLDOWN") and prior_breaker_tripped_at is not None:
         elapsed = datetime.utcnow() - prior_breaker_tripped_at
         if elapsed < timedelta(hours=COOLDOWN_HOURS):
             remaining = COOLDOWN_HOURS - (elapsed.total_seconds() / 3600)
@@ -222,7 +266,7 @@ def check_circuit_breaker(
                 f"{remaining:.1f}h remaining before OPEN"
             )
             logger.warning(f"⏳ {reason}")
-            return "TRIPPED", reason
+            return "COOLDOWN", reason
 
     if reasons_warn:
         state = "WARNING"
@@ -290,7 +334,7 @@ def persist_equity_curve(
 
 def load_peak_equity(conn) -> Tuple[Optional[float], Optional[datetime]]:
     """
-    Load peak equity and last trip timestamp from DuckDB.
+    Load peak equity and last trip/cooldown timestamp from DuckDB.
 
     Returns:
         Tuple of (peak_equity, last_tripped_at)
@@ -321,9 +365,9 @@ def load_peak_equity(conn) -> Tuple[Optional[float], Optional[datetime]]:
         state = result[1]
         snap_date = result[2]
 
-        # Find last TRIPPED timestamp
+        # Find last TRIPPED/COOLDOWN timestamp (cooldown needs to know when trip started)
         tripped_at = None
-        if state == "TRIPPED" and snap_date is not None:
+        if state in ("TRIPPED", "COOLDOWN") and snap_date is not None:
             tripped_at = datetime.combine(snap_date, datetime.min.time())
 
         return peak, tripped_at

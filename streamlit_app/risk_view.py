@@ -20,11 +20,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-try:
-    from core.shared.data_layer.duckdb_utils import connect_read_only as _connect_ro
-except ImportError:
-    import duckdb as _duckdb
-    def _connect_ro(path): return _duckdb.connect(path, read_only=True)
+from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -32,10 +28,14 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=30)
-def get_portfolio_data(db_path_str: str) -> pd.DataFrame:
-    """Load latest snapshot from DuckDB. READ-ONLY."""
+def get_portfolio_data(db_path_str: str = None) -> pd.DataFrame:
+    """Load latest snapshot from DuckDB. READ-ONLY.
+
+    The db_path_str parameter is accepted for backward compatibility but
+    ignored; reads go through get_domain_connection(DbDomain.PIPELINE).
+    """
     try:
-        with _connect_ro(db_path_str) as con:
+        with get_domain_connection(DbDomain.PIPELINE, read_only=True) as con:
             tables = con.execute(
                 "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
             ).df()["table_name"].tolist()

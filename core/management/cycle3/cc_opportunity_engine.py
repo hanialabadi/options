@@ -107,6 +107,20 @@ _NONLADDER_SPREAD_CAP_RECOVERY = 40.0   # recovery: 40% (same as ladder, deeply 
 _NONLADDER_OI_MIN_INCOME       = 100    # income: OI >= 100
 _NONLADDER_OI_MIN_RECOVERY     = 50     # recovery: OI >= 50 (relaxed)
 
+# ── High-HV Recovery Constrained CC (Jabbour Ch.4, Natenberg Ch.11) ──────────
+# When Gate 4 blocks CC for RECOVERY/DEEP_RECOVERY positions (HV > 80%),
+# attempt constrained strike selection instead of outright blocking.
+# Rationale: high HV makes OTM premium rich — exactly when underwater
+# positions need income for cost basis reduction.
+_CONSTRAINED_DELTA_CAP         = 0.20   # vs normal 0.25-0.30; ~80% prob OTM
+_CONSTRAINED_DTE_MIN           = 5      # weekly minimum
+_CONSTRAINED_DTE_MAX           = 14     # biweekly max — limits upside commitment
+_CONSTRAINED_STRIKE_FLOOR_OTM  = 1.15   # strike >= spot × 1.15 (15% OTM minimum)
+_CONSTRAINED_MIN_PREMIUM       = 0.10   # same as regular minimum
+_CONSTRAINED_RESISTANCE_BUFFER = 1.03   # strike >= resistance × 1.03 (3% above stall)
+_CONSTRAINED_ROC5_BLOCK        = 0.03   # block if 5d rally > 3% (let recovery run)
+_CONSTRAINED_RSI_BLOCK         = 60.0   # block if RSI > 60 with positive momentum
+
 # DTE buckets: (label, min_dte, max_dte, target_delta_max)
 _DTE_BUCKETS = [
     ("WEEKLY",   5,  10, 0.25),
@@ -292,6 +306,159 @@ def _compute_recovery_timeline(spot: float, basis: float, hv: float) -> dict:
         "monthly_est": round(monthly_est, 2),
         "months": months,
     }
+
+
+def _chart_resistance_levels(pos_row: pd.Series, spot: float) -> list[float]:
+    """
+    Extract chart-based resistance levels above current spot from position row.
+
+    Used for strike ranking in constrained CC mode — strikes near natural
+    resistance are preferred because assignment at those levels is less painful
+    (the stock was likely to stall there anyway).
+
+    Returns levels sorted ascending. Empty list if none available.
+
+    Book backing:
+      Nison: resistance levels = natural stall points for rallying stocks.
+      McMillan Ch.3: sell calls at resistance — assignment there is acceptable.
+    """
+    levels = []
+    for col in ("SMA50", "UpperBand_20", "SMA20", "EMA9"):
+        v = pos_row.get(col)
+        if v is not None and not (isinstance(v, float) and (np.isnan(v) or v <= 0)):
+            try:
+                level = float(v)
+                if level > spot * 1.05:  # only levels meaningfully above spot
+                    levels.append(level)
+            except (ValueError, TypeError):
+                pass
+    return sorted(set(levels))
+
+
+def _refilter_constrained(
+    candidates: list[dict],
+    spot: float,
+    basis: float,
+    pos_row: pd.Series,
+) -> tuple[list[dict], str]:
+    """
+    Re-filter CC candidates with HIGH_HV_RECOVERY constraints.
+
+    Called when _cc_arbitration returns WRITE_CALL_CONSTRAINED.
+    Applies momentum filter, tighter delta/DTE, chart-aware strike floor
+    (resistance + 3% buffer), and ranks by resistance proximity.
+
+    Returns (filtered_candidates, block_reason).
+    block_reason is non-empty if momentum filter blocks entry entirely.
+
+    Book backing:
+      Cohen Ch.7: buy-write works when trend is NOT aggressively bullish.
+      Jabbour Ch.4: income generation accelerates recovery in high-vol.
+      McMillan Ch.3: sell calls above resistance — stall = OTM expiry.
+    """
+    # ── Step 1: Momentum filter ──────────────────────────────────────
+    # Don't sell calls into an active recovery rally — that's what you want.
+    roc_5 = float(pos_row.get("roc_5") or 0)
+    rsi_14 = float(pos_row.get("rsi_14") or 50)
+
+    if roc_5 > _CONSTRAINED_ROC5_BLOCK:
+        return [], (
+            f"Recovery rally active (ROC5={roc_5:+.1%}) — don't cap upside. "
+            "Wait for consolidation before writing calls. "
+            "(Cohen Ch.7: buy-write works when trend is NOT aggressively bullish.)"
+        )
+    if rsi_14 > _CONSTRAINED_RSI_BLOCK and roc_5 > 0:
+        return [], (
+            f"Overbought momentum (RSI={rsi_14:.0f}, ROC5={roc_5:+.1%}) — "
+            "let the recovery run. Write calls after RSI cools below 60 or "
+            "ROC turns flat/negative. (Cohen Ch.7)"
+        )
+
+    # ── Step 2: Chart-aware strike floor ─────────────────────────────
+    resistance = _chart_resistance_levels(pos_row, spot)
+    # Strike floor = max(spot × 1.15, nearest_resistance × 1.03)
+    # The 3% buffer above resistance ensures we sell ABOVE the stall point.
+    if resistance:
+        nearest_above = resistance[0]  # first (lowest) resistance above spot
+        strike_floor = max(
+            spot * _CONSTRAINED_STRIKE_FLOOR_OTM,
+            nearest_above * _CONSTRAINED_RESISTANCE_BUFFER,
+        )
+    else:
+        strike_floor = spot * _CONSTRAINED_STRIKE_FLOOR_OTM
+
+    # ── Step 3: Apply constrained filters ────────────────────────────
+    constrained = []
+    for c in candidates:
+        delta = c.get("delta", 1.0)
+        dte = c.get("dte", 999)
+        strike = c.get("strike", 0)
+        mid = c.get("mid", 0)
+
+        if delta > _CONSTRAINED_DELTA_CAP:
+            continue
+        if dte < _CONSTRAINED_DTE_MIN or dte > _CONSTRAINED_DTE_MAX:
+            continue
+        if strike < strike_floor:
+            continue
+        if mid < _CONSTRAINED_MIN_PREMIUM:
+            continue
+
+        # ── Step 4: Resistance proximity score for ranking ───────────
+        prox_score = 0.0
+        if resistance:
+            min_dist = min(abs(strike - r) / spot for r in resistance)
+            prox_score = max(0, 1.0 - min_dist)  # 1.0 = at resistance, 0.0 = far
+        c_copy = dict(c)
+        c_copy["constrained"] = True
+        c_copy["safety_tag"] = "HIGH_HV_RECOVERY"
+        c_copy["resistance_proximity"] = round(prox_score, 3)
+        c_copy["strike_floor_used"] = round(strike_floor, 2)
+        constrained.append(c_copy)
+
+    # Rank: resistance proximity (primary), annualized yield (secondary)
+    constrained.sort(
+        key=lambda x: (x.get("resistance_proximity", 0), x.get("ann_yield", 0)),
+        reverse=True,
+    )
+    return constrained[:3], ""
+
+
+def _constrained_watch_signal(pos_row: pd.Series) -> str:
+    """
+    Compute watch signal for constrained CC when entry is blocked or no candidates.
+
+    Monitors two convergence signals:
+      1. Vol contraction: HV_10D < HV_20D (short-term vol declining from peak)
+      2. Price stabilization: spot > EMA9 AND roc_5 > -1% (not in freefall)
+
+    When both converge, CC entry window is approaching — Gate 4 ratio will normalize.
+    """
+    hv_10 = float(pos_row.get("HV_10D") or pos_row.get("hv_10") or 0)
+    hv_20 = float(pos_row.get("HV_20D") or pos_row.get("hv_20") or 0)
+    spot = float(pos_row.get("Last") or pos_row.get("UL Last") or 0)
+    ema9 = float(pos_row.get("EMA9") or 0)
+    roc_5 = float(pos_row.get("roc_5") or 0)
+
+    hv_declining = hv_10 > 0 and hv_20 > 0 and hv_10 < hv_20
+    price_stable = spot > 0 and ema9 > 0 and spot > ema9 and roc_5 > -0.01
+
+    if hv_declining and price_stable:
+        return (
+            f"Vol normalizing (HV10={hv_10*100:.0f}% < HV20={hv_20*100:.0f}%) + "
+            f"price stabilizing above EMA9 — CC entry window approaching. "
+            "Re-evaluate on next cycle."
+        )
+    parts = []
+    if not hv_declining:
+        parts.append(
+            f"HV_10D declining below HV_20D (currently "
+            f"{'N/A' if hv_10 == 0 else f'{hv_10*100:.0f}%'} vs "
+            f"{'N/A' if hv_20 == 0 else f'{hv_20*100:.0f}%'})"
+        )
+    if not price_stable:
+        parts.append("price recovering above EMA9 with ROC5 > -1%")
+    return "Watch for: " + " AND ".join(parts) + " → re-evaluate CC entry."
 
 
 def _compute_ladder_allocation(
@@ -868,6 +1035,7 @@ def _rank_candidates(
     recovery_mode: str = "INCOME",
     spot_price: float = 0.0,
     qty: float = 0.0,
+    prefer_monthly: bool = False,
 ) -> list[dict]:
     """
     From scan rows for this ticker, rank CC candidates by annualised yield
@@ -875,6 +1043,8 @@ def _rank_candidates(
 
     recovery_mode: RECOVERY/DEEP_RECOVERY widens MONTHLY delta cap to 0.35
     and enforces strike floor = max(spot × 1.10, cost_basis).
+    prefer_monthly: when True (backwardation override), rank MONTHLY/BIWEEKLY
+    above WEEKLY to manage mean-reversion gamma risk (McMillan Ch.3).
     """
     # Filter to CC/BUY_WRITE nominations for this ticker that are READY/CONDITIONAL
     mask = (
@@ -998,8 +1168,16 @@ def _rank_candidates(
             "contracts":    _contracts,
         })
 
-    # Sort by annualised yield descending; return top 3
-    candidates.sort(key=lambda x: x["ann_yield"], reverse=True)
+    # Sort by annualised yield descending; when backwardation detected, rank
+    # MONTHLY/BIWEEKLY above WEEKLY so the candidate list matches the gate
+    # advisory (McMillan Ch.3: longer DTE absorbs mean-reversion gamma risk).
+    if prefer_monthly:
+        _bucket_rank = {"MONTHLY": 0, "BIWEEKLY": 1, "WEEKLY": 2}
+        candidates.sort(
+            key=lambda x: (_bucket_rank.get(x["bucket"], 9), -x["ann_yield"]),
+        )
+    else:
+        candidates.sort(key=lambda x: x["ann_yield"], reverse=True)
     return candidates[:3]
 
 
@@ -1077,8 +1255,20 @@ def _cc_arbitration(pos_row: pd.Series, is_fav_scan: bool, unfav_reason: str, ch
                     _g2_reason += " Commodity ETFs show pronounced macro-flow vol cycles."
             return ("HOLD_STOCK", _g2_reason)
         elif iv_surf == "BACKWARDATION":
-            # Backwardation: near-term IV spike — premiums elevated but gamma risk extreme
-            # Don't block entirely (premium IS rich) but require MONTHLY+ DTE
+            # Backwardation: near-term IV spike — premiums elevated but gamma risk extreme.
+            # High absolute IV (≥50%): premium is rich enough that the IV/HV spread is
+            # noise — proceed with DTE preference.  Low IV backwardation: genuinely
+            # negative-EV, stay in MONITOR.
+            if iv_ref >= 0.50:
+                return (
+                    "WRITE_CALL",
+                    f"Gate 2: BACKWARDATION — IV({iv_ref*100:.0f}%) vs HV({hv*100:.0f}%). "
+                    f"Absolute IV is high ({iv_ref*100:.0f}%) — premium is rich despite "
+                    "slight backwardation. Prefer 30–45d monthly expiration to manage "
+                    "mean-reversion gamma risk. "
+                    "(McMillan Ch.3: at high absolute IV, backwardation spread is noise; "
+                    "Natenberg Ch.7: sell rich premium with longer DTE for safety.)"
+                )
             return (
                 "MONITOR",
                 f"Gate 2: BACKWARDATION — IV({iv_ref*100:.0f}%) vs HV({hv*100:.0f}%). "
@@ -1141,7 +1331,36 @@ def _cc_arbitration(pos_row: pd.Series, is_fav_scan: bool, unfav_reason: str, ch
         # 1σ daily move
         daily_move  = hv / (252 ** 0.5) * spot
         if daily_move > 3.0 * premium_day and hv > 0.80:
-            # Stock moves more than 3× daily premium → no edge
+            # ── Recovery override: high HV = rich OTM premium for basis reduction ─
+            # RECOVERY/DEEP_RECOVERY positions need income to close the gap.
+            # At 98% HV, far OTM strikes still collect real premium — the
+            # opportunity cost logic is inverted for underwater positions.
+            # (Jabbour Ch.4: income generation accelerates recovery in high-vol)
+            if recovery_mode in ("RECOVERY", "DEEP_RECOVERY"):
+                return (
+                    "WRITE_CALL_CONSTRAINED",
+                    f"Gate 4: HIGH_HV_RECOVERY override — daily 1σ (${daily_move:.2f}) > "
+                    f"3× premium est (${premium_day:.2f}), HV={hv*100:.0f}%. "
+                    f"Normal CC blocked, but {recovery_mode} mode: high HV makes OTM "
+                    f"premium rich for cost basis reduction. "
+                    f"CONSTRAINED: weekly DTE ({_CONSTRAINED_DTE_MIN}-{_CONSTRAINED_DTE_MAX}d), "
+                    f"delta ≤ {_CONSTRAINED_DELTA_CAP}, strike ≥ resistance+3%. "
+                    "(Jabbour Ch.4: income generation accelerates recovery in high-vol.)"
+                )
+            # INCOME mode: high HV = rich premiums. Covered call still makes sense
+            # because you already own the stock — the vol risk is in the equity,
+            # not the call sale.  Prefer lower delta to preserve upside.
+            # (McMillan Ch.3: "sell premium into high vol, not away from it.")
+            if recovery_mode == "INCOME":
+                return (
+                    "WRITE_CALL",
+                    f"Gate 4: HIGH_HV_INCOME pass — daily 1σ (${daily_move:.2f}) > "
+                    f"3× premium est (${premium_day:.2f}), HV={hv*100:.0f}%. "
+                    "High HV means rich call premiums — sell into elevated vol. "
+                    "Prefer delta ≤ 0.25 to preserve upside. "
+                    "(McMillan Ch.3: 'Sell premium into high vol, not away from it.')"
+                )
+            # Non-INCOME, non-RECOVERY: truly blocked
             _g4_reason = (
                 f"Gate 4: Daily 1σ move (${daily_move:.2f}) > 3× daily premium est "
                 f"(${premium_day:.2f}). At HV={hv*100:.0f}%, stock volatility overwhelms "
@@ -1174,6 +1393,8 @@ def _fetch_cc_candidates_live(
     hv: float,
     schwab_client,
     recovery_mode: str = "INCOME",
+    prefer_monthly: bool = False,
+    qty: float = 0.0,
 ) -> tuple[bool, str, str, list[dict]]:
     """
     Fetch covered call candidates directly from Schwab chain API.
@@ -1192,9 +1413,12 @@ def _fetch_cc_candidates_live(
 
     try:
         schwab_client.ensure_valid_token()
+        # Recovery needs farther OTM strikes (lower delta, higher strike).
+        # 30 strikes ensures the chain extends to spot × 1.50+ range.
+        _sc = 30 if recovery_mode in ("RECOVERY", "DEEP_RECOVERY") else 20
         chain = schwab_client.get_chains(
             symbol=ticker,
-            strikeCount=20,
+            strikeCount=_sc,
             range="OTM",           # Only OTM calls (above spot) — we don't want ITM CCs
             strategy="SINGLE",
             # Note: optionType="C" removed — SchwabClient.get_chains() doesn't accept it.
@@ -1244,9 +1468,14 @@ def _fetch_cc_candidates_live(
             if strike <= spot:
                 continue
 
-            # Recovery strike floor: max(spot × 1.10, cost basis)
+            # Recovery strike floor: spot × 1.10 (permissive pre-filter).
+            # The downstream _refilter_constrained() applies the smarter
+            # chart-aware floor (max(spot×1.15, resistance×1.03)) when the
+            # arbitration gate returns WRITE_CALL_CONSTRAINED.  Using basis
+            # here would kill all candidates below cost basis — too aggressive
+            # for high-HV recovery where constrained OTM strikes make sense.
             if recovery_mode in ("RECOVERY", "DEEP_RECOVERY"):
-                _strike_floor = max(spot * 1.10, basis)
+                _strike_floor = spot * 1.10
                 if strike < _strike_floor:
                     continue
 
@@ -1275,12 +1504,15 @@ def _fetch_cc_candidates_live(
                 continue
 
             spread_pct = ((ask - bid) / mid * 100) if mid > 0 else 999.0
-            _spread_max = 20.0 if recovery_mode in ("RECOVERY", "DEEP_RECOVERY") else 15.0
+            # High-HV recovery: spreads widen naturally; use limit orders at mid.
+            # 40% cap still filters truly untradeable contracts.
+            _spread_max = 40.0 if recovery_mode in ("RECOVERY", "DEEP_RECOVERY") else 15.0
             if spread_pct > _spread_max:
                 continue
 
             ann_y = _ann_yield(mid, basis if basis > 0 else spot, dte)
 
+            _contracts = max(1, int(qty // 100)) if qty >= 100 else 1
             candidates.append({
                 "bucket":      bucket_label,
                 "strike":      round(strike, 2),
@@ -1296,13 +1528,33 @@ def _fetch_cc_candidates_live(
                 "oi":          oi,
                 "iv_pct":      round(iv_dec * 100, 1),
                 "source":      "LIVE_CHAIN",
+                "contracts":   _contracts,
             })
 
     if not candidates:
         return False, "No viable OTM call candidates found in chain", "Wait for better strike availability", []
 
-    # Sort by ann_yield descending; return best 3 across distinct buckets
-    candidates.sort(key=lambda x: x["ann_yield"], reverse=True)
+    # For normal mode: deduplicate to best-per-bucket (highest yield within
+    # each DTE bucket) before global sort — mirrors scan path's approach.
+    # Without this, weeklies dominate top-3 via 365/DTE annualization.
+    # Recovery mode: keep ALL candidates for _refilter_constrained().
+    if recovery_mode not in ("RECOVERY", "DEEP_RECOVERY"):
+        _best_by_bucket: dict[str, dict] = {}
+        for c in sorted(candidates, key=lambda x: x["ann_yield"], reverse=True):
+            bkt = c["bucket"]
+            if bkt not in _best_by_bucket:
+                _best_by_bucket[bkt] = c
+        candidates = list(_best_by_bucket.values())
+
+    # Sort: when backwardation detected, rank MONTHLY/BIWEEKLY above WEEKLY
+    # (McMillan Ch.3: longer DTE for safety). Otherwise rank by yield.
+    if prefer_monthly:
+        _bucket_rank = {"MONTHLY": 0, "BIWEEKLY": 1, "WEEKLY": 2}
+        candidates.sort(
+            key=lambda x: (_bucket_rank.get(x["bucket"], 9), -x["ann_yield"]),
+        )
+    else:
+        candidates.sort(key=lambda x: x["ann_yield"], reverse=True)
 
     # Favorability from position-level HV/IV (scan not available)
     # Use HV_20D from the position row as a proxy — if HV is extreme (>60%)
@@ -1321,7 +1573,10 @@ def _fetch_cc_candidates_live(
         unfav = ""
         watch = ""
 
-    return is_fav, unfav, watch, candidates[:3]
+    # Recovery/Deep Recovery: return full candidate pool so _refilter_constrained()
+    # can apply chart-aware strike floor + delta cap.  Normal mode: top 3 suffices.
+    _limit = len(candidates) if recovery_mode in ("RECOVERY", "DEEP_RECOVERY") else 3
+    return is_fav, unfav, watch, candidates[:_limit]
 
 
 def evaluate_cc_opportunities(df: pd.DataFrame, schwab_client=None) -> pd.DataFrame:
@@ -1435,6 +1690,23 @@ def evaluate_cc_opportunities(df: pd.DataFrame, schwab_client=None) -> pd.DataFr
     # Deduplicate: only process the first row per (ticker, account) for ladder evaluation.
     # Write the ladder result to ALL idle rows for that (ticker, account).
     _seen_ticker_accts: set[tuple[str, str]] = set()
+
+    # Build existing short call positions per ticker — used to deprioritize
+    # ladder candidates that overlap with existing BUY_WRITE/CC positions.
+    # Overlap isn't blocked (doubling down may be optimal), but when a comparable
+    # alternative at a different exp exists, the engine should prefer diversification.
+    _existing_calls_by_ticker: dict[str, list[tuple[float, str]]] = {}
+    if "AssetType" in df.columns and "Underlying_Ticker" in df.columns:
+        _opt_mask = (df["AssetType"] == "OPTION") & (df.get("Quantity", pd.Series(0, index=df.index)).apply(float) < 0)
+        for _ei in df.index[_opt_mask]:
+            _ecp = str(df.at[_ei, "Call/Put"] if "Call/Put" in df.columns else "").upper()
+            _estrat = str(df.at[_ei, "Strategy"] if "Strategy" in df.columns else "").upper()
+            if _estrat in ("BUY_WRITE", "COVERED_CALL") or _ecp in ("C", "CALL"):
+                _etk = str(df.at[_ei, "Underlying_Ticker"])
+                _estr = float(df.at[_ei, "Strike"] if "Strike" in df.columns else 0)
+                _eexp = str(df.at[_ei, "Expiration"] if "Expiration" in df.columns else "")[:10]
+                if _estr > 0:
+                    _existing_calls_by_ticker.setdefault(_etk, []).append((_estr, _eexp))
 
     logger.info(
         f"[CCOpportunity] Evaluating {idle_mask.sum()} idle stock position(s) "
@@ -1567,6 +1839,33 @@ def evaluate_cc_opportunities(df: pd.DataFrame, schwab_client=None) -> pd.DataFr
                     if not _lad_b:
                         _lad_b = _lad_live["tier_b_candidates"]
 
+                # Deprioritize candidates that overlap existing positions.
+                # If the best candidate is also the existing position AND
+                # a comparable alternative exists (≥80% of its premium),
+                # prefer the alternative for expiry diversification.
+                _ex_set = _existing_calls_by_ticker.get(ticker, [])
+                if _ex_set:
+                    def _deoverlap(cands: list[dict]) -> list[dict]:
+                        if not cands:
+                            return cands
+                        def _overlaps(c):
+                            return any(
+                                abs(c["strike"] - es) < 0.01 and c.get("expiry", "")[:10] == ee
+                                for es, ee in _ex_set
+                            )
+                        top = cands[0]
+                        if not _overlaps(top):
+                            return cands   # best is already diversified
+                        # Find best non-overlapping alternative
+                        for alt in cands[1:]:
+                            if not _overlaps(alt) and alt["mid"] >= top["mid"] * 0.80:
+                                # Swap: put non-overlapping first, keep overlap as backup
+                                reordered = [alt] + [c for c in cands if c is not alt]
+                                return reordered
+                        return cands  # all overlap or alternatives too thin → keep original
+                    _lad_a = _deoverlap(_lad_a)
+                    _lad_b = _deoverlap(_lad_b)
+
                 # Build full ladder plan
                 _plan = _build_ladder_plan(
                     pos_row, _ladder_alloc_check, _lad_a, _lad_b, rec_mode,
@@ -1676,6 +1975,9 @@ def evaluate_cc_opportunities(df: pd.DataFrame, schwab_client=None) -> pd.DataFr
                 )
                 continue
 
+            # Resolve qty early — needed by both live chain and scan paths
+            qty = float(pos_row.get("Quantity") or pos_row.get("Qty") or 0)
+
             # Find scan rows for this ticker
             ticker_scan = (
                 scan_df[scan_df["Ticker"] == ticker] if "Ticker" in scan_df.columns
@@ -1691,7 +1993,7 @@ def evaluate_cc_opportunities(df: pd.DataFrame, schwab_client=None) -> pd.DataFr
                     if spot_pos and spot_pos > 0:
                         is_fav_live, unfav_live, watch_live, cands_live = _fetch_cc_candidates_live(
                             ticker, spot_pos, basis_pos or spot_pos, hv_pos, schwab_client,
-                            recovery_mode=rec_mode,
+                            recovery_mode=rec_mode, qty=qty,
                         )
                         # Extract ATM IV from best candidate (chain-derived) for Gate 2
                         _chain_iv = cands_live[0]["iv_pct"] / 100 if cands_live else 0.0
@@ -1706,10 +2008,58 @@ def evaluate_cc_opportunities(df: pd.DataFrame, schwab_client=None) -> pd.DataFr
                         df.at[idx, "CC_Watch_Signal"]       = watch_live
                         if _chain_iv > 0:
                             df.at[idx, "CC_IV_Rank"] = round(_chain_iv * 100, 1)
+                        # Backwardation: re-sort live candidates to prefer monthlies
+                        if "BACKWARDATION" in arb_reason and cands_live:
+                            _br = {"MONTHLY": 0, "BIWEEKLY": 1, "WEEKLY": 2}
+                            cands_live.sort(
+                                key=lambda x: (_br.get(x["bucket"], 9), -x["ann_yield"]),
+                            )
                         if arb_verdict == "HOLD_STOCK":
                             df.at[idx, "CC_Proposal_Status"]  = "UNFAVORABLE"
                             df.at[idx, "CC_Proposal_Verdict"] = f"HOLD_STOCK — {arb_reason}"
                             logger.info(f"[CCOpportunity-Live] {ticker}: HOLD_STOCK — {arb_reason}")
+                        elif arb_verdict == "WRITE_CALL_CONSTRAINED":
+                            _cstr, _cstr_block = _refilter_constrained(
+                                cands_live, spot_pos or 0.0,
+                                basis_pos or (spot_pos or 0.0), pos_row,
+                            )
+                            if _cstr_block:
+                                df.at[idx, "CC_Proposal_Status"]  = "UNFAVORABLE"
+                                df.at[idx, "CC_Proposal_Verdict"] = (
+                                    f"CONSTRAINED_BLOCKED — {_cstr_block}"
+                                )
+                                df.at[idx, "CC_Watch_Signal"] = _constrained_watch_signal(pos_row)
+                                logger.info(f"[CCOpportunity-Live] {ticker}: CONSTRAINED blocked — momentum")
+                            elif _cstr:
+                                _cb = _cstr[0]
+                                for i, cand in enumerate(_cstr, 1):
+                                    df.at[idx, f"CC_Candidate_{i}"] = json.dumps(cand)
+                                df.at[idx, "CC_Proposal_Status"]  = "FAVORABLE"
+                                df.at[idx, "CC_Best_DTE_Bucket"]  = _cb.get("bucket", "WEEKLY")
+                                df.at[idx, "CC_Best_Ann_Yield"]   = _cb.get("ann_yield", 0)
+                                _tl_lv = _compute_recovery_timeline(
+                                    spot_pos, basis_pos or spot_pos, hv_pos
+                                )
+                                df.at[idx, "CC_Proposal_Verdict"] = (
+                                    f"WRITE_CALL_CONSTRAINED — HIGH_HV_RECOVERY. Live chain. "
+                                    f"Best: {_cb.get('bucket', 'WEEKLY')} ${_cb['strike']}C "
+                                    f"(${_cb['mid']:.2f}/sh, {_cb.get('ann_yield', 0):.1%}/yr). "
+                                    f"Safety: δ {_cb.get('delta', 0):.2f}, DTE {_cb.get('dte', 0)}d. "
+                                    f"[{rec_mode}: ${_tl_lv['gap']:.2f}/sh gap, "
+                                    f"~{_tl_lv['months']:.0f}mo]. {arb_reason}"
+                                )
+                                logger.info(
+                                    f"[CCOpportunity-Live] {ticker}: CONSTRAINED — "
+                                    f"${_cb['strike']}C {_cb.get('ann_yield', 0):.1%}/yr"
+                                )
+                            else:
+                                df.at[idx, "CC_Proposal_Status"]  = "UNFAVORABLE"
+                                df.at[idx, "CC_Proposal_Verdict"] = (
+                                    f"MONITOR — HIGH_HV_RECOVERY attempted via live chain "
+                                    f"but no constrained candidates. {arb_reason}"
+                                )
+                                df.at[idx, "CC_Watch_Signal"] = _constrained_watch_signal(pos_row)
+                                logger.info(f"[CCOpportunity-Live] {ticker}: CONSTRAINED — no candidates")
                         elif arb_verdict == "MONITOR":
                             df.at[idx, "CC_Proposal_Status"]  = "UNFAVORABLE"
                             df.at[idx, "CC_Proposal_Verdict"] = f"MONITOR — {arb_reason}"
@@ -1721,6 +2071,21 @@ def evaluate_cc_opportunities(df: pd.DataFrame, schwab_client=None) -> pd.DataFr
                             df.at[idx, "CC_Proposal_Status"]  = "FAVORABLE"
                             df.at[idx, "CC_Best_DTE_Bucket"]  = best["bucket"]
                             df.at[idx, "CC_Best_Ann_Yield"]   = best["ann_yield"]
+                            # DTE split advisory for multi-lot positions
+                            _lots_live = max(1, int(qty // 100)) if qty >= 100 else 1
+                            if _lots_live >= 2 and len(cands_live) >= 2:
+                                _db = list(dict.fromkeys(c["bucket"] for c in cands_live))
+                                if len(_db) >= 2:
+                                    _c1, _c2 = cands_live[0], cands_live[1]
+                                    _sp = max(1, _lots_live // len(_db))
+                                    _rem = _lots_live - _sp * len(_db)
+                                    df.at[idx, "CC_Split_Note"] = (
+                                        f"Split {_lots_live} contracts: "
+                                        f"{_sp + (_rem if _db[0] == _c1['bucket'] else 0)}× "
+                                        f"{_c1['bucket']} ${_c1['strike']}C ({_c1['dte']}d) + "
+                                        f"{_sp}× {_c2['bucket']} ${_c2['strike']}C ({_c2['dte']}d) "
+                                        f"— diversifies DTE/gamma exposure"
+                                    )
                             _rec_tag = ""
                             if rec_mode in ("RECOVERY", "DEEP_RECOVERY"):
                                 _tl = _compute_recovery_timeline(
@@ -1772,7 +2137,6 @@ def evaluate_cc_opportunities(df: pd.DataFrame, schwab_client=None) -> pd.DataFr
             ivhv_gap = float(ctx.get("IVHV_gap_30D") or 0) or None
             spot_px  = _spot(pos_row, ctx)
             basis_px = _basis(pos_row)
-            qty      = float(pos_row.get("Quantity") or pos_row.get("Qty") or 0)
 
             # IV enrichment fallback: query iv_term_history when scan lacks IV_Rank
             if iv_rank is None:
@@ -1801,6 +2165,63 @@ def evaluate_cc_opportunities(df: pd.DataFrame, schwab_client=None) -> pd.DataFr
                 logger.info(f"[CCOpportunity] {ticker}: HOLD_STOCK — {arb_reason}")
                 continue
 
+            # ── WRITE_CALL_CONSTRAINED: High-HV Recovery CC ──────────
+            if arb_verdict == "WRITE_CALL_CONSTRAINED":
+                effective_basis = basis_px or spot_px or 1.0
+                _all_cands = _rank_candidates(
+                    scan_df, ticker, effective_basis,
+                    recovery_mode=rec_mode,
+                    spot_price=spot_px or 0.0,
+                    qty=qty,
+                    prefer_monthly="BACKWARDATION" in arb_reason,
+                )
+                _constrained, _block_reason = _refilter_constrained(
+                    _all_cands, spot_px or 0.0, effective_basis, pos_row,
+                )
+                if _block_reason:
+                    # Momentum filter blocked entry
+                    df.at[idx, "CC_Proposal_Status"]  = "UNFAVORABLE"
+                    df.at[idx, "CC_Proposal_Verdict"] = (
+                        f"CONSTRAINED_BLOCKED — {_block_reason}"
+                    )
+                    df.at[idx, "CC_Watch_Signal"] = _constrained_watch_signal(pos_row)
+                    logger.info(f"[CCOpportunity] {ticker}: CONSTRAINED blocked — momentum")
+                elif _constrained:
+                    best = _constrained[0]
+                    for i, cand in enumerate(_constrained, 1):
+                        df.at[idx, f"CC_Candidate_{i}"] = json.dumps(cand)
+                    df.at[idx, "CC_Proposal_Status"]  = "FAVORABLE"
+                    df.at[idx, "CC_Best_DTE_Bucket"]  = best.get("bucket", "WEEKLY")
+                    df.at[idx, "CC_Best_Ann_Yield"]   = best.get("ann_yield", 0)
+                    _hv_rec = float(pos_row.get("HV_20D") or 0)
+                    _tl_c = _compute_recovery_timeline(
+                        spot_px or 0, basis_px or (spot_px or 0), _hv_rec,
+                    )
+                    df.at[idx, "CC_Proposal_Verdict"] = (
+                        f"WRITE_CALL_CONSTRAINED — HIGH_HV_RECOVERY. "
+                        f"Best: {best.get('bucket', 'WEEKLY')} ${best['strike']}C "
+                        f"(${best['mid']:.2f}/sh, {best.get('ann_yield', 0):.1%}/yr). "
+                        f"Safety: δ {best.get('delta', 0):.2f}, DTE {best.get('dte', 0)}d, "
+                        f"floor ${best.get('strike_floor_used', 0):.2f}. "
+                        f"[{rec_mode}: ${_tl_c['gap']:.2f}/sh gap, ~{_tl_c['months']:.0f}mo]. "
+                        f"{arb_reason}"
+                    )
+                    logger.info(
+                        f"[CCOpportunity] {ticker}: WRITE_CALL_CONSTRAINED — "
+                        f"${best['strike']}C {best.get('ann_yield', 0):.1%}/yr"
+                    )
+                else:
+                    df.at[idx, "CC_Proposal_Status"]  = "UNFAVORABLE"
+                    df.at[idx, "CC_Proposal_Verdict"] = (
+                        f"MONITOR — HIGH_HV_RECOVERY attempted but no candidates survive "
+                        f"constrained filters (δ ≤ {_CONSTRAINED_DELTA_CAP}, "
+                        f"DTE {_CONSTRAINED_DTE_MIN}-{_CONSTRAINED_DTE_MAX}d, "
+                        f"strike ≥ spot×{_CONSTRAINED_STRIKE_FLOOR_OTM}). {arb_reason}"
+                    )
+                    df.at[idx, "CC_Watch_Signal"] = _constrained_watch_signal(pos_row)
+                    logger.info(f"[CCOpportunity] {ticker}: CONSTRAINED — no viable candidates")
+                continue
+
             if arb_verdict == "MONITOR" or not is_fav:
                 reason_str = arb_reason if arb_verdict == "MONITOR" else unfav_reason.split(" | ")[0]
                 df.at[idx, "CC_Proposal_Status"]  = "UNFAVORABLE"
@@ -1809,12 +2230,15 @@ def evaluate_cc_opportunities(df: pd.DataFrame, schwab_client=None) -> pd.DataFr
                 continue
 
             # All gates passed → rank candidates from scan
+            # Backwardation override: prefer longer DTE to manage gamma risk
+            _prefer_monthly = "BACKWARDATION" in arb_reason
             effective_basis = basis_px or spot_px or 1.0
             candidates = _rank_candidates(
                 scan_df, ticker, effective_basis,
                 recovery_mode=rec_mode,
                 spot_price=spot_px or 0.0,
                 qty=qty,
+                prefer_monthly=_prefer_monthly,
             )
 
             if not candidates:
@@ -1855,6 +2279,23 @@ def evaluate_cc_opportunities(df: pd.DataFrame, schwab_client=None) -> pd.DataFr
                     f"Consider covering {_lots - 1} of {_lots} lots — "
                     f"keep 1 lot uncovered for upside recovery."
                 )
+
+            # ── DTE split advisory for multi-lot positions ──
+            # When 2+ lots and candidates span different DTE buckets,
+            # suggest splitting across buckets for DTE diversification.
+            if _lots >= 2 and len(candidates) >= 2:
+                _distinct_buckets = list(dict.fromkeys(c["bucket"] for c in candidates))
+                if len(_distinct_buckets) >= 2:
+                    _c1, _c2 = candidates[0], candidates[1]
+                    _split_per = max(1, _lots // len(_distinct_buckets))
+                    _remainder = _lots - _split_per * len(_distinct_buckets)
+                    df.at[idx, "CC_Split_Note"] = (
+                        f"Split {_lots} contracts: "
+                        f"{_split_per + (_remainder if _distinct_buckets[0] == _c1['bucket'] else 0)}× "
+                        f"{_c1['bucket']} ${_c1['strike']}C ({_c1['dte']}d) + "
+                        f"{_split_per}× {_c2['bucket']} ${_c2['strike']}C ({_c2['dte']}d) "
+                        f"— diversifies DTE/gamma exposure"
+                    )
 
             _rec_tag_scan = ""
             if rec_mode in ("RECOVERY", "DEEP_RECOVERY"):

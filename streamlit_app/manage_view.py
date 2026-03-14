@@ -22,9 +22,12 @@ import logging
 from datetime import datetime, date
 from pathlib import Path
 
+from scan_engine.calendar_context import get_calendar_context
+
 logger = logging.getLogger(__name__)
 
 DOCTRINE_PATH = Path("core/management/outputs/positions_latest.csv")
+PORTFOLIO_VAR_PATH = Path("core/management/outputs/portfolio_var_latest.json")
 
 REQUIRED_DOCTRINE_COLS = [
     "TradeID", "Underlying_Ticker", "Strategy",
@@ -55,33 +58,27 @@ def _load_doctrine() -> tuple[pd.DataFrame, bool]:
         return pd.DataFrame(), False
 
 
-def _duckdb_connect_read_only(db_path_str: str):
-    """
-    Opens a DuckDB connection in read-only mode.
-    If a stale write-lock is detected (crashed writer, PID dead), attempts a brief
-    write-mode open to force WAL recovery/checkpoint, then retries read-only.
-    Returns an open connection or raises.
-    """
-    import duckdb
+@st.cache_data(ttl=30)
+def _load_portfolio_var() -> dict:
+    """Load Portfolio VaR sidecar JSON if available."""
+    if not PORTFOLIO_VAR_PATH.exists():
+        return {}
     try:
-        return duckdb.connect(db_path_str, read_only=True)
-    except Exception as e:
-        if "Conflicting lock" in str(e) or "lock" in str(e).lower():
-            logger.warning(
-                f"[DuckDB] Stale write-lock detected — attempting WAL recovery: {e}"
-            )
-            try:
-                # Open in write mode to trigger automatic WAL recovery + checkpoint,
-                # then close immediately. This clears the stale lock from a dead process.
-                _recovery_con = duckdb.connect(db_path_str, read_only=False)
-                _recovery_con.execute("CHECKPOINT")
-                _recovery_con.close()
-                logger.info("[DuckDB] WAL recovery successful — retrying read-only open.")
-                return duckdb.connect(db_path_str, read_only=True)
-            except Exception as recover_err:
-                logger.error(f"[DuckDB] WAL recovery failed: {recover_err}")
-                raise
-        raise
+        import json
+        return json.loads(PORTFOLIO_VAR_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _duckdb_connect_read_only(db_path_str: str = None):
+    """
+    Opens a DuckDB connection in read-only mode via the domain connection layer.
+    Delegates WAL recovery, lock-retry, and debug-mode routing to duckdb_utils.
+    The db_path_str parameter is accepted for backward compatibility but ignored;
+    all reads go through get_domain_connection(DbDomain.PIPELINE).
+    """
+    from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
+    return get_domain_connection(DbDomain.PIPELINE, read_only=True)
 
 
 @st.cache_data(ttl=30)
@@ -121,6 +118,7 @@ def _load_roll_candidates_from_db(db_path_str: str) -> dict:
                 FROM management_recommendations
                 WHERE AssetType = 'OPTION'
                   AND Roll_Candidate_1 IS NOT NULL
+                  AND Roll_Candidate_1 NOT IN ('N/A', '', 'nan', 'None')
                 ORDER BY Snapshot_TS DESC
             """).df()
         if not df.empty:
@@ -654,15 +652,48 @@ URGENCY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 ACTION_BADGE = {
     "EXIT":       ("🔴", "background-color:#3d1515"),
     "ROLL":       ("🟠", "background-color:#3d2e00"),
-    "ROLL_WAIT":  ("⏳", "background-color:#2a2a00"),
+    "ROLL_WAIT":  ("🟠", "background-color:#3d2e00"),       # displays as ROLL
+    "ROLL_UP_OUT":("🟠", "background-color:#3d2e00"),       # displays as ROLL
     "TRIM":       ("🟡", "background-color:#2d2d00"),
     "HOLD":       ("🟢", ""),
+    "HOLD_STOCK_WAIT":         ("🟢", ""),                   # displays as DEFER_WRITING
+    "HOLD_WITH_CAUTION":       ("🟢", ""),                   # displays as HOLD
+    "HOLD_FOR_REVERSION":      ("🟢", ""),
+    "LET_EXPIRE":              ("🟣", "background-color:#2d1a3d"),
+    "ACCEPT_CALL_AWAY":        ("🟣", "background-color:#2d1a3d"),
+    "ACCEPT_SHARE_ASSIGNMENT": ("🟣", "background-color:#2d1a3d"),
+    "BUYBACK":    ("🔵", "background-color:#1a2a3d"),
+    "WRITE_NOW":  ("🔵", "background-color:#1a2a3d"),       # displays as WRITE_CALL
     "SCALE_UP":   ("⬆️", "background-color:#0a2a0a"),
-    "WAIT":       ("⏳", ""),
-    "REVALIDATE": ("🔄", ""),
+    "PAUSE_WRITING":           ("⏸️", "background-color:#2a2a00"),  # displays as DEFER_WRITING
+    "EXIT_STOCK": ("🔴", "background-color:#3d1515"),       # displays as EXIT
+    "REVIEW":     ("🔄", ""),
     "QUARANTINE": ("🚫", "background-color:#2d001a"),
     "HALT":               ("🛑", "background-color:#3d1515"),
     "AWAITING_SETTLEMENT":("⏳", "background-color:#1a1a2e"),
+}
+
+# ── Action label simplification ──────────────────────────────────────────
+# Engine produces fine-grained internal actions (WRITE_NOW, ROLL_UP_OUT, etc.)
+# The card should answer ONE question: "What do I actually do next?"
+# Details (how, why, when) belong in the journey note / mode badge, not the label.
+ACTION_DISPLAY = {
+    # Direct mappings (clean up formatting)
+    "LET_EXPIRE":              "LET EXPIRE",
+    "ACCEPT_CALL_AWAY":        "ACCEPT CALL AWAY",
+    "ACCEPT_SHARE_ASSIGNMENT": "ACCEPT SHARE ASSIGNMENT",
+    "BUYBACK":                 "BUYBACK",
+    "REVIEW":                  "REVIEW",
+    "SCALE_UP":                "SCALE UP",
+    # Collapsed labels — one label per user behavior
+    "WRITE_NOW":               "WRITE CALL",        # was ambiguous ("write what?")
+    "HOLD_STOCK_WAIT":         "DEFER WRITING",     # hold stock, wait for better window
+    "PAUSE_WRITING":           "DEFER WRITING",     # same user behavior as HOLD_STOCK_WAIT
+    "EXIT_STOCK":              "EXIT",              # exit is exit
+    "ROLL_UP_OUT":             "ROLL",              # "up and out" is how, not what
+    "ROLL_WAIT":               "ROLL",              # timing detail, not action
+    "HOLD_WITH_CAUTION":       "HOLD",              # caution is annotation, not action
+    "HOLD_FOR_REVERSION":      "HOLD",
 }
 DECISION_BADGE = {
     "ACTIONABLE":          "🔴 ACTIONABLE",
@@ -714,6 +745,15 @@ def _render_doctrine_recommendations(df: pd.DataFrame):
         _trades_all = _trades_all.sort_values("_asset_rank").drop(columns=["_asset_rank"])
     trades = _trades_all.drop_duplicates("TradeID").copy()
 
+    # Filter write-off positions — micro-positions parked by doctrine.
+    # They appear in a collapsed section on the Positions tab, not here.
+    if "Doctrine_State" in df.columns:
+        _wo_trades = set(
+            df.loc[df["Doctrine_State"].fillna("").str.upper() == "WRITE_OFF", "TradeID"].dropna()
+        )
+        if _wo_trades:
+            trades = trades[~trades["TradeID"].isin(_wo_trades)].copy()
+
     # Filter STOCK_ONLY: show only those with elevated urgency (MEDIUM/HIGH/CRITICAL)
     # AND ≥100 shares.  Sub-contract stock (<100 shares) adds noise — no CC available,
     # limited actionability.  These remain visible only in the Idle tab.
@@ -730,8 +770,8 @@ def _render_doctrine_recommendations(df: pd.DataFrame):
     # Headline metrics
     actionable = (trades["Decision_State"] == "ACTIONABLE").sum()
     uncertain = (trades["Decision_State"] == "UNCERTAIN").sum()
-    exits = (trades["Action"] == "EXIT").sum()
-    rolls = (trades["Action"] == "ROLL").sum()
+    exits = trades["Action"].isin(["EXIT", "EXIT_STOCK"]).sum()
+    rolls = trades["Action"].isin(["ROLL", "ROLL_UP_OUT", "WRITE_NOW"]).sum()
     roll_waits = (trades["Action"] == "ROLL_WAIT").sum()
     crits = (trades["Urgency"] == "CRITICAL").sum()
 
@@ -771,11 +811,45 @@ def _render_doctrine_recommendations(df: pd.DataFrame):
         vol_state = row.get("VolatilityState_State", "")
         assign_risk = row.get("AssignmentRisk_State", "")
 
-        # Card header
-        urgency_marker = "🔴 " if urgency == "CRITICAL" else ("🟠 " if urgency == "HIGH" else "")
+        # Card header — clean format: one badge emoji, action label, decision state
+        _exit_trigger = str(row.get("Exit_Trigger_Type", "") or "")
+        _action_display = ACTION_DISPLAY.get(action, action)
+
+        # Single emoji: use urgency color when HIGH/CRITICAL, else action badge
+        if urgency == "CRITICAL":
+            _hdr_emoji = "🔴"
+        elif urgency == "HIGH":
+            _hdr_emoji = "🟠"
+        else:
+            _hdr_emoji = emoji  # action badge emoji
+
+        # DTE + account for quick scanning
+        _hdr_dte = f"  `DTE: {int(dte)}d`" if pd.notna(dte) else ""
+        _hdr_acct = ""
+        _hdr_acct_raw = str(row.get("Account", "") or "").upper()
+        if "ROTH" in _hdr_acct_raw:
+            _hdr_acct = "  `Roth`"
+        elif "INDIVIDUAL" in _hdr_acct_raw or "TOD" in _hdr_acct_raw:
+            _hdr_acct = "  `Taxable`"
+
+        # Mode badge: Recovery Premium / Recovery Ladder
+        _hdr_doc_state = str(row.get("Doctrine_State", "") or "").upper()
+        _hdr_mode = ""
+        if _hdr_doc_state == "RECOVERY_PREMIUM":
+            _hdr_mode = "  `Recovery`"
+        elif _hdr_doc_state == "RECOVERY_LADDER":
+            _hdr_mode = "  `Recovery`"
+
+        # Urgency suffix for CRITICAL/HIGH
+        _hdr_urg = ""
+        if urgency == "CRITICAL" and _exit_trigger:
+            _hdr_urg = f" **{urgency} ({_exit_trigger})**"
+        elif urgency in ("CRITICAL", "HIGH"):
+            _hdr_urg = f" **{urgency}**"
+
         header = (
-            f"{urgency_marker}{emoji} **{ticker}** — {strategy}   "
-            f"`{action}` · {decision_label}"
+            f"{_hdr_emoji} **{ticker}** — {strategy}{_hdr_acct}{_hdr_dte}   "
+            f"`{_action_display}`{_hdr_urg}{_hdr_mode} · {decision_label}"
         )
 
         # Auto-expand actionable / critical cards.
@@ -1216,6 +1290,285 @@ def _render_portfolio_snapshot(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
                    delta_color="inverse" if expiring_soon > 0 else "off")
     cols[5].metric("Underlying Tickers", int(tickers))
 
+    # --- Margin Carry (from MarginCarryCalculator) ---
+    _carry = df.attrs.get("margin_carry") if hasattr(df, "attrs") else None
+    if _carry is None:
+        # Fallback: compute from per-position columns if available
+        _dmc = pd.to_numeric(df.get("Daily_Margin_Cost", pd.Series(dtype=float)), errors="coerce").fillna(0)
+        _carry_total = float(_dmc.sum())
+        if _carry_total > 0.01:
+            _carry = {"portfolio_daily_margin_burn": round(_carry_total, 2)}
+            # Compute taxable/retirement counts from Account column
+            try:
+                from core.shared.finance_utils import is_retirement_account as _is_ret
+                _accts = df["Account"].fillna("") if "Account" in df.columns else pd.Series("", index=df.index)
+                _is_ret_mask = _accts.apply(lambda a: _is_ret(str(a)) if a else False)
+                # Count unique TradeIDs per account type (not rows)
+                _tids = df["TradeID"] if "TradeID" in df.columns else pd.Series(range(len(df)))
+                _ret_tids = _tids[_is_ret_mask].nunique()
+                _tax_tids = _tids[~_is_ret_mask & (_accts != "")].nunique()
+                _carry["retirement_positions"] = _ret_tids
+                _carry["taxable_positions"] = _tax_tids
+            except Exception:
+                pass
+            # Margin debit: sum of (Net_Cost_Basis × Qty) for taxable stock legs with margin
+            try:
+                _tax_stocks = df[
+                    (df["AssetType"] == "STOCK")
+                    & (_dmc > 0)
+                ]
+                if not _tax_stocks.empty and "Net_Cost_Basis_Per_Share" in _tax_stocks.columns:
+                    _ncb = pd.to_numeric(_tax_stocks["Net_Cost_Basis_Per_Share"], errors="coerce").fillna(0)
+                    _qty = pd.to_numeric(_tax_stocks["Quantity"], errors="coerce").fillna(0).abs()
+                    _carry["margin_debit"] = round(float((_ncb * _qty).sum()), 0)
+            except Exception:
+                pass
+
+    if _carry and _carry.get("portfolio_daily_margin_burn", 0) > 0.01:
+        _burn = _carry["portfolio_daily_margin_burn"]
+        _net_income = net_theta + _burn * -1  # theta is positive, burn is positive cost
+        _health = _carry.get("portfolio_carry_health", "")
+        _source = _carry.get("burn_source", "ESTIMATED")
+        _debit = _carry.get("margin_debit")
+        _tax_pos = _carry.get("taxable_positions")
+        _ret_pos = _carry.get("retirement_positions")
+
+        carry_cols = st.columns(4)
+        carry_cols[0].metric(
+            "Margin Carry",
+            f"-${_burn:.2f}/day",
+            delta=f"{'ACTUAL' if _source == 'ACTUAL_DEBIT' else 'EST'}",
+            delta_color="off",
+        )
+        carry_cols[1].metric("Net Income/Day", f"${_net_income:+.2f}")
+        carry_cols[2].metric(
+            "Monthly Carry",
+            f"-${_burn * 30:,.0f}",
+        )
+        carry_cols[3].metric(
+            "Margin Debit",
+            f"${_debit:,.0f}" if _debit else "—",
+        )
+
+        # --- Income Layer Yield vs Passive Hurdle ---
+        # Isolate income strategies (BW, CC, CSP) — exclude directional
+        # (LONG_CALL, LONG_PUT, LEAPS_*) which bleed theta and distort yield.
+        _INCOME_STRATS = {"BUY_WRITE", "COVERED_CALL", "CSP"}
+        _strat_col = df["Strategy"].fillna("").str.upper() if "Strategy" in df.columns else pd.Series("", index=df.index)
+
+        # Income theta: only option legs from income strategies
+        _inc_opts = options[_strat_col.reindex(options.index, fill_value="").isin(_INCOME_STRATS)]
+        _inc_theta = 0.0
+        if not _inc_opts.empty:
+            _inc_theta = float(
+                (pd.to_numeric(_inc_opts["Theta"], errors="coerce")
+                 * pd.to_numeric(_inc_opts["Quantity"], errors="coerce")).sum() * 100
+            )
+
+        # Income capital: stock legs backing income strategies only
+        _inc_stocks = df[
+            (df["AssetType"] == "STOCK")
+            & _strat_col.isin(_INCOME_STRATS)
+        ].copy()
+        _inc_capital = 0.0
+        if not _inc_stocks.empty and "Net_Cost_Basis_Per_Share" in _inc_stocks.columns:
+            _ncp = pd.to_numeric(_inc_stocks["Net_Cost_Basis_Per_Share"], errors="coerce").fillna(0)
+            _qty = pd.to_numeric(_inc_stocks["Quantity"], errors="coerce").fillna(0).abs()
+            _inc_capital = float((_ncp * _qty).sum())
+
+        # Income margin: only margin from income positions
+        _inc_margin = 0.0
+        _inc_all = df[_strat_col.isin(_INCOME_STRATS)]
+        if not _inc_all.empty:
+            _inc_margin = float(
+                pd.to_numeric(_inc_all.get("Daily_Margin_Cost", pd.Series(dtype=float)),
+                              errors="coerce").fillna(0).sum()
+            )
+
+        _inc_net_income = _inc_theta - _inc_margin
+        if _inc_capital > 0:
+            _ann_yield = (_inc_net_income * 365) / _inc_capital
+            _SP_HURDLE = 0.10  # S&P 500 long-run ~10%/yr total return
+            if _ann_yield > _SP_HURDLE:
+                _hurdle_label = "Above hurdle"
+                _hurdle_color = "normal"
+            elif _ann_yield > 0:
+                _hurdle_label = "Below hurdle"
+                _hurdle_color = "inverse"
+            else:
+                _hurdle_label = "Negative carry"
+                _hurdle_color = "inverse"
+            # Directional layer: theta bleed from non-income option legs
+            _dir_opts = options[~_strat_col.reindex(options.index, fill_value="").isin(_INCOME_STRATS)].copy()
+            _dir_theta = net_theta - _inc_theta  # typically negative (long options bleed)
+
+            # Split: LEAPs (LEAPS_CALL, LEAPS_PUT) vs short-term (LONG_CALL, LONG_PUT)
+            _LEAP_STRATS = {"LEAPS_CALL", "LEAPS_PUT"}
+            _dir_strat = _strat_col.reindex(_dir_opts.index, fill_value="")
+            _leap_opts = _dir_opts[_dir_strat.isin(_LEAP_STRATS)]
+            _st_opts = _dir_opts[~_dir_strat.isin(_LEAP_STRATS)]
+
+            def _layer_theta(opts_df):
+                if opts_df.empty:
+                    return 0.0
+                return float(
+                    (pd.to_numeric(opts_df["Theta"], errors="coerce")
+                     * pd.to_numeric(opts_df["Quantity"], errors="coerce")).sum() * 100
+                )
+
+            _leap_theta = _layer_theta(_leap_opts)
+            _st_theta = _layer_theta(_st_opts)
+
+            # Top bleeders: per-ticker theta ranked by magnitude
+            _top_bleeders = []
+            if not _dir_opts.empty and "Underlying_Ticker" in _dir_opts.columns:
+                _dir_opts["_pos_theta"] = (
+                    pd.to_numeric(_dir_opts["Theta"], errors="coerce")
+                    * pd.to_numeric(_dir_opts["Quantity"], errors="coerce")
+                ) * 100
+                _by_ticker = _dir_opts.groupby("Underlying_Ticker")["_pos_theta"].sum()
+                _by_ticker = _by_ticker[_by_ticker < -0.01].sort_values()  # worst first
+                _top_bleeders = [
+                    f"{tkr} ${val:+.1f}" for tkr, val in _by_ticker.head(3).items()
+                ]
+
+            _yield_cols = st.columns(6)
+            _yield_cols[0].metric(
+                "Income Layer Yield",
+                f"{_ann_yield:+.1%}",
+                delta=f"θ − margin on ${_inc_capital:,.0f} income capital",
+                delta_color="off",
+            )
+            _gap_pts = (_ann_yield - _SP_HURDLE) * 100
+            _yield_cols[1].metric(
+                "Income Layer Gap vs Passive Hurdle",
+                f"{_gap_pts:+.1f} pts",
+                delta=_hurdle_label,
+                delta_color=_hurdle_color,
+            )
+            # LEAPs carry
+            if _leap_theta != 0:
+                _n_leaps = _leap_opts["Underlying_Ticker"].nunique() if not _leap_opts.empty else 0
+                _yield_cols[2].metric(
+                    "LEAPs Carry",
+                    f"${_leap_theta:+.1f}/day",
+                    delta=f"{_n_leaps} position{'s' if _n_leaps != 1 else ''}",
+                    delta_color="off",
+                )
+            # Short-term directional carry
+            if _st_theta != 0:
+                _n_st = _st_opts["Underlying_Ticker"].nunique() if not _st_opts.empty else 0
+                _yield_cols[3].metric(
+                    "Short-Term Carry",
+                    f"${_st_theta:+.1f}/day",
+                    delta=f"{_n_st} position{'s' if _n_st != 1 else ''}",
+                    delta_color="off",
+                )
+            # Top bleeders
+            if _top_bleeders:
+                _yield_cols[4].metric(
+                    "Top θ Bleeders",
+                    _top_bleeders[0],
+                    delta=", ".join(_top_bleeders[1:]) if len(_top_bleeders) > 1 else None,
+                    delta_color="off",
+                )
+
+    # --- BW/CC Efficiency Scorecard ---
+    _eff = df.attrs.get("bw_efficiency") if hasattr(df, "attrs") else None
+    if _eff is None:
+        # Fallback: compute from per-position columns if available
+        if "Carry_Efficiency_Grade" in df.columns:
+            _grade_col = df["Carry_Efficiency_Grade"].replace("", pd.NA).dropna()
+            if not _grade_col.empty:
+                _eff = {"grade_distribution": _grade_col.value_counts().to_dict()}
+
+    if _eff and _eff.get("total_bw_cc_positions", 0) > 0:
+        _n_bw = _eff["total_bw_cc_positions"]
+        _prem = _eff.get("total_premium_collected", 0)
+        _carry_paid = _eff.get("total_carry_paid", 0)
+        _pcr = _eff.get("portfolio_premium_carry_ratio", 0)
+        _bw_theta = _eff.get("bw_cc_daily_theta", 0)
+        _bw_carry = _eff.get("bw_cc_daily_carry", 0)
+        _net_daily = _eff.get("portfolio_net_yield_daily", 0)
+        _grades = _eff.get("grade_distribution", {})
+
+        eff_cols = st.columns(6)
+        eff_cols[0].metric(
+            "BW/CC Positions",
+            _n_bw,
+        )
+        eff_cols[1].metric(
+            "Premium Collected",
+            f"${_prem:,.0f}",
+        )
+        eff_cols[2].metric(
+            "Carry Paid",
+            f"${_carry_paid:,.0f}",
+        )
+        _pcr_display = f"{_pcr:.1f}×" if _pcr != float("inf") else "∞"
+        _pcr_color = "normal" if _pcr >= 3.0 else ("inverse" if _pcr < 1.5 else "off")
+        eff_cols[3].metric(
+            "Premium/Carry",
+            _pcr_display,
+            delta="Efficient" if _pcr >= 3.0 else ("Marginal" if _pcr >= 1.0 else "Losing"),
+            delta_color=_pcr_color,
+        )
+        eff_cols[4].metric(
+            "BW/CC θ/day",
+            f"${_bw_theta:+.2f}",
+        )
+        eff_cols[5].metric(
+            "BW/CC Net/day",
+            f"${_net_daily:+.2f}",
+            delta=f"θ ${_bw_theta:.0f} - carry ${_bw_carry:.0f}",
+            delta_color="off",
+        )
+
+        # Grade distribution bar
+        _grade_parts = []
+        for g in ("A", "B", "C", "D", "F"):
+            cnt = _grades.get(g, 0)
+            if cnt > 0:
+                _grade_parts.append(f"**{g}**: {cnt}")
+        if _grade_parts:
+            st.caption("**BW/CC Efficiency** — " + " | ".join(_grade_parts))
+
+        # Worst performers warning
+        _worst = _eff.get("worst_performers", [])
+        _f_count = _grades.get("F", 0)
+        _d_count = _grades.get("D", 0)
+        if _f_count > 0:
+            _drain_tickers = [w["ticker"] for w in _worst if w.get("grade") in ("F", "D")]
+            st.warning(
+                f"{_f_count} BW/CC position(s) graded **F** — carry exceeds premium. "
+                f"{'Tickers: ' + ', '.join(_drain_tickers) + '. ' if _drain_tickers else ''}"
+                f"Consider rolling to higher-premium strike or converting to PMCC."
+            )
+
+    # --- Portfolio VaR (MC Correlated Stress Test) ---
+    _pvar = _load_portfolio_var()
+    if _pvar and _pvar.get("Portfolio_VaR_5pct") is not None:
+        _var5 = _pvar["Portfolio_VaR_5pct"]
+        _cvar5 = _pvar.get("Portfolio_CVaR_5pct")
+        _p50 = _pvar.get("Portfolio_P50")
+        _p95 = _pvar.get("Portfolio_P95")
+        _conc = _pvar.get("Portfolio_Concentration")
+        _corr_risk = _pvar.get("Portfolio_Corr_Risk")
+        _stress = _pvar.get("Portfolio_Stress_SPY_5")
+
+        var_cols = st.columns(6)
+        var_cols[0].metric("VaR (5%)", f"${_var5:+,.0f}")
+        var_cols[1].metric("CVaR (5%)", f"${_cvar5:+,.0f}" if _cvar5 is not None else "—")
+        var_cols[2].metric("Median P&L", f"${_p50:+,.0f}" if _p50 is not None else "—")
+        var_cols[3].metric("P95 P&L", f"${_p95:+,.0f}" if _p95 is not None else "—")
+        var_cols[4].metric("Concentration", f"{_conc:.2f}" if _conc is not None else "—",
+                           delta="Concentrated" if _conc is not None and _conc > 0.5 else None,
+                           delta_color="inverse" if _conc is not None and _conc > 0.5 else "off")
+        var_cols[5].metric("SPY -5% Stress", f"${_stress:+,.0f}" if _stress is not None else "—")
+
+        if _corr_risk is not None and _corr_risk > 0.5:
+            st.warning(f"Correlation risk score {_corr_risk:.2f} — positions are highly correlated. Diversification benefit is limited.")
+
     # Capital Bucket exposure row — deduplicate to trade level before counting
     # (multi-leg trades like BUY_WRITE have a STOCK leg with no bucket; counting
     # all rows inflates "Unclassified". Use one row per TradeID.)
@@ -1244,7 +1597,9 @@ def _render_portfolio_snapshot(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
         if "Circuit_Breaker_Reason" in doctrine_df.columns and len(doctrine_df) > 0:
             _cb_reason = str(doctrine_df["Circuit_Breaker_Reason"].iloc[0] or "")
         if _cb_state == "TRIPPED":
-            st.error(f"**Circuit Breaker: TRIPPED** — {_cb_reason}")
+            st.error(f"**Circuit Breaker: TRIPPED** — all positions forced EXIT CRITICAL. {_cb_reason}")
+        elif _cb_state == "COOLDOWN":
+            st.warning(f"**Circuit Breaker: COOLDOWN** — new entries blocked, exits per doctrine. {_cb_reason}")
         elif _cb_state == "WARNING":
             st.warning(f"**Circuit Breaker: WARNING** — {_cb_reason}")
 
@@ -1300,6 +1655,38 @@ def _render_portfolio_snapshot(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
         if _parts:
             st.caption("**Sector RS** — " + "  |  ".join(_parts))
 
+    # --- Macro Event Calendar Strip ---
+    if doctrine_df is not None and "Macro_Strip" in doctrine_df.columns:
+        _macro_strip_val = str(doctrine_df["Macro_Strip"].iloc[0] if len(doctrine_df) > 0 else "")
+        if _macro_strip_val:
+            _is_mw = bool(doctrine_df["Is_Macro_Week"].iloc[0]) if "Is_Macro_Week" in doctrine_df.columns and len(doctrine_df) > 0 else False
+            if _is_mw:
+                st.warning(f"**MACRO WEEK** — {_macro_strip_val}")
+            else:
+                st.info(f"Macro Calendar: {_macro_strip_val}")
+
+    # --- Upcoming Earnings (from days_to_earnings or Earnings_Track_Quarters presence) ---
+    if doctrine_df is not None and "days_to_earnings" in doctrine_df.columns:
+        _dte_earn = doctrine_df[["Underlying_Ticker", "days_to_earnings"]].drop_duplicates("Underlying_Ticker")
+        _dte_earn = _dte_earn[_dte_earn["days_to_earnings"].notna()]
+        _dte_earn = _dte_earn[_dte_earn["days_to_earnings"].between(0, 14)]
+        if not _dte_earn.empty:
+            _dte_earn = _dte_earn.sort_values("days_to_earnings")
+            _parts = []
+            for _, r in _dte_earn.iterrows():
+                _tk = r['Underlying_Ticker']
+                _dd = int(r['days_to_earnings'])
+                _part = f"**{_tk}** ({_dd}d)"
+                # Append phase badge if available
+                if "Earnings_Current_Phase" in doctrine_df.columns:
+                    _ph_rows = doctrine_df[doctrine_df["Underlying_Ticker"] == _tk]["Earnings_Current_Phase"]
+                    _ph = _ph_rows.iloc[0] if not _ph_rows.empty else ""
+                    if _ph and str(_ph) not in ("", "QUIET", "NO_UPCOMING", "N/A", "nan"):
+                        _ph_icons = {"EARLY_POSITIONING": "🟡", "LATE_POSITIONING": "🟠", "IMMINENT": "🔴"}
+                        _part += f" {_ph_icons.get(str(_ph), '')} {str(_ph).replace('_', ' ')}"
+                _parts.append(_part)
+            st.info(f"Upcoming Earnings (14d): {', '.join(_parts)}")
+
     # If doctrine is available, show critical signals under the snapshot
     if doctrine_df is not None and not doctrine_df.empty:
         crits = doctrine_df[doctrine_df["Decision_State"] == "ACTIONABLE"]
@@ -1309,6 +1696,36 @@ def _render_portfolio_snapshot(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
                 f"⚠️ **{len(crits)} position(s) require action: "
                 f"{', '.join(tickers_crit)}** — see Doctrine tab"
             )
+
+    # --- Copy Portfolio Snapshot ---
+    _copy_lines = [
+        f"Portfolio Snapshot — {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}",
+        f"Total G/L: {'+'if total_gl>=0 else ''}{total_gl:,.0f}",
+        f"Net Delta: {net_delta:+.0f} | Net Theta/Day: {net_theta:+.2f} | Net Vega: {net_vega:+.2f}",
+        f"Tickers: {tickers} | Expiring <=7d: {int(expiring_soon)}",
+    ]
+    if _pvar and _pvar.get("Portfolio_VaR_5pct") is not None:
+        _copy_lines.append("")
+        _copy_lines.append("MC Portfolio VaR (Hull Ch.22 — correlated stress test):")
+        _copy_lines.append(
+            f"  VaR(5%): ${_pvar['Portfolio_VaR_5pct']:+,.0f} | "
+            f"CVaR(5%): ${_pvar.get('Portfolio_CVaR_5pct', 0) or 0:+,.0f}"
+        )
+        _copy_lines.append(
+            f"  Median P&L: ${_pvar.get('Portfolio_P50', 0) or 0:+,.0f} | "
+            f"P95: ${_pvar.get('Portfolio_P95', 0) or 0:+,.0f}"
+        )
+        _copy_lines.append(
+            f"  Concentration (HHI): {_pvar.get('Portfolio_Concentration', 0) or 0:.2f} | "
+            f"Corr Risk: {_pvar.get('Portfolio_Corr_Risk', 0) or 0:.2f}"
+        )
+        if _pvar.get("Portfolio_Stress_SPY_5") is not None:
+            _copy_lines.append(f"  SPY -5% Stress: ${_pvar['Portfolio_Stress_SPY_5']:+,.0f}")
+        _mc_note = _pvar.get("Portfolio_MC_Note", "")
+        if _mc_note:
+            _copy_lines.append(f"  Note: {_mc_note}")
+    with st.expander("📋 Copy Portfolio Snapshot", expanded=False):
+        st.code("\n".join(_copy_lines), language=None)
 
 
 def _apply_time_of_day_filter(backend_readiness: str, backend_reason: str, urgency: str) -> tuple:
@@ -1801,8 +2218,8 @@ def _build_auto_checklist(doc_row, hard_stop, spot, opt_legs, opt_doc_row=None, 
             except Exception:
                 pass
 
-            # Detect ITM-defense context: doctrine says ROLL + new strike rescues position above net cost
-            _itm_defense_roll = (
+            # Detect strike-improvement context: doctrine says ROLL + new strike above net cost
+            _strike_improvement_roll = (
                 doctrine_action in ("ROLL", "ROLL_WAIT")
                 and net_cost is not None
                 and pd.notna(net_cost)
@@ -1813,47 +2230,87 @@ def _build_auto_checklist(doc_row, hard_stop, spot, opt_legs, opt_doc_row=None, 
                 and spot > (net_cost * 0.75)  # spot still viable (not catastrophically broken)
             )
 
+            # Distinguish true ITM defense (short call actually ITM) from OTM recovery roll.
+            # "ITM defense" should only appear when the short call IS ITM (spot > strike).
+            # When OTM (spot < strike), the debit is for recovery/strike improvement, not ITM rescue.
+            _cur_short_strike = None
+            if opt_doc_row is not None:
+                _css_raw = opt_doc_row.get("Strike", opt_doc_row.get("Short_Call_Strike"))
+                if _css_raw is not None and pd.notna(_css_raw):
+                    try:
+                        _cur_short_strike = float(_css_raw)
+                    except (TypeError, ValueError):
+                        pass
+            if _cur_short_strike is None and opt_legs is not None and not opt_legs.empty:
+                _css_raw2 = opt_legs.iloc[0].get("Strike")
+                if _css_raw2 is not None and pd.notna(_css_raw2):
+                    try:
+                        _cur_short_strike = float(_css_raw2)
+                    except (TypeError, ValueError):
+                        pass
+            _is_actually_itm = (
+                _cur_short_strike is not None
+                and spot is not None
+                and pd.notna(spot)
+                and spot > _cur_short_strike
+            )
+
+            # Target strike + expiry for display (available from candidate data)
+            _target_label = ""
+            if _new_strike is not None:
+                _new_exp = cand1.get("expiry", "")
+                _strike_str = f"${_new_strike:,.0f}" if _new_strike == int(_new_strike) else f"${_new_strike:,.2f}"
+                _target_label = f" → {_strike_str}"
+                if _new_exp:
+                    _target_label += f" {_new_exp}"
+
             if roll_type == "credit":
-                items.append(("✅", f"Net credit roll (+${net_per:.2f}/contract){_stale_note}",
+                items.append(("✅", f"Net credit roll (+${net_per:.2f}/contract){_target_label}{_stale_note}",
                     "Roll generates income — basis continues reducing"))
-            elif roll_type == "debit" and _itm_defense_roll:
+            elif roll_type == "debit" and _strike_improvement_roll:
                 # net_per_contract is already per-share (e.g. -8.95 = $8.95/share debit)
                 _strike_above_nc  = _new_strike - net_cost
                 _debit_per_share  = abs(net_per)           # net_per_contract IS per-share
                 _new_breakeven    = net_cost + _debit_per_share
                 _net_total        = ctr.get("net_total")   # pre-computed: net_per × qty × 100
                 _total_str        = f"${abs(_net_total):,.0f} total" if _net_total is not None else ""
-                # Determine what assignment at the CURRENT strike would deliver.
-                # This requires the current short strike, not the roll target.
-                # We don't have it directly in ctr, but we can infer from context:
-                # If spot > net_cost and spot < new_strike: current strike is somewhere between them.
-                # Key question: is current strike ABOVE or BELOW net_cost?
-                # _new_strike > net_cost is already guaranteed by _itm_defense_roll.
-                # For the "assignment at current strike" language, use spot as proxy:
-                # if spot (deeply ITM → current strike ≈ below spot) is above net_cost,
-                # assignment would be profitable. If spot < net_cost, it's a loss.
+
+                # Label: distinguish true ITM defense from OTM recovery/strike improvement
+                if _is_actually_itm:
+                    _debit_label = f"Debit roll for ITM defense (-${_debit_per_share:.2f}/share)"
+                else:
+                    _debit_label = f"Debit roll for strike improvement (-${_debit_per_share:.2f}/share)"
+
+                # Context: what does the debit buy us?
                 _assignment_context: str
                 if spot is not None and pd.notna(spot) and spot > net_cost:
-                    # Stock currently above net cost — current strike (which is below spot/ITM)
-                    # may still be above net_cost (assignment would profit) or below it (loss).
-                    # Without current_strike directly, be explicit about what we know:
                     _assign_pnl_new = _new_strike - net_cost   # if assigned at NEW strike
-                    _assignment_context = (
-                        f"Rolling to ${_new_strike:.2f} locks in a ${_assign_pnl_new:.2f}/share "
-                        f"profit buffer above net cost ${net_cost:.2f} if assigned. "
-                        f"The ${_debit_per_share:.2f} debit buys ${_strike_above_nc:.2f} of "
-                        f"additional headroom — pay it to control the exit price."
-                    )
+                    if _is_actually_itm:
+                        _assignment_context = (
+                            f"Short call ITM (spot ${spot:.2f} > strike). "
+                            f"Rolling to ${_new_strike:.2f} locks in a ${_assign_pnl_new:.2f}/share "
+                            f"profit buffer above net cost ${net_cost:.2f} if assigned. "
+                            f"The ${_debit_per_share:.2f} debit buys ${_strike_above_nc:.2f} of "
+                            f"additional headroom — pay it to control the exit price."
+                        )
+                    else:
+                        _assignment_context = (
+                            f"Short call OTM (spot ${spot:.2f} < strike"
+                            f"{f' ${_cur_short_strike:.2f}' if _cur_short_strike else ''}"
+                            f") — not an assignment emergency. "
+                            f"Rolling to ${_new_strike:.2f} lifts strike ${_strike_above_nc:.2f} "
+                            f"above net cost ${net_cost:.2f}, improving recovery geometry. "
+                            f"The ${_debit_per_share:.2f} debit is for positioning, not rescue."
+                        )
                 else:
-                    # Stock below net cost — assignment at any strike near spot would likely
-                    # realize a loss after premiums; the roll is a genuine rescue.
+                    # Stock below net cost
                     _assignment_context = (
                         f"Without this roll, assignment at current strike risks a per-share loss "
                         f"vs net cost ${net_cost:.2f}. "
-                        f"The ${_debit_per_share:.2f} debit rescues the position by moving the "
+                        f"The ${_debit_per_share:.2f} debit moves the "
                         f"strike to ${_new_strike:.2f} — ${_strike_above_nc:.2f} above net cost."
                     )
-                items.append(("⚠️", f"Debit roll required for ITM defense (-${_debit_per_share:.2f}/share){_stale_note}",
+                items.append(("⚠️", f"{_debit_label}{_stale_note}",
                     f"Pay ${_debit_per_share:.2f}/share{(', ' + _total_str) if _total_str else ''} "
                     f"to roll to ${_new_strike:.2f}. New breakeven ~${_new_breakeven:.2f}/share. "
                     + _assignment_context))
@@ -1871,10 +2328,10 @@ def _build_auto_checklist(doc_row, hard_stop, spot, opt_legs, opt_doc_row=None, 
                     f"McMillan Ch.4: only worth paying if the expected directional move is "
                     f"still intact and exceeds the roll cost."))
             elif roll_type == "debit" and abs(net_per) <= 10:
-                items.append(("⚠️", f"Small net debit (-${abs(net_per):.2f}/contract){_stale_note}",
+                items.append(("⚠️", f"Small net debit (-${abs(net_per):.2f}/contract){_target_label}{_stale_note}",
                     "Marginal debit — only worthwhile if new strike meaningfully higher than current"))
             elif roll_type == "debit":
-                items.append(("🔴", f"Net debit roll (-${abs(net_per):.2f}/contract){_stale_note}",
+                items.append(("🔴", f"Net debit roll (-${abs(net_per):.2f}/contract){_target_label}{_stale_note}",
                     "Paying to roll destroys basis recovery — reassess or exit"))
             else:
                 items.append(("☐", "Roll credit math", "Cost-to-roll not computed — run pipeline during market hours"))
@@ -1905,6 +2362,28 @@ def _build_auto_checklist(doc_row, hard_stop, spot, opt_legs, opt_doc_row=None, 
     _action_urgency = str(doc_row.get("Urgency", "") or "") if doc_row is not None else ""
     _action_is_urgent = _action_urgency.upper() in ("CRITICAL", "HIGH")
     _action_is_roll   = str(doctrine_action or "").upper() in ("ROLL", "ROLL_WAIT")
+    _action_upper_dte = str(doctrine_action or "").upper()
+
+    # Compute moneyness: is any short option ATM/ITM? (for assignment risk context)
+    _dte_max_abs_delta = 0.0
+    _dte_is_atm_or_itm = False
+    if not opt_legs.empty and spot is not None and pd.notna(spot) and spot > 0:
+        for _, _oleg in opt_legs.iterrows():
+            _oleg_strike = pd.to_numeric(_oleg.get("Strike"), errors="coerce")
+            _oleg_delta = pd.to_numeric(_oleg.get("Delta"), errors="coerce")
+            if pd.notna(_oleg_delta):
+                _dte_max_abs_delta = max(_dte_max_abs_delta, abs(float(_oleg_delta)))
+            if pd.notna(_oleg_strike) and pd.notna(spot):
+                _pct_from_strike = abs(float(spot) - float(_oleg_strike)) / float(_oleg_strike)
+                if _pct_from_strike <= 0.03:  # within 3% of strike = ATM zone
+                    _dte_is_atm_or_itm = True
+                # ITM: call with spot > strike, or put with spot < strike
+                _oleg_type = str(_oleg.get("Option_Type", "") or "").upper()
+                if _oleg_type in ("CALL", "C") and float(spot) > float(_oleg_strike):
+                    _dte_is_atm_or_itm = True
+                elif _oleg_type in ("PUT", "P") and float(spot) < float(_oleg_strike):
+                    _dte_is_atm_or_itm = True
+
     if not opt_legs.empty and "DTE" in opt_legs.columns:
         min_dte = pd.to_numeric(opt_legs["DTE"], errors="coerce").min()
         if pd.notna(min_dte):
@@ -1918,30 +2397,65 @@ def _build_auto_checklist(doc_row, hard_stop, spot, opt_legs, opt_doc_row=None, 
             elif _action_is_urgent and not _is_long_opt:
                 # EXIT or ROLL with HIGH/CRITICAL urgency on a short option:
                 # DTE context depends on whether this is an exit or a roll.
-                _action_upper = str(doctrine_action or "").upper()
-                if _action_upper in ("EXIT", "TRIM"):
+                if _action_upper_dte in ("EXIT", "TRIM"):
                     if min_dte <= 21:
                         items.append(("⚠️", f"{int(min_dte)}d to expiry — act this week",
                             f"{_action_urgency} urgency: {int(min_dte)}d remaining. "
                             f"Assignment risk is elevated — execute or accept assignment before expiry. "
                             f"Do not wait for a 'better' window that may not come."))
                     else:
+                        if _dte_is_atm_or_itm or _dte_max_abs_delta >= 0.50:
+                            _dte_driver_exit = "delta/assignment risk"
+                        else:
+                            _dte_driver_exit = "structural signals (basis reduction, thesis, or vol regime)"
                         items.append(("✅", f"{int(min_dte)}d to expiry",
-                            f"{_action_urgency} urgency driven by delta/assignment risk, not DTE. "
+                            f"{_action_urgency} urgency driven by {_dte_driver_exit}, not DTE. "
                             f"Adequate time to choose exit timing — act on doctrine signals."))
                 else:
-                    # ROLL with HIGH/CRITICAL urgency
+                    # ROLL with HIGH/CRITICAL urgency — attribute urgency to the
+                    # actual driver. Delta/assignment only applies when the option
+                    # is near or in the money; otherwise urgency comes from basis
+                    # reduction, thesis degradation, or other structural signals.
+                    if _dte_is_atm_or_itm or _dte_max_abs_delta >= 0.50:
+                        _dte_driver = "delta/assignment risk"
+                    else:
+                        _dte_driver = "structural signals (basis reduction, thesis, or vol regime)"
                     items.append(("⚠️", f"{int(min_dte)}d to expiry",
-                        f"DTE alone not urgent, but {_action_urgency} urgency driven by delta/assignment risk — "
+                        f"DTE alone not urgent, but {_action_urgency} urgency driven by {_dte_driver} — "
                         f"act on those signals, not DTE"))
             elif _action_is_urgent and _is_long_opt:
                 # Long options cannot be assigned — urgency is structural (momentum/vol/time).
                 items.append(("⚠️", f"{int(min_dte)}d to expiry",
                     f"DTE alone not urgent, but {_action_urgency} urgency driven by structural signals "
                     f"(momentum, vol regime, or theta trajectory) — review doctrine rationale"))
+            elif _dte_is_atm_or_itm and min_dte <= 21 and not _is_long_opt:
+                # ATM/ITM short option at ≤21 DTE: assignment risk is real even at MEDIUM urgency.
+                # McMillan Ch.7: ATM options at ≤3 weeks have accelerating gamma and assignment risk.
+                _delta_str = f"Δ {_dte_max_abs_delta:.2f}" if _dte_max_abs_delta > 0 else "ATM/ITM"
+                if _action_upper_dte in ("EXIT", "TRIM"):
+                    items.append(("⚠️", f"{int(min_dte)}d to expiry — ATM assignment risk",
+                        f"Option is near the money ({_delta_str}) with {int(min_dte)}d remaining. "
+                        f"Assignment probability is elevated — execute exit or accept assignment. "
+                        f"McMillan Ch.7: ATM gamma accelerates in final 3 weeks."))
+                elif _action_upper_dte in ("ROLL", "ROLL_WAIT"):
+                    items.append(("⚠️", f"{int(min_dte)}d to expiry — ATM, roll before pin risk",
+                        f"Option is near the money ({_delta_str}) with {int(min_dte)}d remaining. "
+                        f"Roll before gamma acceleration — don't carry ATM into final week."))
+                else:
+                    items.append(("⚠️", f"{int(min_dte)}d to expiry — ATM assignment risk",
+                        f"Option is near the money ({_delta_str}) with {int(min_dte)}d remaining — "
+                        f"assignment probability is elevated. Monitor closely."))
             else:
-                items.append(("✅", f"{int(min_dte)}d to expiry",
-                    "No DTE urgency — can wait for better entry conditions"))
+                # Genuinely no DTE pressure: OTM + adequate time remaining
+                if _action_upper_dte in ("EXIT", "TRIM"):
+                    items.append(("✅", f"{int(min_dte)}d to expiry",
+                        "No DTE urgency — adequate time to choose exit timing"))
+                elif _action_upper_dte in ("ROLL", "ROLL_WAIT"):
+                    items.append(("✅", f"{int(min_dte)}d to expiry",
+                        "No DTE urgency — adequate time to find the right roll candidate"))
+                else:
+                    items.append(("✅", f"{int(min_dte)}d to expiry",
+                        "No DTE urgency — position has adequate time remaining"))
 
     # 6. Scan data freshness
     snap_ts = None
@@ -1994,14 +2508,18 @@ def _build_auto_checklist(doc_row, hard_stop, spot, opt_legs, opt_doc_row=None, 
     else:
         items.append(("☐", "Sector relative strength", "No doctrine data available"))
 
-    # 8. Earnings proximity — automated from broker CSV "Earnings Date" column
+    # 8. Earnings proximity — automated from broker CSV "Earnings_Date" column
+    #    ETFs (SLV, GLD, SPY, etc.) don't have earnings — skip this check entirely.
     _earn_row = opt_doc_row if opt_doc_row is not None else doc_row
-    _earnings_raw = _earn_row.get("Earnings Date") if _earn_row is not None else None
+    _is_etf = bool(_earn_row.get("Is_ETF", False)) if _earn_row is not None else False
+    _earnings_raw = _earn_row.get("Earnings_Date") if _earn_row is not None else None
     _earn_missing = (
         _earnings_raw in (None, "", "nan", "N/A", "n/a")
         or (isinstance(_earnings_raw, float) and pd.isna(_earnings_raw))
     )
-    if _earn_missing:
+    if _is_etf:
+        pass  # ETFs don't have earnings — no checklist item needed
+    elif _earn_missing:
         items.append(("☐", "Earnings date",
             "Not populated in broker CSV — check manually before rolling. "
             "Earnings within option DTE can cause IV spike then crush immediately after."))
@@ -2028,6 +2546,14 @@ def _build_auto_checklist(doc_row, hard_stop, spot, opt_legs, opt_doc_row=None, 
                     items.append(("⚠️", f"Earnings in {_days_to_earn}d ({_ed.strftime('%b %d')})",
                         f"Within 45 days — ensure roll target expiry clears earnings date. "
                         f"IV typically inflates 2–3 weeks pre-earnings then collapses after."))
+                elif min_dte is not None and pd.notna(min_dte) and _days_to_earn < float(min_dte):
+                    # Earnings > 45d away BUT current option expires AFTER earnings.
+                    # The position carries through the earnings event — flag it.
+                    _earn_gap = int(float(min_dte) - _days_to_earn)
+                    items.append(("⚠️", f"Earnings in {_days_to_earn}d ({_ed.strftime('%b %d')}) — inside current DTE",
+                        f"Option expires {_earn_gap}d AFTER earnings. Position carries through the event — "
+                        f"roll to post-earnings expiry or accept gap risk. "
+                        f"Natenberg Ch.12: delta cannot protect against discontinuous earnings moves."))
                 else:
                     items.append(("✅", f"Earnings in {_days_to_earn}d ({_ed.strftime('%b %d')})",
                         f"No near-term earnings risk — roll window clear"))
@@ -2053,6 +2579,9 @@ def _build_copy_text(
     opt_legs: "pd.DataFrame",
     entry_structure: str,
     card_metrics: dict,
+    db_path: str | None = None,
+    trade_id: str | None = None,
+    ticker: str | None = None,
 ) -> str:
     """Build a plain-text snapshot of a position card for clipboard copy."""
     lines: list[str] = []
@@ -2064,6 +2593,22 @@ def _build_copy_text(
 
     # ── Doctrine ────────────────────────────────────────────────────────────
     if doctrine_row is not None:
+        _act_copy = str(doctrine_row.get("Action", "") or "")
+        _urg_copy = str(doctrine_row.get("Urgency", "") or "")
+        _trig_copy = str(doctrine_row.get("Exit_Trigger_Type", "") or "")
+        _act_copy_disp = ACTION_DISPLAY.get(_act_copy, _act_copy)
+        _action_line = f"{_act_copy_disp} {_urg_copy}".strip()
+        if _trig_copy:
+            _action_line += f" ({_trig_copy})"
+        # Mode badge: surface Recovery Premium / Recovery Ladder so user knows context
+        _doctrine_state_cp = str(doctrine_row.get("Doctrine_State", "") or "").upper()
+        _mode_badge = ""
+        if _doctrine_state_cp == "RECOVERY_PREMIUM":
+            _mode_badge = " | Mode: Recovery Premium"
+        elif _doctrine_state_cp == "RECOVERY_LADDER":
+            _mode_badge = " | Mode: Recovery Ladder"
+        if _action_line:
+            lines.append(f"Action: {_action_line}{_mode_badge}")
         _rat = str(doctrine_row.get("Rationale", "") or "")
         _src = str(doctrine_row.get("Doctrine_Source", "") or "")
         if _rat:
@@ -2084,7 +2629,7 @@ def _build_copy_text(
         if any(v for v in [_da, _ss, _ds, _rs]):
             lines.append("📊 Drift State")
             lines.append(
-                f"Drift Action: {_da or 'NO_ACTION'} | Signal: {_ss or '—'} | "
+                f"Drift Trigger: {_da or 'NO_ACTION'} | Signal: {_ss or '—'} | "
                 f"Data: {_ds or '—'} | Regime: {_rs or '—'}"
             )
             if _dd:
@@ -2138,6 +2683,13 @@ def _build_copy_text(
             _roc_parts.append(f"Γ ROC 1D: {float(_g1):+.2f}")
         if _roc_parts:
             lines.append(f"Greek ROC (1d): {' · '.join(_roc_parts)}")
+
+        # Macro Calendar Context
+        _macro_strip_cp = str(doctrine_row.get("Macro_Strip", "") or "") if doctrine_row is not None else ""
+        if _macro_strip_cp:
+            _is_mw_cp = doctrine_row.get("Is_Macro_Week", False) if doctrine_row is not None else False
+            _prefix_cp = "MACRO WEEK" if _is_mw_cp else "Macro"
+            lines.append(f"📅 {_prefix_cp}: {_macro_strip_cp}")
 
         # Entry displacement
         _de = doctrine_row.get("Delta_Displacement")
@@ -2205,6 +2757,23 @@ def _build_copy_text(
             if _pr_eff and _pr_eff not in ("nan", "None", ""):
                 _pr_parts.append(f"Roll efficiency: {_pr_eff}")
             lines.append(f"🔄 {' · '.join(_pr_parts)}")
+
+        # Wave Phase (move lifecycle)
+        _wp = str(doctrine_row.get("WavePhase_State", "") or "") if doctrine_row is not None else ""
+        if _wp and _wp not in ("UNKNOWN", "N/A", ""):
+            _wp_line = f"🌊 Wave Phase: {_wp}"
+            _trim_c = doctrine_row.get("Trim_Contracts") if doctrine_row is not None else None
+            _trim_p = doctrine_row.get("Trim_Pct") if doctrine_row is not None else None
+            if _trim_c is not None and not (isinstance(_trim_c, float) and pd.isna(_trim_c)):
+                _wp_line += f" · Trim {int(float(_trim_c))} contracts ({float(_trim_p):.0%})" if _trim_p else f" · Trim {int(float(_trim_c))} contracts"
+            lines.append(_wp_line)
+
+        # Thesis Review Verdict (if available)
+        _tr_v = str(doctrine_row.get("Thesis_Review_Verdict", "") or "") if doctrine_row is not None else ""
+        if _tr_v and _tr_v not in ("", "N/A"):
+            _tr_s = doctrine_row.get("Thesis_Review_Score", "") if doctrine_row is not None else ""
+            _tr_s_str = f" score={float(_tr_s):+.0f}" if _tr_s != "" and not (isinstance(_tr_s, float) and pd.isna(_tr_s)) else ""
+            lines.append(f"📋 Thesis Review: {_tr_v}{_tr_s_str}")
 
         # Trend / Momentum / Vol Regime / Basis Drift / Sector RS
         _trend_parts = []
@@ -2304,7 +2873,7 @@ def _build_copy_text(
         _eff_a = _ce.get("efficiency_ann")
         _mcost_d = _ce.get("margin_cost_daily")
         _mcost_h = _ce.get("margin_cost_horizon")
-        _mcost_mo = (_mcost_d * 30) if _mcost_d else None
+        _mcost_mo = (_mcost_d * 30) if (_mcost_d is not None) else None
         _hor_label = f"{int(_hor)}d" if _hor else "—"
         lines.append("📈 Capital Efficiency + Hold EV")
         _ce_parts = []
@@ -2317,15 +2886,32 @@ def _build_copy_text(
         if _ce_parts:
             lines.append(" | ".join(_ce_parts))
         # Margin cost line
-        if _mcost_d:
+        if _mcost_d is not None and _mcost_d > 0:
             lines.append(f"💰 Margin Cost: ${_mcost_d:.2f}/day (${_mcost_mo:,.0f}/month) @ 10.375%/yr")
+        elif _mcost_d is not None and _mcost_d == 0:
+            lines.append("💰 Margin Cost: $0.00/day (Roth/IRA — no margin)")
         _ce2 = []
         if _hev is not None:
             _ce2.append(f"Hold EV ({_hor_label}): ${_hev:,.0f}")
         if _eff_a is not None:
             _ce2.append(f"Annualised Yield: {_eff_a:.1%}")
         if _hev is not None:
-            _qual = "🔴 Negative" if _hev < 0 else ("✅ Strong" if (_eff_a or 0) >= 0.20 else "🟡 Moderate")
+            if _hev < 0:
+                _margin_h = _mcost_h if (_mcost_h is not None) else 0.0
+                _theta_h = _carry if (_carry is not None) else 0.0
+                _gdrag_h = _gdrag if (_gdrag is not None) else 0.0
+                if _gdrag_h > _theta_h and _margin_h > _theta_h:
+                    _qual = "🔴 Negative (Γ drag + margin > θ)"
+                elif _gdrag_h > _theta_h:
+                    _qual = "🟠 Negative (Γ drag > θ — carry OK)"
+                elif _margin_h > _theta_h:
+                    _qual = "🔴 Negative (margin > θ)"
+                else:
+                    _qual = "🟠 Negative (Γ + margin combined)"
+            elif (_eff_a or 0) >= 0.20:
+                _qual = "✅ Strong"
+            else:
+                _qual = "🟡 Moderate"
             _ce2.append(f"Carry Quality: {_qual}")
         if _ce2:
             lines.append(" | ".join(_ce2))
@@ -2343,7 +2929,7 @@ def _build_copy_text(
     _margin_ps_mo = card_metrics.get("margin_ps_monthly")
     if _gap is not None:
         lines.append("📊 Recovery Path")
-        _rp1 = [f"Gap to Breakeven: ${_gap:.2f}/share"]
+        _rp1 = [f"Net Cost Gap: ${_gap:.2f}/share (after premium credit)"]
         if _hs is not None:
             _cush = f" (+${_gap_stop:.2f} cushion)" if _gap_stop is not None else ""
             _rp1.append(f"Hard Stop: ${_hs:.2f}{_cush}")
@@ -2362,6 +2948,49 @@ def _build_copy_text(
         if _rp2:
             lines.append(" | ".join(_rp2))
         lines.append("")
+
+    # ── Idle Share Utilization (copy text) ──────────────────────────────────
+    if doctrine_row is not None:
+        _iu_idle_c = doctrine_row.get("Recovery_Idle_Shares")
+        _iu_base_c = doctrine_row.get("Recovery_Months_Baseline")
+        if (_iu_idle_c is not None and not (isinstance(_iu_idle_c, float) and pd.isna(_iu_idle_c))
+                and float(_iu_idle_c) >= 100
+                and _iu_base_c is not None and not (isinstance(_iu_base_c, float) and pd.isna(_iu_base_c))
+                and float(_iu_base_c) > 0):
+            _iu_i = int(float(_iu_idle_c))
+            _iu_t = int(float(doctrine_row.get("Recovery_Total_Shares") or 0))
+            _iu_cv = int(float(doctrine_row.get("Recovery_Covered_Shares") or 0))
+            _iu_mb = float(_iu_base_c)
+            _iu_mf_raw = doctrine_row.get("Recovery_Months_Full")
+            _iu_mf = float(_iu_mf_raw) if (_iu_mf_raw is not None and not (isinstance(_iu_mf_raw, float) and pd.isna(_iu_mf_raw))) else 0
+            _iu_ib = float(doctrine_row.get("Recovery_Income_Baseline_Mo") or 0)
+            _iu_if = float(doctrine_row.get("Recovery_Income_Full_Mo") or 0)
+            _iu_dm = int(_iu_mb - _iu_mf) if _iu_mb < 999 else 0
+            _iu_rec = doctrine_row.get("Recovery_Cover_Idle_Recommended")
+            _iu_rec_bool = bool(_iu_rec) if (_iu_rec is not None and not (isinstance(_iu_rec, float) and pd.isna(_iu_rec))) else False
+            _mc_v = str(doctrine_row.get("MC_Recovery_Verdict") or "")
+            _mc_d = float(doctrine_row.get("MC_Recovery_EV_Delta") or 0)
+
+            lines.append(f"📦 Idle Share Utilization — {_iu_i:,} shares uncovered ({_iu_t:,} total, {_iu_cv:,} covered)")
+            lines.append(f"Baseline: ~{int(_iu_mb)} months (${_iu_ib:,.0f}/mo) | Full Coverage: ~{int(_iu_mf)} months (${_iu_if:,.0f}/mo) | Acceleration: -{abs(_iu_dm)} months")
+            if _iu_rec_bool:
+                lines.append(f"Verdict: COVER {_iu_i:,} idle shares — saves ~{abs(_iu_dm)} months")
+            elif _mc_v == "KEEP_IDLE":
+                lines.append(f"Verdict: KEEP IDLE — upside optionality beats premium (MC EV delta ${_mc_d:+,.0f})")
+            else:
+                _blk = []
+                _iv_ok_c = doctrine_row.get("Recovery_IV_HV_OK")
+                if not (_iv_ok_c and str(_iv_ok_c) not in ("False", "0", "nan")):
+                    _blk.append("IV < 90% HV")
+                _cc_fav_c = doctrine_row.get("Recovery_CC_Favorable")
+                if not (_cc_fav_c and str(_cc_fav_c) not in ("False", "0", "nan")):
+                    _blk.append("CC engine not FAVORABLE")
+                lines.append(f"Verdict: HOLD (guardrails block: {', '.join(_blk)})" if _blk else "Verdict: HOLD")
+            if _mc_v and _mc_v not in ("", "SKIP"):
+                _mc_pc = float(doctrine_row.get("MC_Recovery_P_Recover_Current") or 0)
+                _mc_pf = float(doctrine_row.get("MC_Recovery_P_Recover_Full") or 0)
+                lines.append(f"MC: {_mc_v} | EV delta ${_mc_d:+,.0f} | P(recover) {_mc_pc:.0%} current → {_mc_pf:.0%} full")
+            lines.append("")
 
     # ── Story Check ─────────────────────────────────────────────────────────
     if doctrine_row is not None:
@@ -2396,7 +3025,7 @@ def _build_copy_text(
                 if _rmb is not None and not (isinstance(_rmb, float) and pd.isna(_rmb)):
                     _rmb_f = float(_rmb)
                     _ratio = _rmb_f / _em_f if _em_f > 0 else 0
-                    _fe_parts.append(f"Required move to breakeven: ${_rmb_f:.1f}")
+                    _fe_parts.append(f"Option leg move to BE: ${_rmb_f:.1f}")
                     _feas = "🟢" if _ratio < 0.50 else ("🟡" if _ratio < 1.0 else "🔴")
                     _fe_parts.append(f"{_feas} {_ratio:.2f}× Feasible")
                 if _rm50 is not None and not (isinstance(_rm50, float) and pd.isna(_rm50)):
@@ -2468,6 +3097,148 @@ def _build_copy_text(
             f"P(touch): {_mc_a.get('p_touch', '—')}"
         )
 
+    # ── Roll Candidates + Economics Vector ────────────────────────────────
+    # Parse Roll_Candidate_1/2/3 from the option doc row (stock leg may not carry them).
+    _opt_doc_cp = card_metrics.get("_opt_row")
+    _rc_source_cp = _opt_doc_cp if (_opt_doc_cp is not None and
+        str(_opt_doc_cp.get("Roll_Candidate_1", "") or "") not in ("", "nan", "None")) else doctrine_row
+    if _rc_source_cp is not None:
+        import json as _json_cp
+        _any_cand = False
+        for _rank in (1, 2, 3):
+            _rc_raw = _rc_source_cp.get(f"Roll_Candidate_{_rank}")
+            if not _rc_raw or str(_rc_raw) in ("", "nan", "None"):
+                continue
+            try:
+                _cand_cp = _json_cp.loads(str(_rc_raw)) if isinstance(_rc_raw, str) else _rc_raw
+                if not isinstance(_cand_cp, dict):
+                    continue
+            except Exception:
+                continue
+
+            if not _any_cand:
+                lines.append("")
+                lines.append("🔄 Roll Candidates")
+                _any_cand = True
+
+            _cp_strike = _cand_cp.get("strike", "?")
+            _cp_expiry = _cand_cp.get("expiry", "?")
+            _cp_score = _cand_cp.get("score", "?")
+            _cp_edge = _cand_cp.get("primary_edge", "")
+            _cp_edge_sum = _cand_cp.get("edge_summary", "")
+            lines.append(f"  #{_rank}: ${_cp_strike} exp {_cp_expiry} (score {_cp_score})")
+            if _cp_edge:
+                lines.append(f"    Edge: {_cp_edge.replace('_', ' ').title()} — {_cp_edge_sum}")
+
+            # Economics vector decomposition
+            _econ_cp = _cand_cp.get("economics")
+            if isinstance(_econ_cp, dict):
+                _net_cp = _econ_cp.get("net_credit_debit")
+                _strike_chg = _econ_cp.get("strike_change")
+                _basis_imp = _econ_cp.get("basis_improvement_pct")
+                _dte_ext = _econ_cp.get("dte_extension")
+                _gamma_red = _econ_cp.get("gamma_reduction_pct")
+                _assign_risk = _econ_cp.get("assignment_risk_change")
+                _slip = _econ_cp.get("slippage_warning", False)
+
+                _econ_parts = []
+                if _net_cp is not None:
+                    _ct = "credit" if _net_cp >= 0 else "debit"
+                    _econ_parts.append(f"${abs(_net_cp):.2f} {_ct}")
+                if _strike_chg and abs(_strike_chg) > 0.01:
+                    _econ_parts.append(f"Strike {_strike_chg:+.1f}")
+                if _basis_imp is not None and abs(_basis_imp) > 0.1:
+                    _econ_parts.append(f"Basis {_basis_imp:+.1f}%")
+                if _dte_ext and _dte_ext > 0:
+                    _econ_parts.append(f"+{_dte_ext}d DTE")
+                if _gamma_red is not None and _gamma_red > 1.0:
+                    _econ_parts.append(f"Gamma -{_gamma_red:.0f}%")
+                if _assign_risk and _assign_risk != "UNCHANGED":
+                    _econ_parts.append(f"Assignment: {_assign_risk}")
+                if _slip:
+                    _econ_parts.append("⚠️ Slippage risk")
+                if _econ_parts:
+                    lines.append(f"    Economics: {' | '.join(_econ_parts)}")
+
+        # Split suggestion — prefer pre-computed column, fallback to on-the-fly
+        _split_cp = None
+        _split_raw_cp = _rc_source_cp.get("Roll_Split_Suggestion")
+        if _split_raw_cp and str(_split_raw_cp) not in ("", "nan", "None"):
+            try:
+                _split_cp = _json_cp.loads(str(_split_raw_cp)) if isinstance(_split_raw_cp, str) else _split_raw_cp
+                if not isinstance(_split_cp, dict) or not _split_cp.get("type"):
+                    _split_cp = None
+            except Exception:
+                _split_cp = None
+
+        # Fallback: compute from parsed candidates if column missing (pre-upgrade data)
+        if _split_cp is None and _any_cand:
+            try:
+                from core.management.cycle3.roll.roll_candidate_engine import _compute_split_suggestion
+                _cp_parsed_cands = []
+                for _rank_cp in (1, 2, 3):
+                    _rc_raw_fb = _rc_source_cp.get(f"Roll_Candidate_{_rank_cp}")
+                    if _rc_raw_fb and str(_rc_raw_fb) not in ("", "nan", "None"):
+                        _cp_c = _json_cp.loads(str(_rc_raw_fb)) if isinstance(_rc_raw_fb, str) else _rc_raw_fb
+                        if isinstance(_cp_c, dict):
+                            _cp_parsed_cands.append(_cp_c)
+                if _cp_parsed_cands:
+                    _cp_qty_raw = opt_legs.iloc[0].get("Quantity", 1) if not opt_legs.empty else 1
+                    _cp_qty = abs(int(float(_cp_qty_raw or 1)))
+                    _split_cp = _compute_split_suggestion(
+                        _cp_parsed_cands, _cp_qty,
+                        str(entry_structure or "").upper(),
+                    )
+            except Exception:
+                _split_cp = None
+
+        # ── MC-ranked split paths (preferred) ────────────────────────
+        _mc_split_shown = False
+        _mc_sp_raw = (
+            (_rc_source_cp.get("MC_Split_Paths") if _rc_source_cp is not None else None)
+            or (doctrine_row.get("MC_Split_Paths") if doctrine_row is not None else None)
+        )
+        _mc_sp_verdict = (
+            (_rc_source_cp.get("MC_Split_Verdict") if _rc_source_cp is not None else None)
+            or (doctrine_row.get("MC_Split_Verdict") if doctrine_row is not None else None)
+        )
+        if _mc_sp_raw and str(_mc_sp_raw).strip() not in ("", "nan", "None", "[]", "SKIP"):
+            try:
+                _mc_sp_list = _json_cp.loads(str(_mc_sp_raw)) if isinstance(_mc_sp_raw, str) else _mc_sp_raw
+                if isinstance(_mc_sp_list, list) and len(_mc_sp_list) > 0:
+                    _mc_v = str(_mc_sp_verdict or "").upper()
+                    _v_label = {"SPLIT_BETTER": "Split preferred", "ALL_IN_BETTER": "All-in preferred", "MARGINAL": "Marginal difference"}.get(_mc_v, _mc_v)
+                    lines.append(f"  MC Split Analysis ({_v_label}):")
+                    for _pi, _sp in enumerate(_mc_sp_list[:4]):
+                        _star = "★" if _pi == 0 else " "
+                        _sp_label = str(_sp.get("type", "")).replace("_", " ").title()
+                        _sp_ev = _sp.get("ev", 0)
+                        _sp_pp = _sp.get("p_profit", 0)
+                        _sp_cvar = _sp.get("cvar_5", 0)
+                        lines.append(
+                            f"    {_star} {_sp_label}: "
+                            f"EV ${_sp_ev:+,.0f} | "
+                            f"P(profit) {_sp_pp:.0%} | "
+                            f"CVaR ${_sp_cvar:+,.0f}"
+                        )
+                    _mc_split_shown = True
+            except Exception:
+                pass
+
+        # Fallback: rules-based split suggestion
+        if not _mc_split_shown and _split_cp and isinstance(_split_cp, dict) and _split_cp.get("type"):
+            _sp_type_cp = _split_cp["type"].replace("_", " ").title()
+            _sp_rat_cp = _split_cp.get("rationale", "")
+            if not _any_cand:
+                lines.append("")
+            lines.append(f"  Split Suggestion: {_sp_type_cp} — {_sp_rat_cp}")
+
+    # ── Research Context ──────────────────────────────────────────────────
+    _research_text = card_metrics.get("research_text")
+    if _research_text:
+        lines.append("")
+        lines.append(f"📚 Research: {_research_text}")
+
     # ── Pre-Execution Checklist ─────────────────────────────────────────────
     _chk = card_metrics.get("checklist")
     if _chk:
@@ -2475,6 +3246,78 @@ def _build_copy_text(
         lines.append("Pre-Execution Checklist:")
         for _icon, _label, _detail in _chk:
             lines.append(f"{_icon} {_label} — {_detail}")
+
+    # ── Decision History + Roll Chain ─────────────────────────────────────
+    if db_path and trade_id:
+        try:
+            from core.shared.data_layer.decision_ledger import (
+                get_trade_timeline,
+                get_roll_chain_summary,
+            )
+            _cp_con = _duckdb_connect_read_only(db_path)
+            try:
+                # Timeline
+                _cp_tl = get_trade_timeline(_cp_con, trade_id)
+                if not _cp_tl.empty:
+                    lines.append("")
+                    lines.append(f"📜 Decision History — {len(_cp_tl)} daily snapshots")
+                    for _, _tl_row in _cp_tl.iterrows():
+                        _tl_date = str(_tl_row.get("run_date", ""))[:10]
+                        _tl_act = str(_tl_row.get("Action", ""))
+                        # Translate legacy labels stored in DuckDB before the rename
+                        _tl_act = {"REVALIDATE": "REVIEW", "ASSIGN": "LET_EXPIRE"}.get(_tl_act, _tl_act)
+                        # Display name (remove underscores, collapse synonyms)
+                        _tl_act = ACTION_DISPLAY.get(_tl_act, _tl_act)
+                        _tl_urg = str(_tl_row.get("Urgency", ""))
+                        _tl_strike = _tl_row.get("Strike")
+                        _tl_spot = _tl_row.get("spot")
+                        _tl_dte = _tl_row.get("DTE")
+                        _tl_parts = [_tl_date, f"{_tl_act} {_tl_urg}"]
+                        if _tl_strike is not None and not (isinstance(_tl_strike, float) and pd.isna(_tl_strike)):
+                            _tl_parts.append(f"Strike ${float(_tl_strike):.0f}")
+                        if _tl_spot is not None and not (isinstance(_tl_spot, float) and pd.isna(_tl_spot)):
+                            _tl_parts.append(f"Spot ${float(_tl_spot):.2f}")
+                        if _tl_dte is not None and not (isinstance(_tl_dte, float) and pd.isna(_tl_dte)):
+                            _tl_parts.append(f"DTE {int(float(_tl_dte))}")
+                        _tl_changed = _tl_row.get("action_changed")
+                        if _tl_changed:
+                            _tl_parts.append("← CHANGED")
+                        lines.append("  " + " | ".join(_tl_parts))
+
+                # Roll chain (BUY_WRITE / COVERED_CALL)
+                _cp_strat = str(doctrine_row.get("Strategy", "") if doctrine_row else "").upper()
+                _cp_ticker = ticker or (str(doctrine_row.get("Underlying_Ticker", "")) if doctrine_row else "")
+                if _cp_ticker and ("BUY_WRITE" in _cp_strat or "COVERED_CALL" in _cp_strat):
+                    _cp_chain = get_roll_chain_summary(_cp_con, _cp_ticker)
+                    if _cp_chain and _cp_chain.get("cycle_count", 0) > 0:
+                        _cp_strikes = _cp_chain.get("strike_chain", [])
+                        _cp_chain_str = " → ".join([f"${s:.0f}" for s in _cp_strikes])
+                        lines.append("")
+                        lines.append(f"Roll Chain: {_cp_chain_str}")
+                        lines.append(
+                            f"Cycles: {_cp_chain.get('cycle_count', 0)} | "
+                            f"Gross: ${_cp_chain.get('total_gross', 0):.2f}/sh | "
+                            f"Net: ${_cp_chain.get('total_net', 0):.2f}/sh"
+                        )
+                        _cp_close = _cp_chain.get("total_close_cost", 0)
+                        if _cp_close > 0:
+                            lines.append(f"Close costs: ${_cp_close:.2f}/sh")
+
+                # Flip warning
+                if doctrine_row:
+                    _cp_flips = int(doctrine_row.get("Decision_Flip_Count_5D", 0) or 0)
+                    if _cp_flips >= 3:
+                        lines.append(f"⚠️ Decision instability: {_cp_flips} action changes in 5 days")
+
+                # Execution pending
+                if doctrine_row and doctrine_row.get("Execution_Pending"):
+                    _cp_exec_act = str(doctrine_row.get("Last_Execution_Action", ""))
+                    _cp_exec_ts = str(doctrine_row.get("Last_Execution_TS", ""))
+                    lines.append(f"⏳ {_cp_exec_act} executed {_cp_exec_ts} — awaiting broker data refresh")
+            finally:
+                _cp_con.close()
+        except Exception:
+            pass  # Non-fatal — copy text works without decision history
 
     return "\n".join(lines)
 
@@ -2488,6 +3331,8 @@ def _compute_bw_capital_efficiency(
     iv: float | None,
     spot: float,
     delta: float | None,
+    is_retirement: bool = False,
+    precomputed_margin_cost_daily: float | None = None,
 ) -> dict:
     """
     Capital Efficiency + Hold EV for a BUY_WRITE / COVERED_CALL position.
@@ -2539,12 +3384,24 @@ def _compute_bw_capital_efficiency(
         gamma_drag_day = None   # set below once net_g is passed in
 
     # ── Margin Carry Cost ──────────────────────────────────────────────────
-    # Fidelity 10.375% annualised — the real daily bleed on margined stock.
-    # McMillan Ch.3: "The covered writer must earn at least the cost of carrying the stock."
-    _MARGIN_RATE_DAILY = 0.10375 / 365  # ~0.0284% per day
-    margin_cost_daily  = (net_cost_per_share * n_shares * _MARGIN_RATE_DAILY) if (net_cost_per_share > 0 and n_shares > 0) else None
-    margin_cost_horizon = (margin_cost_daily * horizon) if (margin_cost_daily and horizon) else None
-    margin_cost_per_share_daily = (net_cost_per_share * _MARGIN_RATE_DAILY) if (net_cost_per_share > 0) else None
+    # Prefer pre-computed Daily_Margin_Cost from MarginCarryCalculator (correct:
+    # borrowed-portion only, per-ticker margin requirements).
+    # Fallback: Fidelity 10.375%/yr on full net basis (approximate).
+    # Roth/IRA/401K: fully cash-funded, no margin cost.
+    if is_retirement:
+        margin_cost_daily = 0.0
+        margin_cost_horizon = 0.0
+        margin_cost_per_share_daily = 0.0
+    elif precomputed_margin_cost_daily is not None and precomputed_margin_cost_daily > 0:
+        # Pre-computed value is per-contract ($/day) — use directly
+        margin_cost_daily = precomputed_margin_cost_daily
+        margin_cost_horizon = (margin_cost_daily * horizon) if horizon else None
+        margin_cost_per_share_daily = (margin_cost_daily / n_shares) if n_shares > 0 else None
+    else:
+        _MARGIN_RATE_DAILY = 0.10375 / 365  # ~0.0284% per day
+        margin_cost_daily  = (net_cost_per_share * n_shares * _MARGIN_RATE_DAILY) if (net_cost_per_share > 0 and n_shares > 0) else None
+        margin_cost_horizon = (margin_cost_daily * horizon) if (margin_cost_daily and horizon) else None
+        margin_cost_per_share_daily = (net_cost_per_share * _MARGIN_RATE_DAILY) if (net_cost_per_share > 0) else None
 
     return {
         "capital_at_risk":   capital_at_risk,
@@ -2916,12 +3773,13 @@ def _render_ticker_banner(df: pd.DataFrame, ticker: str, doctrine_by_trade: dict
                 _tr_strat = str(_dr.get("Strategy", _dr.get("Strategy_Name", "?")))
                 _tr_act  = str(_dr.get("Action", "?"))
                 _tr_urg  = str(_dr.get("Urgency", ""))
-                _act_badge = (
-                    f"🔴 {_tr_act}" if _tr_act in ("EXIT", "ROLL") and _tr_urg in ("HIGH", "CRITICAL")
-                    else f"🟡 {_tr_act}" if _tr_act == "ROLL"
-                    else f"✅ {_tr_act}" if _tr_act == "HOLD"
-                    else f"⚪ {_tr_act}"
-                )
+                _tr_act_disp = ACTION_DISPLAY.get(_tr_act, _tr_act)
+                _tr_badge_e, _ = ACTION_BADGE.get(_tr_act, ("⚪", ""))
+                if _tr_act in ("EXIT", "EXIT_STOCK") and _tr_urg in ("HIGH", "CRITICAL"):
+                    _tr_badge_e = "🔴"
+                elif _tr_act in ("ROLL", "ROLL_WAIT", "ROLL_UP_OUT") and _tr_urg in ("HIGH", "CRITICAL"):
+                    _tr_badge_e = "🔴"
+                _act_badge = f"{_tr_badge_e} {_tr_act_disp}"
                 _trade_rows.append({
                     "Strategy":  _tr_strat,
                     "Action":    _act_badge,
@@ -2966,13 +3824,23 @@ def _render_ticker_banner(df: pd.DataFrame, ticker: str, doctrine_by_trade: dict
                 delta=None,
             )
 
-            # Narrative for the delta shift
+            # Narrative for the delta shift — use engine-computed warning if available
+            _engine_reversal = ''
+            for _tid_rv in trade_ids:
+                if _tid_rv in doctrine_by_trade:
+                    _rv_val = str(doctrine_by_trade[_tid_rv].get('Direction_Reversal_Warning', '') or '')
+                    if _rv_val:
+                        _engine_reversal = _rv_val
+                        break
+
             if _has_exit and _dir_now != _dir_post:
-                st.warning(
-                    f"**Direction reversal after EXIT**: executing doctrine flips combined {ticker} "
+                st.error(
+                    f"🚨 **DIRECTION REVERSAL GATE**: executing EXIT flips combined {ticker} "
                     f"exposure from **{_dir_now}** ({net_d:+.0f}Δ) to **{_dir_post}** ({_post_d:+.0f}Δ).  \n"
-                    f"Confirm this is the intended outcome — if the remaining leg (e.g. LONG_CALL HOLD) "
-                    f"produces a directional bet you didn't plan, consider whether to adjust it simultaneously."
+                    f"**Before executing**: confirm the remaining leg's directional bet is intentional. "
+                    f"If not, adjust both legs simultaneously.  \n"
+                    f"*(Natenberg Ch.11: net Greek analysis after all actions; "
+                    f"Passarelli Ch.6: managing multi-leg exposure on same underlying)*"
                 )
             elif _has_exit:
                 st.info(
@@ -3548,7 +4416,18 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
         _ticker_trade_counts[_t] = _ticker_trade_counts.get(_t, 0) + 1
     _tickers_banner_rendered: set = set()
 
-    for tid in sorted_trade_ids:
+    # ── Separate write-off positions from active positions ──────────────
+    _writeoff_tids = []
+    _active_trade_ids = []
+    for _wo_tid in sorted_trade_ids:
+        _wo_dr = doctrine_by_trade.get(_wo_tid)
+        if (_wo_dr is not None
+                and str(_wo_dr.get("Doctrine_State", "") or "").upper() == "WRITE_OFF"):
+            _writeoff_tids.append(_wo_tid)
+        else:
+            _active_trade_ids.append(_wo_tid)
+
+    for tid in _active_trade_ids:
         group = df[df["TradeID"] == tid].copy()
         ticker = group["Underlying_Ticker"].iloc[0]
 
@@ -3599,7 +4478,21 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                     badge_emoji = "🔴"  # HOLD-but-BROKEN = red hold (exit pressure building)
                 elif _ts_for_badge == "DEGRADED":
                     badge_emoji = "🟡"  # HOLD-but-DEGRADED = amber hold (monitor)
-            doctrine_badge = f"  {badge_emoji} `{action}`" + (f" **{urgency}**" if urgency in ("CRITICAL", "HIGH") else "")
+            _doc_trigger = str(doctrine_row.get("Exit_Trigger_Type", "") or "")
+            _urgency_suffix = ""
+            if urgency == "CRITICAL" and _doc_trigger:
+                _urgency_suffix = f" **{urgency} ({_doc_trigger})**"
+            elif urgency in ("CRITICAL", "HIGH"):
+                _urgency_suffix = f" **{urgency}**"
+            _action_disp = ACTION_DISPLAY.get(action, action)
+            # Mode badge: surface Recovery Premium / Recovery Ladder
+            _doc_state_hdr = str(doctrine_row.get("Doctrine_State", "") or "").upper()
+            _mode_tag = ""
+            if _doc_state_hdr == "RECOVERY_PREMIUM":
+                _mode_tag = "  `Recovery`"
+            elif _doc_state_hdr == "RECOVERY_LADDER":
+                _mode_tag = "  `Recovery`"
+            doctrine_badge = f"  {badge_emoji} `{_action_disp}`{_urgency_suffix}{_mode_tag}"
 
         # P/L freshness tag — broker CSV is stale; schwab_live means both UL and option prices refreshed.
         _price_src = ""
@@ -3619,7 +4512,59 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
             elif "scan_cache" in str(_src_str):
                 _price_src = " `UL↻scan`"
             # broker_csv: no tag — that's the default, tag absence = stale
-        header = f"{emoji} **{ticker}** — {entry_structure}   `DTE: {dte_str}`   P/L: {_pnl_color(total_gl_val)}{_price_src}{doctrine_badge}"
+        # Trade age — how long this position has been open
+        _trade_age_str = ""
+        _dit_raw = None
+        if doctrine_row is not None:
+            _dit_raw = doctrine_row.get("Days_In_Trade")
+        if _dit_raw is None or (isinstance(_dit_raw, float) and pd.isna(_dit_raw)):
+            # Fallback: check group rows
+            if "Days_In_Trade" in group.columns:
+                _dit_vals = group["Days_In_Trade"].dropna()
+                if not _dit_vals.empty:
+                    _dit_raw = _dit_vals.max()
+        if _dit_raw is not None and not (isinstance(_dit_raw, float) and pd.isna(_dit_raw)):
+            _dit_int = int(float(_dit_raw))
+            if _dit_int == 0:
+                _trade_age_str = "   `Opened: today`"
+            elif _dit_int == 1:
+                _trade_age_str = "   `Opened: yesterday`"
+            else:
+                _trade_age_str = f"   `Age: {_dit_int}d`"
+
+        # ── Contract + Account tags for collapsed header ────────────────
+        # Contract: short strike + expiry for income strategies, or option type for directional
+        _contract_tag = ""
+        if not opt_legs.empty:
+            _hdr_opt = opt_legs.iloc[0]
+            _hdr_strike = pd.to_numeric(_hdr_opt.get("Strike"), errors="coerce")
+            _hdr_exp = _hdr_opt.get("Expiration")
+            _hdr_otype = str(_hdr_opt.get("Option_Type") or _hdr_opt.get("PutCall") or "").upper()
+            _hdr_otype_ch = "c" if "CALL" in _hdr_otype else ("p" if "PUT" in _hdr_otype else "")
+            if pd.notna(_hdr_strike) and _hdr_exp:
+                # Format expiration as MonDD (e.g., "Mar20")
+                try:
+                    _hdr_exp_dt = pd.to_datetime(_hdr_exp)
+                    _hdr_exp_str = _hdr_exp_dt.strftime("%b%d").lstrip("0")
+                except Exception:
+                    _hdr_exp_str = str(_hdr_exp)[:5]
+                _contract_tag = f"  `${_hdr_strike:.0f}{_hdr_otype_ch} {_hdr_exp_str}`"
+
+        # Account: short tag for quick Roth/Individual distinction
+        _acct_tag = ""
+        _acct_vals = group["Account"].dropna().unique() if "Account" in group.columns else []
+        if len(_acct_vals) > 0:
+            _acct_str = str(_acct_vals[0]).upper()
+            if "ROTH" in _acct_str:
+                _acct_tag = "  `Roth`"
+            elif "IRA" in _acct_str and "ROTH" not in _acct_str:
+                _acct_tag = "  `IRA`"
+            elif "401" in _acct_str:
+                _acct_tag = "  `401K`"
+            elif "INDIVIDUAL" in _acct_str or "TOD" in _acct_str:
+                _acct_tag = "  `Taxable`"
+
+        header = f"{emoji} **{ticker}** — {entry_structure}{_contract_tag}{_acct_tag}   `DTE: {dte_str}`{_trade_age_str}   P/L: {_pnl_color(total_gl_val)}{_price_src}{doctrine_badge}"
 
         # Auto-expand on urgency, DTE, loss, or degraded/broken thesis
         _ts_for_expand = str(doctrine_row.get("Thesis_State", "") or "").upper() if doctrine_row is not None else ""
@@ -3634,6 +4579,20 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
             # ── Copy Card placeholder (filled at bottom after all metrics computed) ──
             _copy_placeholder = st.empty()
             _card_metrics: dict = {"_opt_row": option_row_by_trade.get(tid)}
+
+            # ── Research Context (ticker profile + active events) ──────────
+            try:
+                from core.shared.data_layer.ticker_research import format_research_for_card
+                from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
+                _research_con = get_domain_connection(DbDomain.PIPELINE, read_only=True)
+                try:
+                    _research_text = format_research_for_card(_research_con, ticker)
+                    if _research_text:
+                        _card_metrics["research_text"] = _research_text
+                finally:
+                    _research_con.close()
+            except Exception:
+                pass  # graceful — research is supplementary
 
             # Doctrine inline block (if available)
             if doctrine_row is not None and str(doctrine_row.get("Decision_State")) == "ACTIONABLE":
@@ -3739,7 +4698,7 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                 if _has_drift_data:
                     # Drift Action badge
                     _da_emoji = {
-                        "NO_ACTION": "✅", "REVALIDATE": "🔄", "TRIM_ONLY": "✂️",
+                        "NO_ACTION": "✅", "REVIEW": "🔄", "TRIM_ONLY": "✂️",
                         "EXIT": "🚨", "QUARANTINE": "🔒", "HARD_HALT": "⛔", "FORCE_EXIT": "💀"
                     }.get(_da, "❓")
                     _da_display = f"{_da_emoji} `{_da}`" if _da else "—"
@@ -3764,8 +4723,8 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
 
                     with st.expander("📊 Drift State", expanded=(_da not in ("", "NO_ACTION"))):
                         dc1, dc2, dc3, dc4 = st.columns(4)
-                        dc1.metric("Drift Action", _da_display if _da else "NO_ACTION",
-                                   help="DriftEngine authoritative action. Risk may only be reduced, never increased.")
+                        dc1.metric("Drift Trigger", _da_display if _da else "NO_ACTION",
+                                   help="Upstream drift input. Thesis Review Scorer resolves this into a concrete action.")
                         dc2.markdown(f"**Signal**  \n{_ss_display}",
                                      help="Greek ROC + PCS drift state. DEGRADED=monitor, VIOLATED=act.")
                         dc3.markdown(f"**Data**  \n{_ds_display}  \n**Regime**  \n{_rs_display}",
@@ -3950,6 +4909,146 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                 "Monitor for IV compression + chop persistence."
                             )
 
+            # ── Macro Event Badge ──────────────────────────────────
+            if doctrine_row is not None:
+                _macro_days_badge = pd.to_numeric(doctrine_row.get('Days_To_Macro'), errors='coerce')
+                _macro_type_badge = str(doctrine_row.get('Macro_Next_Type', '') or '')
+                _macro_date_badge = str(doctrine_row.get('Macro_Next_Date', '') or '')
+                if pd.notna(_macro_days_badge) and _macro_days_badge <= 5 and _macro_type_badge:
+                    _md_int = int(_macro_days_badge)
+                    _badge_color = "red" if _md_int <= 3 else "orange"
+                    _badge_text = f"{_macro_type_badge} in {_md_int}d" if _md_int > 0 else f"{_macro_type_badge} TODAY"
+                    st.markdown(f":{_badge_color}[📅 **{_badge_text}** ({_macro_date_badge})]")
+
+            # ── Decision History + Roll Chain + Execution Button ────────
+            _show_decision_history = (
+                db_path is not None
+                and doctrine_row is not None
+            )
+            if _show_decision_history:
+                _dh_flip_count = int(doctrine_row.get("Decision_Flip_Count_5D", 0) or 0)
+                _dh_exec_pending = bool(doctrine_row.get("Execution_Pending", False))
+                _dh_action = str(doctrine_row.get("Action", "HOLD"))
+                _dh_auto_expand = _dh_flip_count >= 3 or _dh_exec_pending
+
+                with st.expander("📜 Decision History", expanded=_dh_auto_expand):
+                    try:
+                        _dh_con = _duckdb_connect_read_only(db_path)
+                        try:
+                            from core.shared.data_layer.decision_ledger import (
+                                get_trade_timeline,
+                                get_ticker_timeline,
+                                get_roll_chain_summary,
+                                detect_action_flips,
+                            )
+
+                            # ── Flip warning ──
+                            if _dh_flip_count >= 3:
+                                st.warning(
+                                    f"⚠️ **Decision instability**: {_dh_flip_count} action changes "
+                                    f"in the last 5 days. Verify thesis before acting."
+                                )
+
+                            # ── Execution pending badge ──
+                            if _dh_exec_pending:
+                                _dh_last_action = str(doctrine_row.get("Last_Execution_Action", ""))
+                                _dh_last_ts = str(doctrine_row.get("Last_Execution_TS", ""))
+                                st.info(
+                                    f"⏳ **{_dh_last_action}** executed {_dh_last_ts} — "
+                                    f"awaiting broker data refresh."
+                                )
+
+                            # ── Timeline table ──
+                            _dh_timeline = get_trade_timeline(_dh_con, tid)
+                            if not _dh_timeline.empty:
+                                _dh_display = _dh_timeline[
+                                    [c for c in ["run_date", "Action", "Urgency", "Strike",
+                                                  "spot", "DTE", "rationale_digest",
+                                                  "action_changed", "strike_changed"]
+                                     if c in _dh_timeline.columns]
+                                ].copy()
+                                # Translate legacy labels stored before rename
+                                _LEGACY_LABELS = {"REVALIDATE": "REVIEW", "ASSIGN": "LET_EXPIRE"}
+                                if "Action" in _dh_display.columns:
+                                    _dh_display["Action"] = _dh_display["Action"].replace(_LEGACY_LABELS)
+                                # Format booleans for readability
+                                for _bc in ("action_changed", "strike_changed"):
+                                    if _bc in _dh_display.columns:
+                                        _dh_display[_bc] = _dh_display[_bc].map(
+                                            {True: "✓", False: ""})
+                                st.markdown(f"**Timeline** — {len(_dh_display)} daily snapshots")
+                                st.dataframe(
+                                    _dh_display,
+                                    width='stretch',
+                                    hide_index=True,
+                                    height=min(35 * len(_dh_display) + 38, 300),
+                                )
+                            else:
+                                st.caption("No prior decision history found for this TradeID.")
+
+                            # ── Roll Chain (BUY_WRITE / COVERED_CALL only) ──
+                            _dh_strat = str(doctrine_row.get("Strategy", "")).upper()
+                            if "BUY_WRITE" in _dh_strat or "COVERED_CALL" in _dh_strat:
+                                _dh_chain = get_roll_chain_summary(_dh_con, ticker)
+                                if _dh_chain and _dh_chain.get("cycle_count", 0) > 0:
+                                    _chain_strikes = _dh_chain.get("strike_chain", [])
+                                    _chain_str = " → ".join(
+                                        [f"\\${s:.0f}" for s in _chain_strikes])
+                                    st.markdown(f"**Roll Chain**: {_chain_str}")
+                                    _rc1, _rc2, _rc3 = st.columns(3)
+                                    _rc1.metric("Cycles", _dh_chain.get("cycle_count", 0))
+                                    _rc2.metric(
+                                        "Gross Collected",
+                                        f"${_dh_chain.get('total_gross', 0):.2f}/sh")
+                                    _rc3.metric(
+                                        "Net After Close Costs",
+                                        f"${_dh_chain.get('total_net', 0):.2f}/sh")
+                                    if _dh_chain.get("total_close_cost", 0) > 0:
+                                        st.caption(
+                                            f"Close costs: \\${_dh_chain['total_close_cost']:.2f}/sh"
+                                        )
+
+                            # ── Mark as Executed button ──
+                            if _dh_action in ("EXIT", "ROLL", "TRIM") and not _dh_exec_pending:
+                                st.divider()
+                                _me_col1, _me_col2 = st.columns([1, 3])
+                                with _me_col1:
+                                    _me_clicked = st.button(
+                                        f"✅ Mark {_dh_action} Executed",
+                                        key=f"mark_exec_{tid}",
+                                        help=f"Record that you have executed the {_dh_action} "
+                                             f"recommendation. Suppresses stale re-recommendations.",
+                                    )
+                                if _me_clicked:
+                                    try:
+                                        from core.shared.data_layer.duckdb_utils import get_domain_connection, DbDomain
+                                        _me_con = get_domain_connection(DbDomain.MANAGEMENT, read_only=False)
+                                        try:
+                                            from core.shared.data_layer.decision_ledger import (
+                                                mark_action_executed,
+                                                ensure_executed_actions_table,
+                                            )
+                                            ensure_executed_actions_table(_me_con)
+                                            _me_strike = pd.to_numeric(
+                                                doctrine_row.get("Strike"), errors="coerce")
+                                            mark_action_executed(
+                                                _me_con,
+                                                trade_id=tid,
+                                                action=_dh_action,
+                                                confirmed_by="manual",
+                                                strike_old=float(_me_strike) if pd.notna(_me_strike) else None,
+                                                notes=f"Marked from dashboard on {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                                            )
+                                            st.success(f"✅ {_dh_action} marked as executed for {tid}.")
+                                        finally:
+                                            _me_con.close()
+                                    except Exception as _me_err:
+                                        st.error(f"Failed to mark execution: {_me_err}")
+                        finally:
+                            _dh_con.close()
+                    except Exception as _dh_err:
+                        st.caption(f"Decision history unavailable: {_dh_err}")
+
             # Stock context — full buy-write cost picture
             if not stock_legs.empty:
                 s = stock_legs.iloc[0]
@@ -4033,6 +5132,39 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                         st.success(f"FULL POSITION — pyramid complete, protect gains{_tier_str}")
                     elif _winner_lc == "THESIS_EXHAUSTING":
                         st.warning(f"THESIS EXHAUSTING — momentum/conviction fading{_tier_str}")
+
+                # Wave Phase badge — move lifecycle classification
+                _wave_phase = str(s.get("WavePhase_State", "") or "").strip().upper()
+                if _wave_phase and _wave_phase not in ("", "UNKNOWN", "N/A"):
+                    if _wave_phase == "BUILDING":
+                        st.success("🌊 WAVE BUILDING — scale-up window open")
+                    elif _wave_phase == "PEAKING":
+                        st.warning("🌊 WAVE PEAKING — protect profits, trim eligible")
+                    elif _wave_phase in ("EXHAUSTED", "FADING"):
+                        st.error(f"🌊 WAVE {_wave_phase} — exit or trim")
+                    elif _wave_phase == "FORMING":
+                        st.info("🌊 WAVE FORMING — watching for confirmation")
+                    elif _wave_phase == "RECOVERING":
+                        st.info("🌊 WAVE RECOVERING — watch for structural shift")
+                    elif _wave_phase == "STALLED":
+                        st.info("🌊 WAVE STALLED — no directional conviction")
+
+                # Thesis Review Verdict badge — scored thesis evaluation
+                _tr_verdict = str(s.get("Thesis_Review_Verdict", "") or "").strip().upper()
+                if _tr_verdict and _tr_verdict not in ("", "N/A"):
+                    _tr_score = s.get("Thesis_Review_Score", "")
+                    _tr_score_str = f" (score={float(_tr_score):+.0f})" if pd.notna(_tr_score) and _tr_score != "" else ""
+                    _tr_evidence = str(s.get("Thesis_Review_Evidence", "") or "").strip()
+                    if _tr_verdict == "REAFFIRMED":
+                        st.success(f"✅ THESIS REAFFIRMED{_tr_score_str}")
+                    elif _tr_verdict == "MONITORING":
+                        st.warning(f"👁 THESIS MONITORING{_tr_score_str}")
+                    elif _tr_verdict == "WEAKENED":
+                        st.warning(f"⚠️ THESIS WEAKENED{_tr_score_str}")
+                    elif _tr_verdict == "DEGRADED":
+                        st.error(f"🔴 THESIS DEGRADED{_tr_score_str}")
+                    if _tr_evidence:
+                        st.caption(f"Evidence: {_tr_evidence}")
 
                 # Premium recovery line
                 if pd.notna(cum_premium) and cum_premium > 0:
@@ -4193,8 +5325,16 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                 )
                 _ev_qty_int = int(_ev_qty_s) if pd.notna(_ev_qty_s) else 0
 
+                # Detect retirement account (Roth/IRA/401K) — no margin cost
+                _ev_acct = str(_ev_s.get("Account") or "").upper()
+                _ev_is_retirement = any(k in _ev_acct for k in ("ROTH", "IRA", "401K", "RETIRE"))
+
                 if (_ev_ncp_safe and _ev_qty_int > 0
                         and pd.notna(_ev_spot) and pd.notna(net_t) and pd.notna(_ev_dte)):
+
+                    # Read pre-computed Daily_Margin_Cost from stock row (MarginCarryCalculator)
+                    _ev_precomp_mc = pd.to_numeric(_ev_s.get("Daily_Margin_Cost"), errors="coerce")
+                    _ev_precomp_mc = float(_ev_precomp_mc) if pd.notna(_ev_precomp_mc) else None
 
                     _ev = _compute_bw_capital_efficiency(
                         net_cost_per_share = float(_ev_ncp_safe),
@@ -4205,6 +5345,8 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                         iv                 = float(_ev_iv) if pd.notna(_ev_iv) else None,
                         spot               = float(_ev_spot),
                         delta              = float(_ev_delta) if pd.notna(_ev_delta) else None,
+                        is_retirement      = _ev_is_retirement,
+                        precomputed_margin_cost_daily = _ev_precomp_mc,
                     )
                     # Second pass: fill gamma drag now that net_g is in scope
                     if pd.notna(net_g):
@@ -4248,7 +5390,7 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                         _mcost_d = _ev.get("margin_cost_daily")
                         _mcost_h = _ev.get("margin_cost_horizon")
                         _mcost_ps = _ev.get("margin_cost_per_share_daily")
-                        _mcost_mo = (_mcost_d * 30) if _mcost_d else None
+                        _mcost_mo = (_mcost_d * 30) if (_mcost_d is not None and _mcost_d > 0) else None
 
                         ev4, ev5, ev6 = st.columns(3)
                         ev4.metric(
@@ -4257,13 +5399,21 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                             delta=f"HV={_hv_pct_ev}, ±${_hv1sd:.2f}/day 1σ" if _hv1sd else None,
                             delta_color="inverse",
                         )
+                        _mcost_label = "—"
+                        if _mcost_d is not None and _mcost_d > 0:
+                            _mcost_label = f"${_mcost_d:.2f}/day"
+                        elif _mcost_d is not None and _mcost_d == 0:
+                            _mcost_label = "$0.00/day"
                         ev5.metric(
                             "Margin Cost",
-                            f"${_mcost_d:.2f}/day" if _mcost_d else "—",
-                            delta=f"${_mcost_mo:,.0f}/month" + (f" · {_hor_label}: ${_mcost_h:,.0f}" if _mcost_h else "") if _mcost_mo else None,
-                            delta_color="inverse",
-                            help=f"Fidelity 10.375%/yr on ${_ev_ncp_safe:.2f}/share net basis × {_ev_qty_int} shares"
-                                 if _mcost_d else None,
+                            _mcost_label,
+                            delta=(f"${_mcost_mo:,.0f}/month" + (f" · {_hor_label}: ${_mcost_h:,.0f}" if _mcost_h else "")
+                                   if _mcost_mo else ("retirement — no margin" if _ev_is_retirement else None)),
+                            delta_color="inverse" if (_mcost_mo and _mcost_mo > 0) else "off",
+                            help=(f"Pre-computed: borrowed portion × 10.375%/yr"
+                                  if _ev_precomp_mc and _ev_precomp_mc > 0
+                                  else f"Estimated: ${_ev_ncp_safe:.2f}/share net basis × {_ev_qty_int} shares × 10.375%/yr")
+                                 if (_mcost_d is not None and _mcost_d > 0) else None,
                         )
                         ev6.metric(
                             f"Hold EV ({_hor_label})",
@@ -4275,12 +5425,28 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                         st.divider()
 
                         # Row 3: Carry quality summary
-                        # Efficiency context: must reconcile annualised yield WITH hold EV.
-                        # Annualised yield is theta-only; if costs > theta, hold EV is
-                        # negative — "strong carry" is wrong when you're losing money net.
+                        # Distinguish the DRIVER of negative hold EV:
+                        #   - Gamma drag > theta → short-term structural (DTE-dependent, resolves at roll)
+                        #   - Margin cost > theta → long-term carry problem (position is losing money to Fidelity)
+                        #   - Both → combined drag
+                        # Annualised yield is theta-only; hold EV includes gamma drag + margin.
                         _eff_context = ""
+                        _margin_h = _mcost_h if (_mcost_h is not None) else 0.0
+                        _theta_h = _carry if (_carry is not None) else 0.0
+                        _gdrag_h = _gdrag if (_gdrag is not None) else 0.0
+
                         if _hev is not None and _hev < 0:
-                            _eff_context = "🔴 Negative carry (costs > θ)"
+                            # Negative hold EV — diagnose the driver
+                            if _gdrag_h > _theta_h and _margin_h > _theta_h:
+                                _eff_context = "🔴 Negative hold EV (Γ drag + margin > θ)"
+                            elif _gdrag_h > _theta_h:
+                                # Gamma drag is the culprit — carry itself is fine
+                                _eff_context = "🟠 Negative hold EV (Γ drag > θ — carry OK)"
+                            elif _margin_h > _theta_h:
+                                _eff_context = "🔴 Negative carry (margin > θ)"
+                            else:
+                                # Combined effect pushes it negative
+                                _eff_context = "🟠 Negative hold EV (Γ + margin combined)"
                         elif _eff_a:
                             if _eff_a >= 0.20:
                                 _eff_context = "✅ Strong carry (>20%/yr)"
@@ -4291,7 +5457,7 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                         ev7, ev8, ev9 = st.columns(3)
                         ev7.metric("Carry Quality", _eff_context or "—")
                         # Net yield after margin: how much of theta actually survives
-                        if _mcost_d and net_t:
+                        if _mcost_d is not None and net_t:
                             _theta_after_margin = net_t - _mcost_d
                             _pct_kept = _theta_after_margin / net_t if net_t > 0 else 0
                             ev8.metric(
@@ -4300,8 +5466,31 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                 delta=f"{_pct_kept:.0%} of gross θ retained",
                                 delta_color="normal" if _theta_after_margin > 0 else "inverse",
                             )
-                        if _mcost_ps:
-                            _margin_ann_pct = 0.10375  # match constant
+                        # Show BWEfficiency grade + ratio from enrichment if available
+                        _raw_grade = _ev_s.get("Carry_Efficiency_Grade")
+                        _eff_grade = str(_raw_grade).strip() if (pd.notna(_raw_grade) and str(_raw_grade).strip() not in ("", "nan", "None")) else ""
+                        _eff_ratio = pd.to_numeric(_ev_s.get("Premium_vs_Carry_Ratio"), errors="coerce")
+                        _eff_net_yield = pd.to_numeric(_ev_s.get("Net_Yield_Annual_Pct"), errors="coerce")
+                        _eff_days_left = pd.to_numeric(_ev_s.get("Days_Until_Carry_Eats_GL"), errors="coerce")
+                        if _eff_grade:
+                            _grade_emoji = {"A": "🟢", "B": "🟢", "C": "🟡", "D": "🟠", "F": "🔴", "—": "⚪"}.get(_eff_grade, "⚪")
+                            _ratio_str = f"{_eff_ratio:.1f}×" if (pd.notna(_eff_ratio) and _eff_ratio != float("inf")) else "∞"
+                            ev9.metric(
+                                "BW Efficiency",
+                                f"{_grade_emoji} Grade {_eff_grade}",
+                                delta=f"Premium/Carry: {_ratio_str}"
+                                      + (f" · Net Yield: {_eff_net_yield:.1f}%/yr" if pd.notna(_eff_net_yield) else ""),
+                                delta_color="off",
+                                help=(f"Days until carry eats GL: {int(_eff_days_left)}" if pd.notna(_eff_days_left) else None),
+                            )
+                        elif _ev_is_retirement:
+                            ev9.metric(
+                                "Carry Cost",
+                                "✅ $0 (Roth/IRA)",
+                                delta="No margin — 100% of θ retained",
+                                delta_color="off",
+                            )
+                        elif _mcost_ps:
                             ev9.metric(
                                 "Margin Rate",
                                 "10.375%/yr",
@@ -4311,11 +5500,17 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
 
                         # Formula transparency
                         _margin_formula = ""
-                        if _mcost_d:
-                            _margin_formula = (
-                                f"Margin cost = \\${_ev_ncp_safe:.2f} × {_ev_qty_int}sh × 10.375%/365 "
-                                f"= \\${_mcost_d:.2f}/day (\\${_mcost_mo:,.0f}/month). "
-                            )
+                        if _mcost_d is not None and _mcost_d > 0:
+                            if _ev_precomp_mc and _ev_precomp_mc > 0:
+                                _margin_formula = (
+                                    f"Margin cost = \\${_mcost_d:.2f}/day (\\${_mcost_mo:,.0f}/month) "
+                                    f"— pre-computed on borrowed portion (10.375%/yr). "
+                                )
+                            else:
+                                _margin_formula = (
+                                    f"Margin cost = \\${_ev_ncp_safe:.2f} × {_ev_qty_int}sh × 10.375%/365 "
+                                    f"= \\${_mcost_d:.2f}/day (\\${_mcost_mo:,.0f}/month). "
+                                )
                         st.caption(
                             f"**How computed:** "
                             f"Capital at risk = net basis \\${_ev_ncp_safe:.2f} × {_ev_qty_int} shares. "
@@ -4374,13 +5569,14 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                         _bb_doc_row    = doctrine_by_trade.get(tid)
                         _bb_doc_action = str(_bb_doc_row.get("Action", "")) if _bb_doc_row is not None else ""
                         _bb_urgency    = str(_bb_doc_row.get("Urgency", "LOW")) if _bb_doc_row is not None else "LOW"
-                        _doctrine_decided_btc = _bb_doc_action in ("ROLL", "EXIT")
+                        _doctrine_decided_btc = _bb_doc_action in ("ROLL", "ROLL_UP_OUT", "ROLL_WAIT", "EXIT", "EXIT_STOCK")
 
                         if _doctrine_decided_btc:
                             # Header: confirmed action, not a question
                             _btc_urgency = _bb_urgency
                             _btc_icon = "🔴" if _btc_urgency == "CRITICAL" else "🟠" if _btc_urgency == "HIGH" else "🟡"
-                            st.markdown(f"**📣 Buy Back the Short Call — {_btc_icon} {_bb_doc_action} {_btc_urgency}**")
+                            _bb_disp = ACTION_DISPLAY.get(_bb_doc_action, _bb_doc_action)
+                            st.markdown(f"**📣 Buy Back the Short Call — {_btc_icon} {_bb_disp} {_btc_urgency}**")
                             # For EXIT: redirect to the Exit Winner Panel, not Roll Scenarios.
                             # The Winner Panel resolves the call disposition (buyback vs let expire vs
                             # accept assignment) — the roll scaffold is irrelevant for EXIT.
@@ -4551,10 +5747,11 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                             # Row 1: current state
                             r1a, r1b, r1c = st.columns(3)
                             r1a.metric(
-                                "Gap to Breakeven",
+                                "Net Cost Gap",
                                 f"${_gap_to_breakeven:.2f}/share",
                                 delta=f"${_gap_to_breakeven * (_qty or 0):+,.0f} total",
                                 delta_color="inverse",
+                                help="Gap after crediting collected premium (net cost basis − spot)",
                             )
                             r1b.metric(
                                 "Hard Stop",
@@ -4582,8 +5779,14 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                 _monthly_premium_est = _weekly_premium_est * 4.3
 
                                 # Margin bleed: real cost that eats into recovery premium
-                                _MARGIN_RATE_DAILY = 0.10375 / 365
-                                _margin_ps_daily = _eff_cost * _MARGIN_RATE_DAILY if _eff_cost else 0.0
+                                # Roth/IRA/401K: no margin — fully cash-funded
+                                _recov_acct = str(_s.get("Account") or "").upper()
+                                _recov_is_retirement = any(k in _recov_acct for k in ("ROTH", "IRA", "401K", "RETIRE"))
+                                if _recov_is_retirement:
+                                    _margin_ps_daily = 0.0
+                                else:
+                                    _MARGIN_RATE_DAILY = 0.10375 / 365
+                                    _margin_ps_daily = _eff_cost * _MARGIN_RATE_DAILY if _eff_cost else 0.0
                                 _margin_ps_monthly = _margin_ps_daily * 30
                                 _net_monthly_income = _monthly_premium_est - _margin_ps_monthly
                                 _cycles_to_recover = int(_gap_to_breakeven / max(_net_monthly_income, 0.01)) + 1 if _net_monthly_income > 0.01 else 999
@@ -4602,9 +5805,9 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                 )
                                 sc2.metric(
                                     "Margin Bleed",
-                                    f"−${_margin_ps_monthly:.2f}/share/mo",
-                                    delta=f"10.375%/yr on ${_eff_cost:.2f} basis",
-                                    delta_color="inverse",
+                                    "$0 (Roth)" if _recov_is_retirement else f"−${_margin_ps_monthly:.2f}/share/mo",
+                                    delta="No margin cost" if _recov_is_retirement else f"10.375%/yr on ${_eff_cost:.2f} basis",
+                                    delta_color="off" if _recov_is_retirement else "inverse",
                                 )
                                 sc3.metric(
                                     "Net Monthly Income",
@@ -4615,7 +5818,7 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                 sc4.metric(
                                     "Months to Close Gap",
                                     f"~{_cycles_to_recover}" if _cycles_to_recover < 999 else "∞",
-                                    help=f"${_gap_to_breakeven:.2f} gap ÷ ${_net_monthly_income:.2f}/mo net income"
+                                    help=f"${_gap_to_breakeven:.2f} net cost gap ÷ ${_net_monthly_income:.2f}/mo net income"
                                          if _net_monthly_income > 0 else "Margin cost exceeds premium — gap widens",
                                     delta=f"net of margin cost" if _net_monthly_income > 0 else "recovery infeasible",
                                     delta_color="off" if _net_monthly_income > 0 else "inverse",
@@ -4641,7 +5844,7 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                         f"Premium income cannot outrun continued stock deterioration."
                                     )
                                 elif _cycles_to_recover <= 3:
-                                    st.success(f"**Feasible**: ~{_cycles_to_recover} months of rolling can close the ${_gap_to_breakeven:.2f}/share gap — if stock stabilizes.")
+                                    st.success(f"**Feasible**: ~{_cycles_to_recover} months of rolling can close the ${_gap_to_breakeven:.2f}/share net cost gap — if stock stabilizes.")
                                 elif _cycles_to_recover <= 6:
                                     st.warning(f"**Marginal**: ~{_cycles_to_recover} months required. Each dollar of stock decline adds another month. Verify thesis first.")
                                 else:
@@ -4698,6 +5901,217 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                         f"Hard stop discipline applies. Do not roll for premium — "
                                         f"premium cannot outrun a continuing decline."
                                     )
+
+                            # ── Unified Recovery Plan (idle shares) ──────────
+                            _rec_total = float(_rq_row.get("Recovery_Total_Shares", 0) or 0) if _rq_row is not None else 0
+                            _rec_covered = float(_rq_row.get("Recovery_Covered_Shares", 0) or 0) if _rq_row is not None else 0
+                            _rec_idle = float(_rq_row.get("Recovery_Idle_Shares", 0) or 0) if _rq_row is not None else 0
+                            _rec_mo_base = float(_rq_row.get("Recovery_Months_Baseline", 0) or 0) if _rq_row is not None else 0
+                            _rec_mo_full = float(_rq_row.get("Recovery_Months_Full", 0) or 0) if _rq_row is not None else 0
+                            _rec_inc_base = float(_rq_row.get("Recovery_Income_Baseline_Mo", 0) or 0) if _rq_row is not None else 0
+                            _rec_inc_full = float(_rq_row.get("Recovery_Income_Full_Mo", 0) or 0) if _rq_row is not None else 0
+                            _rec_accel = float(_rq_row.get("Recovery_Acceleration_Pct", 0) or 0) if _rq_row is not None else 0
+                            _rec_recommend = bool(_rq_row.get("Recovery_Cover_Idle_Recommended", False)) if _rq_row is not None else False
+                            _rec_iv_ok = bool(_rq_row.get("Recovery_IV_HV_OK", False)) if _rq_row is not None else False
+                            _rec_cc_fav = bool(_rq_row.get("Recovery_CC_Favorable", False)) if _rq_row is not None else False
+
+                            if _rec_idle > 0 and _rec_mo_base > 0:
+                                st.divider()
+                                st.markdown(
+                                    f"**📊 Unified Recovery — {int(_rec_total):,} shares "
+                                    f"({int(_rec_covered):,} covered, {int(_rec_idle):,} idle)**"
+                                )
+                                _delta_months = int(_rec_mo_base - _rec_mo_full) if _rec_mo_base < 999 else 0
+
+                                bc1, bc2, bc3 = st.columns(3)
+                                _base_label = f"~{int(_rec_mo_base)} months" if _rec_mo_base < 999 else "∞"
+                                bc1.metric(
+                                    "Baseline (covered only)",
+                                    _base_label,
+                                    delta=f"${_rec_inc_base:,.2f}/mo income",
+                                    delta_color="off",
+                                    help=f"Recovery timeline using {int(_rec_covered):,} covered shares only",
+                                )
+                                _full_label = f"~{int(_rec_mo_full)} months" if _rec_mo_full < 999 else "∞"
+                                bc2.metric(
+                                    "Full Coverage",
+                                    _full_label,
+                                    delta=f"${_rec_inc_full:,.2f}/mo income",
+                                    delta_color="off",
+                                    help=f"Recovery timeline if all {int(_rec_total):,} shares write CCs",
+                                )
+                                bc3.metric(
+                                    "Acceleration",
+                                    f"-{abs(_delta_months)} months" if _delta_months > 0 else "—",
+                                    delta=f"{abs(_rec_accel):.0f}% faster" if _rec_accel > 0 else None,
+                                    delta_color="normal" if _rec_accel > 0 else "off",
+                                )
+
+                                if _rec_recommend:
+                                    _guardrail_parts = []
+                                    if _rec_iv_ok:
+                                        _guardrail_parts.append("IV ≥ 90% HV ✓")
+                                    if _rec_cc_fav:
+                                        _guardrail_parts.append("CC engine FAVORABLE ✓")
+                                    _guardrails = "  |  ".join(_guardrail_parts) if _guardrail_parts else ""
+                                    st.success(
+                                        f"⚡ **Cover {int(_rec_idle):,} idle shares** — "
+                                        f"saves ~{abs(_delta_months)} months "
+                                        f"({abs(_rec_accel):.0f}% faster recovery)"
+                                        + (f"  \n{_guardrails}" if _guardrails else "")
+                                    )
+                                else:
+                                    _reasons = []
+                                    if not _rec_iv_ok:
+                                        _reasons.append("IV below 90% of HV")
+                                    if not _rec_cc_fav:
+                                        _reasons.append("CC engine not FAVORABLE")
+                                    if _rec_accel < 15:
+                                        _reasons.append(f"improvement only {_rec_accel:.0f}%")
+                                    st.warning(
+                                        f"⏸️ **{int(_rec_idle):,} idle shares not recommended for coverage**: "
+                                        + ", ".join(_reasons)
+                                    )
+
+                                # ── MC Recovery Comparison ────────────────
+                                _mc_rec_ev_curr = float(_rq_row.get("MC_Recovery_EV_Current", 0) or 0) if _rq_row is not None else 0
+                                _mc_rec_ev_full = float(_rq_row.get("MC_Recovery_EV_Full", 0) or 0) if _rq_row is not None else 0
+                                _mc_rec_delta = float(_rq_row.get("MC_Recovery_EV_Delta", 0) or 0) if _rq_row is not None else 0
+                                _mc_rec_p_curr = float(_rq_row.get("MC_Recovery_P_Recover_Current", 0) or 0) if _rq_row is not None else 0
+                                _mc_rec_p_full = float(_rq_row.get("MC_Recovery_P_Recover_Full", 0) or 0) if _rq_row is not None else 0
+                                _mc_rec_verdict = str(_rq_row.get("MC_Recovery_Verdict", "") or "") if _rq_row is not None else ""
+                                _mc_rec_note = str(_rq_row.get("MC_Recovery_Note", "") or "") if _rq_row is not None else ""
+
+                                if _mc_rec_verdict and _mc_rec_verdict not in ("", "SKIP"):
+                                    st.divider()
+                                    st.caption("**🎲 MC Scenario Comparison** (6-month GBM, 2,000 paths)")
+                                    mc1, mc2, mc3 = st.columns(3)
+                                    mc1.metric(
+                                        "EV Current Coverage",
+                                        f"${_mc_rec_ev_curr:,.0f}",
+                                        delta=f"P(recover) {_mc_rec_p_curr:.0%}",
+                                        delta_color="off",
+                                    )
+                                    mc2.metric(
+                                        "EV Full Coverage",
+                                        f"${_mc_rec_ev_full:,.0f}",
+                                        delta=f"P(recover) {_mc_rec_p_full:.0%}",
+                                        delta_color="off",
+                                    )
+                                    _delta_color = "normal" if _mc_rec_delta > 0 else ("inverse" if _mc_rec_delta < 0 else "off")
+                                    mc3.metric(
+                                        "EV Delta",
+                                        f"${_mc_rec_delta:+,.0f}",
+                                        delta=_mc_rec_verdict.replace("_", " ").title(),
+                                        delta_color=_delta_color,
+                                    )
+
+            # ── Idle Share Utilization ────────────────────────────────────────
+            # Top-level section for recovery positions with idle shares.
+            # Reads reconciler + MC columns from doctrine row.
+            _idle_doc = doctrine_by_trade.get(tid)
+            if _idle_doc is None:
+                _idle_doc = option_row_by_trade.get(tid)
+            if _idle_doc is not None:
+                _iu_idle = 0.0
+                _iu_raw = _idle_doc.get("Recovery_Idle_Shares")
+                if _iu_raw is not None and pd.notna(_iu_raw):
+                    _iu_idle = float(_iu_raw)
+                _iu_mo_base_raw = _idle_doc.get("Recovery_Months_Baseline")
+                _iu_mo_base = float(_iu_mo_base_raw) if _iu_mo_base_raw is not None and pd.notna(_iu_mo_base_raw) else 0.0
+
+                if _iu_idle >= 100 and _iu_mo_base > 0:
+                    _iu_total = float(_idle_doc.get("Recovery_Total_Shares") or 0) if pd.notna(_idle_doc.get("Recovery_Total_Shares")) else 0
+                    _iu_covered = float(_idle_doc.get("Recovery_Covered_Shares") or 0) if pd.notna(_idle_doc.get("Recovery_Covered_Shares")) else 0
+                    _iu_mo_full_raw = _idle_doc.get("Recovery_Months_Full")
+                    _iu_mo_full = float(_iu_mo_full_raw) if _iu_mo_full_raw is not None and pd.notna(_iu_mo_full_raw) else 0.0
+                    _iu_inc_base = float(_idle_doc.get("Recovery_Income_Baseline_Mo") or 0) if pd.notna(_idle_doc.get("Recovery_Income_Baseline_Mo")) else 0
+                    _iu_inc_full = float(_idle_doc.get("Recovery_Income_Full_Mo") or 0) if pd.notna(_idle_doc.get("Recovery_Income_Full_Mo")) else 0
+                    _iu_accel = float(_idle_doc.get("Recovery_Acceleration_Pct") or 0) if pd.notna(_idle_doc.get("Recovery_Acceleration_Pct")) else 0
+                    _iu_recommend = bool(_idle_doc.get("Recovery_Cover_Idle_Recommended")) if pd.notna(_idle_doc.get("Recovery_Cover_Idle_Recommended")) else False
+                    _iu_iv_ok = bool(_idle_doc.get("Recovery_IV_HV_OK")) if pd.notna(_idle_doc.get("Recovery_IV_HV_OK")) else False
+                    _iu_cc_fav = bool(_idle_doc.get("Recovery_CC_Favorable")) if pd.notna(_idle_doc.get("Recovery_CC_Favorable")) else False
+
+                    st.divider()
+                    _iu_delta_mo = int(_iu_mo_base - _iu_mo_full) if _iu_mo_base < 999 else 0
+                    with st.expander(
+                        f"📦 Idle Share Utilization — {int(_iu_idle):,} shares uncovered"
+                        + (f"  ·  ⚡ -{abs(_iu_delta_mo)} months if covered" if _iu_delta_mo > 0 else ""),
+                        expanded=True,
+                    ):
+                        iu1, iu2, iu3 = st.columns(3)
+                        _iu_base_label = f"~{int(_iu_mo_base)} months" if _iu_mo_base < 999 else "∞"
+                        iu1.metric(
+                            "Baseline (covered only)",
+                            _iu_base_label,
+                            delta=f"${_iu_inc_base:,.0f}/mo · {int(_iu_covered):,} shares",
+                            delta_color="off",
+                        )
+                        _iu_full_label = f"~{int(_iu_mo_full)} months" if _iu_mo_full < 999 else "∞"
+                        iu2.metric(
+                            "Full Coverage",
+                            _iu_full_label,
+                            delta=f"${_iu_inc_full:,.0f}/mo · {int(_iu_total):,} shares",
+                            delta_color="off",
+                        )
+                        iu3.metric(
+                            "Acceleration",
+                            f"-{abs(_iu_delta_mo)} months" if _iu_delta_mo > 0 else "—",
+                            delta=f"{abs(_iu_accel):.0f}% faster" if _iu_accel > 0 else None,
+                            delta_color="normal" if _iu_accel > 0 else "off",
+                        )
+
+                        # MC data
+                        _iu_mc_verdict = str(_idle_doc.get("MC_Recovery_Verdict") or "") if pd.notna(_idle_doc.get("MC_Recovery_Verdict")) else ""
+                        _iu_mc_ev_c = float(_idle_doc.get("MC_Recovery_EV_Current") or 0) if pd.notna(_idle_doc.get("MC_Recovery_EV_Current")) else 0
+                        _iu_mc_ev_f = float(_idle_doc.get("MC_Recovery_EV_Full") or 0) if pd.notna(_idle_doc.get("MC_Recovery_EV_Full")) else 0
+                        _iu_mc_delta = float(_idle_doc.get("MC_Recovery_EV_Delta") or 0) if pd.notna(_idle_doc.get("MC_Recovery_EV_Delta")) else 0
+                        _iu_mc_p_c = float(_idle_doc.get("MC_Recovery_P_Recover_Current") or 0) if pd.notna(_idle_doc.get("MC_Recovery_P_Recover_Current")) else 0
+                        _iu_mc_p_f = float(_idle_doc.get("MC_Recovery_P_Recover_Full") or 0) if pd.notna(_idle_doc.get("MC_Recovery_P_Recover_Full")) else 0
+                        _iu_has_mc = _iu_mc_verdict and _iu_mc_verdict not in ("", "SKIP")
+
+                        # Unified verdict: combine deterministic + MC
+                        if _iu_recommend:
+                            _iu_guards = []
+                            if _iu_iv_ok:
+                                _iu_guards.append("IV >= 90% HV")
+                            if _iu_cc_fav:
+                                _iu_guards.append("CC engine FAVORABLE")
+                            if _iu_has_mc and _iu_mc_verdict == "COVER_IDLE":
+                                _iu_guards.append(f"MC: COVER (EV +${_iu_mc_delta:+,.0f})")
+                            st.success(
+                                f"**COVER {int(_iu_idle):,} idle shares** — "
+                                f"saves ~{abs(_iu_delta_mo)} months "
+                                f"({abs(_iu_accel):.0f}% faster recovery)"
+                                + (f"  \n" + "  |  ".join(_iu_guards) if _iu_guards else "")
+                            )
+                        elif _iu_has_mc and _iu_mc_verdict == "KEEP_IDLE":
+                            st.info(
+                                f"**KEEP {int(_iu_idle):,} shares idle** — "
+                                f"MC finds upside optionality beats premium income "
+                                f"(EV delta ${_iu_mc_delta:+,.0f})"
+                            )
+                        else:
+                            _iu_reasons = []
+                            if not _iu_iv_ok:
+                                _iu_reasons.append("IV below 90% of HV")
+                            if not _iu_cc_fav:
+                                _iu_reasons.append("CC engine not FAVORABLE")
+                            if _iu_accel < 15:
+                                _iu_reasons.append(f"improvement only {_iu_accel:.0f}%")
+                            st.warning(
+                                f"**{int(_iu_idle):,} idle shares — guardrails block**: "
+                                + ", ".join(_iu_reasons)
+                            )
+
+                        # MC detail metrics (always show when available)
+                        if _iu_has_mc:
+                            st.caption("**MC Scenario Comparison** (6-month GBM, 2,000 paths)")
+                            mc_a, mc_b, mc_c = st.columns(3)
+                            mc_a.metric("EV Current", f"${_iu_mc_ev_c:,.0f}", delta=f"P(recover) {_iu_mc_p_c:.0%}", delta_color="off")
+                            mc_b.metric("EV Full Coverage", f"${_iu_mc_ev_f:,.0f}", delta=f"P(recover) {_iu_mc_p_f:.0%}", delta_color="off")
+                            _mc_dc = "normal" if _iu_mc_delta > 0 else ("inverse" if _iu_mc_delta < 0 else "off")
+                            mc_c.metric("EV Delta", f"${_iu_mc_delta:+,.0f}", delta=_iu_mc_verdict.replace("_", " ").title(), delta_color=_mc_dc)
 
             # ── Thesis State Panel ────────────────────────────────────────────
             # Layer 0: is the underlying company still aligned with the thesis?
@@ -4856,7 +6270,7 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
 
                             st.caption(
                                 f"Expected Move (10D): {_em_str}  ·  "
-                                f"Required move to breakeven: {_be_str} {_ratio_icon} {_ev_ratio:.2f}× {_ratio_label}  ·  "
+                                f"Option leg move to BE: {_be_str} {_ratio_icon} {_ev_ratio:.2f}× {_ratio_label}  ·  "
                                 f"50% Recovery: {_50_str} ({_r50_str})"
                             )
 
@@ -5161,13 +6575,21 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                         st.divider()
                         st.markdown("### 🏆 Exit Winner Panel — What to Execute")
 
+                        # ── Calendar context for execution timing ─────────
+                        _ewp_cal = get_calendar_context()
+                        _ewp_is_friday = _ewp_cal.is_friday
+                        _ewp_is_pre_long_wknd = _ewp_cal.is_pre_long_weekend
+                        _ewp_bleed_days = _ewp_cal.theta_bleed_days  # 0=normal, 2=weekend, 3+=holiday
+                        _ewp_next_open = _ewp_cal.next_open
+                        _ewp_gap_days = _ewp_cal.weekend_gap_days
+
                         # ── Determine recommended path ──────────────────────
                         # Decision tree (Passarelli Ch.6 + McMillan Ch.6):
                         #   ITM + DTE≤7  → accept assignment (do nothing on call)
                         #   ITM + DTE>7  → accept assignment preferred if assignment_net≥active_exit_net
                         #                  else active exit (buyback + sell stock)
                         #   OTM + DTE≤7  → let call expire; sell stock separately if wanted
-                        #   OTM + DTE>7  → sell stock first (independent); let call ride/expire
+                        #   OTM + DTE>7  → buy back call (release collateral), then sell stock
                         # In no case does "EXIT" mean "roll" or "open a new position".
 
                         _ewp_dte        = float(_call_dte) if pd.notna(_call_dte) else 30.0
@@ -5176,7 +6598,13 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                         _ewp_assign_net = float(_call_strike * _n_shares) if (pd.notna(_call_strike) and _n_shares > 0) else 0.0
                         _ewp_active_net = float(_spot * _n_shares - _call_buyback_cost)
                         _ewp_basis      = float(_exit_effcost) if pd.notna(_exit_effcost) else 0.0
-                        _ewp_gain       = (_ewp_assign_net - _ewp_basis * _n_shares) if (_ewp_itm and _n_shares > 0) else 0.0
+                        if _ewp_itm and _n_shares > 0:
+                            _ewp_gain = _ewp_assign_net - _ewp_basis * _n_shares
+                        elif _n_shares > 0 and _ewp_basis > 0:
+                            # OTM: net gain = stock proceeds - basis - buyback cost
+                            _ewp_gain = (_spot * _n_shares) - (_ewp_basis * _n_shares) - _call_buyback_cost
+                        else:
+                            _ewp_gain = 0.0
                         _ewp_profitable = _ewp_assign_net > (_ewp_basis * _n_shares) if _n_shares > 0 else False
                         _ewp_bb_cost    = _call_buyback_cost  # alias
 
@@ -5222,32 +6650,35 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                     _ewp_stock_action = f"Sell stock at market / limit after call is closed."
                                     _ewp_not_a_roll   = True
                         else:
-                            # OTM call
+                            # OTM call — shares are collateral; must buy back call before selling stock
                             if _ewp_dte <= 7:
-                                _ewp_rec        = "LET_EXPIRE"
-                                _ewp_rec_label  = "Let Call Expire + Sell Stock Separately"
+                                _ewp_rec        = "LET_EXPIRE_THEN_SELL"
+                                _ewp_rec_label  = "Wait for Expiry, Then Sell Stock"
                                 _ewp_rec_icon   = "🟢"
                                 _ewp_rationale  = (
-                                    f"Call is OTM with {int(_ewp_dte)}d left — buying back costs \\${_ewp_bb_cost:,.0f} "
-                                    f"to avoid something worth near zero at expiry. Wasteful. "
-                                    f"Sell the stock independently now if desired; call expires worthless on its own."
+                                    f"Call is OTM with only {int(_ewp_dte)}d left — near-certain to expire worthless. "
+                                    f"Buying back now costs \\${_ewp_bb_cost:,.0f} to close something worth near zero. "
+                                    f"Wait for expiry to free the shares, then sell stock. "
+                                    f"Shares are collateral for the short call — cannot sell until call is closed or expired."
                                 )
-                                _ewp_call_action  = "Do nothing — OTM call expires worthless in ≤7 days."
-                                _ewp_stock_action = f"Sell stock separately (limit near \\${_spot:.2f}) if you want out now."
+                                _ewp_call_action  = "Do nothing — OTM call expires worthless in ≤7 days, freeing the shares."
+                                _ewp_stock_action = f"After expiry: sell stock (limit near \\${_spot:.2f})."
                                 _ewp_not_a_roll   = True
                             else:
-                                _ewp_rec        = "SELL_STOCK_LET_CALL_RIDE"
-                                _ewp_rec_label  = "Sell Stock Now, Let Call Ride"
+                                _ewp_rec        = "BUYBACK_CALL_THEN_SELL_STOCK"
+                                _ewp_rec_label  = "Buy Back Call, Then Sell Stock"
                                 _ewp_rec_icon   = "🟡"
                                 _ewp_rationale  = (
-                                    f"Call is OTM — the two legs are independent decisions. "
-                                    f"Stock: sell now at \\${_spot:.2f} to lock the gain. "
-                                    f"Call: remains short — it can expire worthless or you can buy it back later "
-                                    f"if it gets cheap (< 20% of original credit). "
-                                    f"Passarelli: 'Never buy back an OTM call just to exit the stock.'"
+                                    f"Call is OTM (Δ {_call_delta:.3f}) — cheap to close at \\${_ewp_bb_cost:,.0f}. "
+                                    f"Shares are collateral for the short call — must buy back the call first "
+                                    f"to release the shares for sale. "
+                                    f"Step 1: buy back the \\${_call_strike:.0f} call. "
+                                    f"Step 2: sell stock at \\${_spot:.2f} to lock the gain. "
+                                    f"Net cost of buyback (\\${_ewp_bb_cost:,.0f}) is small vs "
+                                    f"stock proceeds (\\${_spot * _n_shares:,.0f})."
                                 )
-                                _ewp_call_action  = "Leave the short call open — it is OTM. Close it only if cheap (<20% of original premium)."
-                                _ewp_stock_action = f"Sell stock now (limit near \\${_spot:.2f})."
+                                _ewp_call_action  = f"Buy to close the \\${_call_strike:.0f} call (limit at mid \\${float(_call_last):.2f})."
+                                _ewp_stock_action = f"After call closed: sell stock (limit near \\${_spot:.2f})."
                                 _ewp_not_a_roll   = True
 
                         # ── "Is this a roll / re-entry?" — explicit clarification ──
@@ -5296,29 +6727,116 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                 )
                             else:
                                 _ewp_cols[0].metric(
-                                    "Sell stock at market",
+                                    "Step 1: Buy back call",
+                                    f"\\${_ewp_bb_cost:,.0f}",
+                                    f"releases shares for sale",
+                                )
+                                _ewp_cols[1].metric(
+                                    "Step 2: Sell stock",
                                     f"\\${int(_spot * _n_shares):,}",
                                     f"\\${_spot:.2f} × {_n_shares} shares",
                                 )
-                                _ewp_cols[1].metric(
-                                    "Buyback OTM call (skip)",
-                                    f"\\${_ewp_bb_cost:,.0f}",
-                                    "Not recommended — OTM",
-                                )
                             _gain_str = f"+\\${_ewp_gain:,.0f}" if _ewp_gain >= 0 else f"-\\${abs(_ewp_gain):,.0f}"
-                            _ewp_cols[2].metric(
-                                "Gain vs cost basis",
-                                _gain_str,
-                                f"basis \\${_ewp_basis:.2f}/share" if _ewp_basis > 0 else "basis unknown",
+                            _ewp_gain_label = "Gain vs cost basis" if _ewp_itm else "Net after close"
+                            _ewp_gain_sub = (
+                                f"basis \\${_ewp_basis:.2f}/share" if _ewp_itm and _ewp_basis > 0
+                                else f"after \\${_ewp_bb_cost:,.0f} buyback" if not _ewp_itm
+                                else "basis unknown"
+                            )
+                            _ewp_cols[2].metric(_ewp_gain_label, _gain_str, _ewp_gain_sub)
+
+                        # ── Calendar-aware execution timing ──────────────────
+                        # Short premium (BUY_WRITE) collects theta over weekends/holidays.
+                        # Buying back the short call on Friday costs ~N extra days of theta
+                        # vs waiting until Monday. The panel must surface this.
+                        _ewp_theta_day = float(net_t) if (net_t is not None and pd.notna(net_t)) else 0.0
+                        # Weekend decay factor: markets front-load ~40% of weekend theta
+                        # into Friday pricing. Actual savings ≈ 60% of theoretical.
+                        # Natenberg Ch.11: "weekend decay is partially priced by Friday close"
+                        _WEEKEND_DECAY_FACTOR = 0.60
+                        _ewp_weekend_theta_savings = (
+                            abs(_ewp_theta_day) * _ewp_bleed_days * _WEEKEND_DECAY_FACTOR
+                            if _ewp_bleed_days > 0 else 0.0
+                        )
+
+                        if _ewp_is_friday or _ewp_is_pre_long_wknd:
+                            _ewp_day_label = "Friday" if _ewp_is_friday else "pre-holiday"
+                            _ewp_next_label = _ewp_next_open.strftime("%A %b %d")
+
+                            # ── OTM call buyback paths: delay saves weekend theta ──
+                            if _ewp_otm and _ewp_rec in ("BUYBACK_CALL_THEN_SELL_STOCK", "LET_EXPIRE_THEN_SELL"):
+                                # Short call collects theta over weekend — delay buyback
+                                _ewp_cal_icon = "📅"
+                                if _ewp_weekend_theta_savings > 5:  # only show if material (>$5)
+                                    st.warning(
+                                        f"{_ewp_cal_icon} **{_ewp_day_label.title()} Timing** — "
+                                        f"Short call collects **{_ewp_bleed_days} days** of weekend theta "
+                                        f"(~\\${_ewp_weekend_theta_savings:.0f} savings on buyback cost). "
+                                        f"Delay call buyback to **{_ewp_next_label}** morning — "
+                                        f"the call will be cheaper after {_ewp_bleed_days} days of free decay. "
+                                        f"Then sell stock after call is closed. "
+                                        f"(Natenberg Ch.11: weekend theta accrues to the short side; "
+                                        f"Passarelli Ch.6: don't pay for theta you could collect for free)"
+                                    )
+                                else:
+                                    st.info(
+                                        f"{_ewp_cal_icon} **{_ewp_day_label.title()} Timing** — "
+                                        f"Weekend theta savings are minimal (~\\${_ewp_weekend_theta_savings:.0f}). "
+                                        f"Execute at your discretion — no strong calendar edge either way."
+                                    )
+
+                            # ── ITM active exit: Friday is fine (no theta edge to collect) ──
+                            elif _ewp_itm and _ewp_rec == "ACTIVE_EXIT":
+                                st.info(
+                                    f"📅 **{_ewp_day_label.title()} Timing** — "
+                                    f"ITM call has minimal extrinsic value left — "
+                                    f"weekend theta savings are negligible. "
+                                    f"Execute today if ready."
+                                )
+
+                            # ── Assignment paths: no action needed, calendar irrelevant ──
+                            elif _ewp_rec in ("ACCEPT_ASSIGNMENT",):
+                                st.info(
+                                    f"📅 **{_ewp_day_label.title()}** — "
+                                    f"Assignment path selected — no active execution needed today. "
+                                    f"Call resolves at expiry automatically."
+                                )
+
+                        else:
+                            # Mon-Thu: no calendar modifier
+                            _ewp_weekday_name = _ewp_cal.date.strftime("%A")
+                            st.caption(
+                                f"📅 **{_ewp_weekday_name}** — No weekend/holiday timing edge. "
+                                f"Execute when ready."
                             )
 
-                        # ── Timing window ────────────────────────────────────
-                        st.caption(
-                            "**Best execution window** (Passarelli Ch.6): "
-                            "1:00–3:30 PM ET for stock (avoid open volatility spike and EOD spread widening). "
-                            "For call buyback: execute before 2:00 PM ET to avoid gamma acceleration "
-                            "near close if ITM."
-                        )
+                        # ── Intraday execution window ───────────────────────
+                        # Time-of-day guidance (static but useful)
+                        try:
+                            from datetime import timezone, timedelta as _td
+                            import pytz
+                            _et = pytz.timezone("US/Eastern")
+                            _now_et = datetime.now(_et)
+                            _hour_et = _now_et.hour
+                            _min_et = _now_et.minute
+                            _time_str = _now_et.strftime("%-I:%M %p ET")
+
+                            if _hour_et < 9 or (_hour_et == 9 and _min_et < 30):
+                                _window_msg = f"🕐 **{_time_str}** — Pre-market. Wait for open (9:30 AM ET). Best window: 1:00–3:30 PM ET."
+                            elif _hour_et < 10:
+                                _window_msg = f"🕐 **{_time_str}** — Opening volatility — spreads wide. Wait until after 10:00 AM ET for tighter fills."
+                            elif _hour_et < 13:
+                                _window_msg = f"🕐 **{_time_str}** — Midday lull — acceptable for execution. Prime window starts at 1:00 PM ET."
+                            elif _hour_et < 15 or (_hour_et == 15 and _min_et <= 30):
+                                _window_msg = f"🟢 **{_time_str}** — Prime execution window (1:00–3:30 PM ET). Optimal liquidity and tight spreads."
+                            elif _hour_et < 16:
+                                _window_msg = f"🟡 **{_time_str}** — Late session — spreads may widen. Execute promptly if acting today."
+                            else:
+                                _window_msg = f"🔴 **{_time_str}** — After hours. Execute tomorrow during market hours (best: 1:00–3:30 PM ET)."
+                        except Exception:
+                            _window_msg = "**Best execution window** (Passarelli Ch.6): 1:00–3:30 PM ET for stock. For call buyback: before 2:00 PM ET if ITM."
+
+                        st.caption(_window_msg)
 
             # ── Weekend Roll Pre-Staging ──────────────────────────────────────
             # When market is closed, pre-compute roll scenarios for review.
@@ -5642,10 +7160,15 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                             "**Doctrine Action: TRIM** — bank partial gains, keep residual exposure. "
                             "This is a Sell-to-Close on a portion of the position, not a roll."
                         )
+                    # Use doctrine's Trim_Contracts if available, otherwise default half
+                    _doctrine_trim_qty = None
+                    if _doc_row is not None:
+                        _dtq_raw = _doc_row.get("Trim_Contracts")
+                        if _dtq_raw is not None and not (isinstance(_dtq_raw, float) and pd.isna(_dtq_raw)):
+                            _doctrine_trim_qty = int(float(_dtq_raw))
                     for _, _tr_leg in opt_legs.iterrows():
                         _tr_qty_total = abs(int(_tr_leg.get("Quantity", 1) or 1))
-                        # Trim half, keep half (engine logic: floor(qty/2) trimmed)
-                        _tr_qty_close = max(1, int(_tr_qty_total / 2))
+                        _tr_qty_close = _doctrine_trim_qty if _doctrine_trim_qty is not None else max(1, int(_tr_qty_total / 2))
                         _tr_qty_keep  = _tr_qty_total - _tr_qty_close
                         _tr_last   = pd.to_numeric(_tr_leg.get("Last"), errors="coerce")
                         _tr_bid    = pd.to_numeric(_tr_leg.get("Bid"),  errors="coerce")
@@ -6456,8 +7979,8 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
             # Roll expander only makes sense for BUY_WRITE/COVERED_CALL (short call to roll)
             # or when action is explicitly ROLL. EXIT on a LONG_CALL means close — no roll scaffold.
             _needs_roll = (
-                (_doc_action in ("ROLL", "ROLL_WAIT"))
-                or (_is_bw and _doc_action == "EXIT")
+                (_doc_action in ("ROLL", "ROLL_WAIT", "ROLL_UP_OUT", "WRITE_NOW"))
+                or (_is_bw and _doc_action in ("EXIT", "EXIT_STOCK"))
                 or (_is_bw and not stock_legs.empty and '_drift' in dir() and _drift < -0.08)
             )
 
@@ -6502,14 +8025,14 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                         return None, False
 
                 with st.expander(
-                    ("🚪 Exit Path — Call Leg Disposition" if _doc_action == "EXIT" and _is_bw
+                    ("🚪 Exit Path — Call Leg Disposition" if _doc_action in ("EXIT", "EXIT_STOCK") and _is_bw
                      else "🗓️ Weekend Prep — Roll Scenarios" if not _is_market_open
                      else "📋 Roll Scenarios"),
-                    expanded=(not _is_market_open and _doc_action in ("EXIT", "ROLL"))
+                    expanded=(not _is_market_open and _doc_action in ("EXIT", "EXIT_STOCK", "ROLL", "ROLL_UP_OUT"))
                 ):
                     # EXIT override — show explicit decision framing before candidates
                     # so user doesn't interpret roll list as a recommendation.
-                    if _doc_action == "EXIT" and _is_bw:
+                    if _doc_action in ("EXIT", "EXIT_STOCK") and _is_bw:
                         st.error(
                             "**🔴 Doctrine Action: EXIT** — see Exit Winner Panel above for the "
                             "recommended path (accept assignment vs active exit). "
@@ -6587,7 +8110,7 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                 _rw_earn_str     = None
                                 _rw_cand1_dte    = None
                                 try:
-                                    _earn_raw = _doc_row.get("Earnings Date") if _doc_row is not None else None
+                                    _earn_raw = _doc_row.get("Earnings_Date") if _doc_row is not None else None
                                     if _earn_raw and str(_earn_raw) not in ("", "nan", "None", "N/A"):
                                         _ed = pd.to_datetime(str(_earn_raw), errors="coerce")
                                         if pd.notna(_ed):
@@ -6700,7 +8223,7 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                     # For EXIT on BUY_WRITE: the execution decision lives in the Exit Winner
                     # Panel (accept assignment vs active exit). The roll scaffold's execution
                     # banner is irrelevant — suppress it and redirect.
-                    if _doc_action == "EXIT" and _is_bw:
+                    if _doc_action in ("EXIT", "EXIT_STOCK") and _is_bw:
                         st.info(
                             "🏆 **Exit execution path resolved above** — see the Exit Winner Panel "
                             "for the specific directive (accept assignment vs active exit). "
@@ -6764,6 +8287,11 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                     f"**No credit roll found — Assignment is the better outcome.**  \n"
                                     f"{_nvr_rationale_safe}"
                                 )
+                            elif _nvr_verdict == "NO_VIABLE_RECOVERY_ROLL":
+                                st.warning(
+                                    f"**💰 Recovery Premium — no viable roll candidates in current chain.**  \n"
+                                    f"{_nvr_rationale_safe}"
+                                )
                             else:
                                 st.error(
                                     f"**🚨 No viable above-basis roll found in 45–150 DTE range.**  \n"
@@ -6796,6 +8324,8 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                     "WEEKLY":           " 🟡 *Weekly cycle (fragile position)*",
                                     "EMERGENCY":        " 🚨 *Emergency DTE search*",
                                     "BROKEN_RECOVERY":  " 🔴 *Broken recovery — 30–45 DTE (gamma reduction mode)*",
+                                    "BASIS_REDUCTION":  " 🔽 *Basis reduction — roll DOWN to tighter strike*",
+                                    "RECOVERY_PREMIUM": " 💰 *Recovery premium — max cycling for basis reduction*",
                                 }.get(_cand_mode, _pre_itm_tag)
 
                                 _cstrike  = cand.get("strike", "?")
@@ -6945,7 +8475,7 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                         _cand_cost_info = {}
                                 _cand_roll_type = _cand_cost_info.get("type", "")
                                 _winner_harvest_mode = _wm_rec_for_roll == "ROLL_DOWN" and _is_directional_long
-                                if _doc_action == "EXIT" and _is_bw:
+                                if _doc_action in ("EXIT", "EXIT_STOCK") and _is_bw:
                                     # EXIT on BUY_WRITE: candidates are reference-only, not a roll recommendation.
                                     # Winner Panel owns the execution decision — suppress Recommended badge.
                                     _rec_tag = " *(reference only — EXIT action)*" if i == 1 else ""
@@ -6984,12 +8514,30 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                 )
 
                                 # _stale_tag removed from header — shown as a caption instead
+                                # ── Edge classification badge ──────────────────────
+                                _edge_label = cand.get("primary_edge", "")
+                                _edge_summary = cand.get("edge_summary", "")
+                                _edge_badge = ""
+                                if _edge_label:
+                                    _edge_icons = {
+                                        "INCOME_EXTENSION": "🔄",
+                                        "STRIKE_IMPROVEMENT": "📈",
+                                        "RECOVERY_ROLL": "🔧",
+                                        "INCOME_CREDIT": "💰",
+                                        "DEFENSIVE_ROLL": "🛡️",
+                                        "ASSIGNMENT_PREFERABLE": "⛔",
+                                        "WEAK_LIQUIDITY": "⚠️",
+                                    }
+                                    _eicon = _edge_icons.get(_edge_label, "")
+                                    _edge_badge = f"  \n{_eicon} *{_edge_label.replace('_', ' ').title()}: {_edge_summary}*"
+
                                 st.markdown(
                                     f"**#{i}**{_rec_tag}{_roll_mode_tag}{_liq_warn}  \n"
                                     f"Strike **\\${_fmt_strike(_cstrike)}** · Exp **{_cexp}** ({_cdte}d) · "
                                     f"Mid **\\${_cmid:.2f}/share**{_yield_part} · "
                                     f"Δ {_cdelta:.2f} · Liq {_cliq}"
                                     + (f" · Spread {_cspread:.1f}%" if _cspread is not None else "")
+                                    + _edge_badge
                                 )
                                 # Staleness notice — separate from header so it reads as a warning, not a tag
                                 if _from_db:
@@ -7149,6 +8697,86 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                 if _cal_note:
                                     st.caption(_cal_note.strip(" |"))
 
+                                # ── Economics breakdown ─────────────────────────
+                                _econ = cand.get("economics")
+                                if isinstance(_econ, str):
+                                    try:
+                                        import json as _ej; _econ = _ej.loads(_econ)
+                                    except Exception:
+                                        _econ = None
+                                if _econ and isinstance(_econ, dict):
+                                    with st.expander("Economics Breakdown", expanded=False):
+                                        _ec = _econ
+                                        # Leg economics
+                                        _leg_parts = []
+                                        if _ec.get("net_credit_debit") is not None:
+                                            _nc = _ec["net_credit_debit"]
+                                            _ct = _ec.get("cost_type", "")
+                                            _nt = _ec.get("net_total", 0)
+                                            _leg_parts.append(
+                                                f"**Net {_ct}**: \\${abs(_nc):.2f}/share"
+                                                f" (\\${abs(_nt):,.0f} total, {_ec.get('contracts', 1)} contract{'s' if _ec.get('contracts', 1) != 1 else ''})"
+                                            )
+                                        if _ec.get("slippage_warning"):
+                                            _leg_parts.append("**Slippage risk**: wide spread or thin book — real fill may differ")
+                                        if _leg_parts:
+                                            st.markdown("**Leg Economics**  \n" + "  \n".join(_leg_parts))
+
+                                        # Strike change
+                                        _strike_parts = []
+                                        if _ec.get("strike_change") is not None and _ec["strike_change"] != 0:
+                                            _sc = _ec["strike_change"]
+                                            _scp = _ec.get("strike_change_pct", 0) or 0
+                                            _strike_parts.append(f"Strike change: **\\${_sc:+.2f}** ({_scp:+.1f}%)")
+                                        if _ec.get("basis_improvement_pct") is not None:
+                                            _bi = _ec["basis_improvement_pct"]
+                                            _bi_dir = "closer to" if _bi > 0 else "further from"
+                                            _strike_parts.append(f"Basis improvement: **{_bi:+.1f}%** ({_bi_dir} breakeven)")
+                                        if _ec.get("assignment_risk_change") and _ec["assignment_risk_change"] != "UNCHANGED":
+                                            _ar = _ec["assignment_risk_change"]
+                                            _ar_icon = "✅" if _ar == "IMPROVED" else "⚠️"
+                                            _strike_parts.append(f"Assignment risk: {_ar_icon} **{_ar}**")
+                                        if _ec.get("new_basis_after_roll") is not None:
+                                            st.markdown(f"New effective basis: **\\${_ec['new_basis_after_roll']:.2f}**")
+                                        if _strike_parts:
+                                            st.markdown("**Strike Change**  \n" + "  \n".join(_strike_parts))
+
+                                        # Time change
+                                        _time_parts = []
+                                        if _ec.get("dte_extension") is not None and _ec["dte_extension"] != 0:
+                                            _time_parts.append(f"DTE extension: **+{_ec['dte_extension']}d**")
+                                        if _ec.get("gamma_reduction_pct") is not None:
+                                            _time_parts.append(f"Gamma reduction: **{_ec['gamma_reduction_pct']:.0f}%** (from DTE extension)")
+                                        if _time_parts:
+                                            st.markdown("**Time Change**  \n" + "  \n".join(_time_parts))
+
+                                        # Score decomposition
+                                        _score_parts = []
+                                        for _sk, _sl in [
+                                            ("delta_score", "Delta"), ("yield_score", "Yield"),
+                                            ("dte_score", "DTE"), ("iv_score", "IV"),
+                                            ("liq_score", "Liquidity"),
+                                        ]:
+                                            _sv = _ec.get(_sk)
+                                            if _sv is not None:
+                                                _bar = "█" * int(_sv * 10) + "░" * (10 - int(_sv * 10))
+                                                _score_parts.append(f"`{_bar}` {_sl}: {_sv:.0%}")
+                                        if _ec.get("composite_score") is not None:
+                                            _score_parts.append(f"**Composite: {_ec['composite_score']:.0%}**")
+                                        # Penalties
+                                        _penalties = []
+                                        for _pk, _pl in [
+                                            ("earnings_mult", "Earnings"), ("dividend_mult", "Dividend"),
+                                            ("churn_mult", "Churn"),
+                                        ]:
+                                            _pv = _ec.get(_pk)
+                                            if _pv is not None and _pv < 1.0:
+                                                _penalties.append(f"{_pl}: {_pv:.0%}")
+                                        if _penalties:
+                                            _score_parts.append(f"Penalties: {', '.join(_penalties)}")
+                                        if _score_parts:
+                                            st.markdown("**Score Decomposition**  \n" + "  \n".join(_score_parts))
+
                                 # Full rationale — collapsible, not shown by default
                                 if _rationale and len(_rationale) > 40:
                                     with st.expander("Details", expanded=False):
@@ -7156,6 +8784,101 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
 
                             if not _any_shown:
                                 st.caption("Candidates stored but could not be parsed.")
+
+                            # ── Split suggestion (MC-ranked or rules-based) ─
+                            _opt_for_split = option_row_by_trade.get(tid)
+                            _mc_split_shown_ui = False
+
+                            # Try MC-ranked split paths first
+                            _mc_sp_raw_ui = (
+                                (_opt_for_split.get("MC_Split_Paths") if _opt_for_split is not None else None)
+                                or (_doc_row.get("MC_Split_Paths") if _doc_row is not None else None)
+                            )
+                            _mc_sp_verdict_ui = (
+                                (_opt_for_split.get("MC_Split_Verdict") if _opt_for_split is not None else None)
+                                or (_doc_row.get("MC_Split_Verdict") if _doc_row is not None else None)
+                            )
+                            if _mc_sp_raw_ui and str(_mc_sp_raw_ui).strip() not in ("", "nan", "None", "[]", "SKIP"):
+                                try:
+                                    import json as _jss_mc
+                                    _mc_sp_list_ui = _jss_mc.loads(str(_mc_sp_raw_ui)) if isinstance(_mc_sp_raw_ui, str) else _mc_sp_raw_ui
+                                    if isinstance(_mc_sp_list_ui, list) and len(_mc_sp_list_ui) > 0:
+                                        _mc_v_ui = str(_mc_sp_verdict_ui or "").upper()
+                                        _v_icons = {"SPLIT_BETTER": "✂️", "ALL_IN_BETTER": "🎯", "MARGINAL": "⚖️"}
+                                        _v_labels = {"SPLIT_BETTER": "Split preferred", "ALL_IN_BETTER": "All-in preferred", "MARGINAL": "Marginal difference"}
+                                        _v_icon = _v_icons.get(_mc_v_ui, "📊")
+                                        _v_label = _v_labels.get(_mc_v_ui, _mc_v_ui)
+
+                                        _mc_lines = [f"{_v_icon} **MC Split Analysis** — {_v_label}"]
+                                        for _pi, _sp in enumerate(_mc_sp_list_ui[:4]):
+                                            _star = "**★**" if _pi == 0 else "  "
+                                            _sp_lbl = str(_sp.get("type", "")).replace("_", " ").title()
+                                            _sp_ev = _sp.get("ev", 0)
+                                            _sp_pp = _sp.get("p_profit", 0)
+                                            _sp_cvar = _sp.get("cvar_5", 0)
+                                            _sp_lbl_detail = _sp.get("label", _sp_lbl)
+                                            _mc_lines.append(
+                                                f"{_star} {_sp_lbl_detail}: "
+                                                f"EV \\${_sp_ev:+,.0f} · "
+                                                f"P(profit) {_sp_pp:.0%} · "
+                                                f"CVaR \\${_sp_cvar:+,.0f}"
+                                            )
+                                        st.info("  \n".join(_mc_lines))
+                                        _mc_split_shown_ui = True
+                                except Exception:
+                                    pass
+
+                            # Fallback: rules-based split suggestion
+                            if not _mc_split_shown_ui:
+                                _split_raw = (
+                                    (_opt_for_split.get("Roll_Split_Suggestion") if _opt_for_split is not None else None)
+                                    or (_doc_row.get("Roll_Split_Suggestion") if _doc_row is not None else None)
+                                )
+                                _split = None
+                                if _split_raw and str(_split_raw).strip() not in ("", "nan", "None"):
+                                    try:
+                                        import json as _jss
+                                        _split = _jss.loads(str(_split_raw)) if isinstance(_split_raw, str) else _split_raw
+                                        if not isinstance(_split, dict) or not _split.get("type"):
+                                            _split = None
+                                    except Exception:
+                                        _split = None
+
+                                # On-the-fly fallback from parsed candidates
+                                if _split is None and _all_cands:
+                                    try:
+                                        from core.management.cycle3.roll.roll_candidate_engine import _compute_split_suggestion
+                                        _opt_qty_raw = opt_legs["Quantity"].iloc[0] if not opt_legs.empty else 1
+                                        _opt_qty = abs(int(float(_opt_qty_raw or 1)))
+                                        _strat_key = str(entry_structure or "").upper()
+                                        _nc_basis = float(card_metrics.get("gap", 0) or 0)
+                                        _ul_p = float(stock_legs.iloc[0].get("UL Last", 0)) if not stock_legs.empty else 0
+                                        _split = _compute_split_suggestion(
+                                            [c for _, c, _ in _all_cands],
+                                            _opt_qty, _strat_key,
+                                            net_cost_basis=_nc_basis,
+                                            ul_price=_ul_p,
+                                        )
+                                    except Exception:
+                                        _split = None
+
+                                if _split and isinstance(_split, dict) and _split.get("type"):
+                                    _sp_type = _split["type"]
+                                    _sp_rationale = str(_split.get("rationale", "")).replace("$", "\\$")
+                                    _sp_icons = {
+                                        "ROLL_PARTIAL_HOLD": "⚖️",
+                                        "SPLIT_DEBIT_EXPOSURE": "🛡️",
+                                        "STAGGER_EXPIRY": "📅",
+                                        "SPLIT_STRIKE": "🎯",
+                                        "PARTIAL_CLOSE_PARTIAL_ROLL": "✂️",
+                                    }
+                                    _sp_icon = _sp_icons.get(_sp_type, "📊")
+                                    _sp_label = _sp_type.replace("_", " ").title()
+                                    st.info(
+                                        f"{_sp_icon} **Split Suggestion: {_sp_label}**  \n"
+                                        f"{_sp_rationale}"
+                                    )
+
                     else:
                         # No pre-fetched candidates
                         if _doc_action == "ROLL_WAIT":
@@ -7335,10 +9058,12 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                     # Three context-sensitive MC panels, each shown only when relevant.
                     # All data comes from positions_latest.csv (populated by run_all.py).
 
-                    # Panel A: Roll Wait-Cost (ROLL / STAGE_AND_RECHECK rows)
-                    if _doc_row is not None and _doc_action in ("ROLL", "ROLL_WAIT") or _final_er == "STAGE_AND_RECHECK":
-                        _mc_w_verdict = str(_doc_row.get("MC_Wait_Verdict", "") or "") if _doc_row is not None else ""
-                        _mc_w_note    = str(_doc_row.get("MC_Wait_Note",    "") or "") if _doc_row is not None else ""
+                    # Panel A: Roll Wait-Cost (ROLL / WRITE / STAGE_AND_RECHECK rows)
+                    if (_doc_row is not None and _doc_action in ("ROLL", "ROLL_WAIT", "ROLL_UP_OUT", "WRITE_NOW")) or _final_er == "STAGE_AND_RECHECK":
+                        _raw_mc_v = _doc_row.get("MC_Wait_Verdict", "") if _doc_row is not None else ""
+                        _mc_w_verdict = str(_raw_mc_v).strip() if (pd.notna(_raw_mc_v) and str(_raw_mc_v).strip() not in ("", "nan", "None")) else ""
+                        _raw_mc_n = _doc_row.get("MC_Wait_Note", "") if _doc_row is not None else ""
+                        _mc_w_note = str(_raw_mc_n).strip() if (pd.notna(_raw_mc_n) and str(_raw_mc_n).strip() not in ("", "nan", "None")) else ""
                         _mc_w_p_imp   = _doc_row.get("MC_Wait_P_Improve") if _doc_row is not None else None
                         _mc_w_p_brch  = _doc_row.get("MC_Wait_P_Assign")  if _doc_row is not None else None
                         _mc_w_cr_dlt  = _doc_row.get("MC_Wait_Credit_Delta") if _doc_row is not None else None
@@ -7552,7 +9277,7 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                     st.caption(f"🎲 MC wait-cost: {_mc_w_note}")
 
                     # Panel B: Exit vs Hold (HOLD rows)
-                    if _doc_row is not None and _doc_action in ("HOLD", "HOLD_FOR_REVERSION", "REVALIDATE"):
+                    if _doc_row is not None and _doc_action in ("HOLD", "HOLD_FOR_REVERSION", "HOLD_WITH_CAUTION", "HOLD_STOCK_WAIT", "PAUSE_WRITING", "REVIEW"):
                         _mc_h_verdict = str(_doc_row.get("MC_Hold_Verdict",    "") or "") if _doc_row is not None else ""
                         _mc_h_p_rec   = _doc_row.get("MC_Hold_P_Recovery") if _doc_row is not None else None
                         _mc_h_p_ml    = _doc_row.get("MC_Hold_P_MaxLoss")  if _doc_row is not None else None
@@ -7561,7 +9286,10 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                         _mc_h_ev      = _doc_row.get("MC_Hold_EV")         if _doc_row is not None else None
                         _mc_h_note    = str(_doc_row.get("MC_Hold_Note",   "") or "") if _doc_row is not None else ""
 
-                        if _mc_h_verdict and _mc_h_verdict not in ("", "SKIP"):
+                        if _mc_h_verdict and _mc_h_verdict == "SKIP":
+                            _skip_reason = _mc_h_note.split(": ", 1)[1] if _mc_h_note and ": " in _mc_h_note else "missing strike, DTE, or spot price"
+                            st.caption(f"🎲 MC Exit vs Hold — ⏭️ skipped ({_skip_reason})")
+                        elif _mc_h_verdict and _mc_h_verdict not in ("", "SKIP"):
                             _h_icon = {"HOLD_JUSTIFIED": "🟢", "EXIT_NOW": "🔴", "MONITOR": "🟡"}.get(_mc_h_verdict, "⚪")
                             with st.expander(f"🎲 MC Exit vs Hold — {_h_icon} {_mc_h_verdict}", expanded=(_mc_h_verdict == "EXIT_NOW")):
                                 try:
@@ -7634,7 +9362,10 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                     # MC_Assign_Urgency arrives as float NaN → str() gives "nan" which is truthy —
                     # must explicitly exclude "nan" alongside "" and "SKIP".
                     _valid_assign_urgencies = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
-                    if _mc_a_urgency in _valid_assign_urgencies and not _is_directional_long:
+                    if _mc_a_urgency == "SKIP" and not _is_directional_long:
+                        _skip_a_reason = _mc_a_note.split(": ", 1)[1] if _mc_a_note and ": " in _mc_a_note else "missing strike, DTE, or spot price"
+                        st.caption(f"🎲 MC Assignment Risk — ⏭️ skipped ({_skip_a_reason})")
+                    elif _mc_a_urgency in _valid_assign_urgencies and not _is_directional_long:
                         _card_metrics["mc_assign"] = {
                             "urgency": _mc_a_urgency,
                             "p_assign": f"{float(_mc_a_p_exp):.0%}" if _mc_a_p_exp and str(_mc_a_p_exp) not in ("nan","None","") else "—",
@@ -8082,6 +9813,11 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
                                     "Re-run the management engine to evaluate this position."
                                 )
 
+                    # ── Research Context (if available) ──────────────────
+                    _rt = _card_metrics.get("research_text")
+                    if _rt:
+                        st.caption(f"📚 {_rt}")
+
                     if _doc_action == "ROLL_WAIT":
                         st.markdown(
                             "**Pre-Execution Checklist** *(ROLL structurally indicated — "
@@ -8126,9 +9862,48 @@ def _render_position_cards(df: pd.DataFrame, show_stocks: bool, doctrine_df: pd.
             _copy_text = _build_copy_text(
                 header, _doc_row, group, stock_legs, opt_legs,
                 entry_structure, _card_metrics,
+                db_path=db_path, trade_id=tid, ticker=ticker,
             )
             with _copy_placeholder.expander("📋 Copy Card", expanded=False):
                 st.code(_copy_text, language=None)
+
+    # ── Write-Off Positions (collapsed) ──────────────────────────────────
+    if _writeoff_tids:
+        with st.expander(
+            f"📦 Write-Off Positions ({len(_writeoff_tids)})",
+            expanded=False,
+        ):
+            st.caption(
+                "Micro-positions below $100 market value. Parked — no doctrine evaluation. "
+                "Close manually when convenient to reduce portfolio noise."
+            )
+            _wo_rows = []
+            for _wo_tid in _writeoff_tids:
+                _wo_grp = df[df["TradeID"] == _wo_tid]
+                if _wo_grp.empty:
+                    continue
+                _wo_tkr = _wo_grp["Underlying_Ticker"].iloc[0]
+                _wo_sym = _wo_grp["Symbol"].iloc[0] if "Symbol" in _wo_grp.columns else _wo_tkr
+                _wo_qty = _wo_grp["Quantity"].iloc[0] if "Quantity" in _wo_grp.columns else 0
+                _wo_last = _wo_grp["Last"].iloc[0] if "Last" in _wo_grp.columns else 0
+                _wo_at = str(_wo_grp["AssetType"].iloc[0]) if "AssetType" in _wo_grp.columns else ""
+                _wo_mult = 100 if _wo_at in ("OPTION", "CALL", "PUT") else 1
+                _wo_mval = abs(float(_wo_qty or 0)) * float(_wo_last or 0) * _wo_mult
+                _wo_gl = _best_gl_for_group(_wo_grp)
+                _wo_rows.append({
+                    "Ticker": _wo_tkr,
+                    "Symbol": _wo_sym,
+                    "Qty": _wo_qty,
+                    "Last": f"${float(_wo_last or 0):,.2f}",
+                    "Mkt Value": f"${_wo_mval:,.0f}",
+                    "G/L": f"${_wo_gl:+,.0f}" if pd.notna(_wo_gl) else "—",
+                })
+            if _wo_rows:
+                st.dataframe(
+                    pd.DataFrame(_wo_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8305,13 +10080,15 @@ def _render_portfolio_optimization(df: pd.DataFrame, doctrine_df: pd.DataFrame |
         if misaligned:
             _changes.append("🔴 removes misaligned position")
 
-        _action_badge = {
-            "EXIT":         "🔴 EXIT",
-            "ROLL":         "🟡 ROLL",
-            "ROLL_WAIT":    "⏸ ROLL_WAIT",
-            "HOLD":         "🟢 HOLD",
-            "TRIM":         "⚠️ TRIM",
-        }.get(action, action or "—")
+        _liq_action_disp = ACTION_DISPLAY.get(action, action)
+        _liq_emoji_map = {
+            "EXIT": "🔴", "ROLL": "🟡", "HOLD": "🟢", "TRIM": "⚠️",
+            "BUYBACK": "🔵", "REVIEW": "🔄", "LET_EXPIRE": "🟣",
+            "ACCEPT_CALL_AWAY": "🟣", "ACCEPT_SHARE_ASSIGNMENT": "🟣",
+            "SCALE_UP": "⬆️",
+        }
+        _liq_emoji = _liq_emoji_map.get(action, ACTION_BADGE.get(action, ("⚪",))[0])
+        _action_badge = f"{_liq_emoji} {_liq_action_disp}"
 
         liq_rows.append({
             "Score":        improvement_score,
@@ -8548,22 +10325,23 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
         st.info("No position data available.")
         return
 
-    # Tickers that have a short call leg (Strategy = BUY_WRITE or COVERED_CALL, or
-    # Call/Put = C with negative quantity) — these are the only ones that cover the stock.
-    _call_covered_tickers: set = set()
+    # Trade-level idle detection: a STOCK row is idle when its own TradeID
+    # has no OPTION legs (short call).  This correctly handles partial coverage —
+    # e.g. EOSE with 900 shares in BUY_WRITE (covered) + 1100 shares in STOCK_ONLY (idle).
+    _trades_with_short_call: set = set()
     _opt_rows = df[df["AssetType"] == "OPTION"]
     for _, _or in _opt_rows.iterrows():
         _strat   = str(_or.get("Strategy") or "").upper()
         _cp      = str(_or.get("Call/Put") or "").upper()
         _qty     = float(_or.get("Quantity") or 0)
-        _ul      = str(_or.get("Underlying_Ticker") or "")
+        _tid_opt = str(_or.get("TradeID") or "")
         # Short call: BUY_WRITE/COVERED_CALL strategy OR explicit call with negative qty
         if _strat in ("BUY_WRITE", "COVERED_CALL") or (_cp in ("C", "CALL") and _qty < 0):
-            _call_covered_tickers.add(_ul)
+            _trades_with_short_call.add(_tid_opt)
 
     idle_df = df[
         (df["AssetType"] == "STOCK") &
-        ~df["Underlying_Ticker"].isin(_call_covered_tickers)
+        ~df["TradeID"].isin(_trades_with_short_call)
     ].copy()
 
     if idle_df.empty:
@@ -8592,23 +10370,60 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
     cc_eligible_df = idle_df[idle_df["_quantity_f"] >= 100].copy()
     sub_contract_df = idle_df[idle_df["_quantity_f"] < 100].copy()
 
-    # Build doctrine lookup
+    # Build doctrine lookup — keyed by (ticker, account) to support same ticker
+    # across multiple accounts (e.g. UUUU in ROTH vs Individual).
+    # Fallback: ticker-only key for positions without account match.
+    _doctrine_by_ticker_acct = {}
     doctrine_by_ticker = {}
+    # Also build a stock-only thesis lookup — prevents LEAPS_CALL thesis bleeding into idle stock
+    _thesis_by_ticker_stock_only = {}
     if doctrine_df is not None and not doctrine_df.empty and "Underlying_Ticker" in doctrine_df.columns:
         for _, drow in doctrine_df.iterrows():
             t = str(drow.get("Underlying_Ticker", "") or "")
             if not t:
                 continue
+            acct = str(drow.get("Account", "") or "").strip()
+            ta_key = (t, acct) if acct else None
+
             # Prefer STOCK rows over OPTION rows for CC columns.
             # The CC engine only writes CC_Proposal_* onto stock rows; an OPTION row
             # winning first-match means CC_Proposal_Status = NaN even when the stock row
             # has a valid verdict.
+
+            # Per-(ticker, account) lookup — precise match
+            if ta_key:
+                existing_ta = _doctrine_by_ticker_acct.get(ta_key)
+                if existing_ta is None:
+                    _doctrine_by_ticker_acct[ta_key] = drow.to_dict()
+                elif str(existing_ta.get("AssetType", "")) == "OPTION" and str(drow.get("AssetType", "")) == "STOCK":
+                    _doctrine_by_ticker_acct[ta_key] = drow.to_dict()
+                elif (str(existing_ta.get("AssetType", "")) == "STOCK"
+                      and str(drow.get("AssetType", "")) == "STOCK"
+                      and str(existing_ta.get("CC_Proposal_Status", "")) in ("nan", "None", "", "NaN")
+                      and str(drow.get("CC_Proposal_Status", "")) not in ("nan", "None", "", "NaN")):
+                    # Among STOCK rows, prefer the one with CC engine data.
+                    # NaN is truthy in Python — must compare via str().
+                    _doctrine_by_ticker_acct[ta_key] = drow.to_dict()
+
+            # Ticker-only fallback (legacy)
             existing = doctrine_by_ticker.get(t)
             if existing is None:
                 doctrine_by_ticker[t] = drow.to_dict()
             elif str(existing.get("AssetType", "")) == "OPTION" and str(drow.get("AssetType", "")) == "STOCK":
                 # Upgrade to the STOCK row — it carries the CC proposal columns
                 doctrine_by_ticker[t] = drow.to_dict()
+            elif (str(existing.get("AssetType", "")) == "STOCK"
+                  and str(drow.get("AssetType", "")) == "STOCK"
+                  and str(existing.get("CC_Proposal_Status", "")) in ("nan", "None", "", "NaN")
+                  and str(drow.get("CC_Proposal_Status", "")) not in ("nan", "None", "", "NaN")):
+                doctrine_by_ticker[t] = drow.to_dict()
+            # Stock-only thesis: only store thesis from STOCK-based strategies
+            _d_strat = str(drow.get("Strategy", "") or "").upper()
+            _d_at = str(drow.get("AssetType", "") or "").upper()
+            if _d_at == "STOCK" or _d_strat in ("BUY_WRITE", "COVERED_CALL", "STOCK_ONLY"):
+                _existing_thesis = _thesis_by_ticker_stock_only.get(t)
+                if _existing_thesis is None:
+                    _thesis_by_ticker_stock_only[t] = str(drow.get("Thesis_State", "") or "")
 
     # Summary header
     total_gl = pd.to_numeric(idle_df["$ Total G/L"], errors="coerce").sum()
@@ -8633,18 +10448,29 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
     )
     st.divider()
 
-    # ── Sub-contract holdings section (collapsed by default — low actionability) ──
+    # ── Sub-contract holdings section ──────────────────────────────────────────
+    # Now shows BW upgrade feasibility analysis from doctrine.
     if not sub_contract_df.empty:
         _sub_gl = pd.to_numeric(sub_contract_df["$ Total G/L"], errors="coerce").sum()
         _sub_icon = "🔴" if _sub_gl < 0 else "🟢"
+
+        # Count BW upgrade candidates
+        _n_bw_candidates = 0
+        for _, _sr in sub_contract_df.iterrows():
+            _sr_ticker = str(_sr.get("Underlying_Ticker", ""))
+            _sr_acct = str(_sr.get("Account", "") or "").strip()
+            _sr_doc = _doctrine_by_ticker_acct.get((_sr_ticker, _sr_acct)) or doctrine_by_ticker.get(_sr_ticker)
+            if _sr_doc and _sr_doc.get("BW_Upgrade_Feasible"):
+                _n_bw_candidates += 1
+
+        _bw_label = f" · **{_n_bw_candidates} BW candidates**" if _n_bw_candidates > 0 else ""
         with st.expander(
-            f"🔹 Sub-Contract Holdings — {n_sub} positions · {_sub_icon} ${_sub_gl:+,.0f} "
-            f"(< 100 shares — CC not available)",
-            expanded=False,
+            f"🔹 Sub-Contract Holdings — {n_sub} positions · {_sub_icon} ${_sub_gl:+,.0f}{_bw_label}",
+            expanded=_n_bw_candidates > 0,
         ):
             st.caption(
-                "These positions do not have enough shares for a standard options contract (100 shares minimum). "
-                "Covered calls are **not available**. Decision: **hold or exit?**"
+                "These positions have < 100 shares. Buy-write upgrade: buy remaining "
+                "shares to 100, then sell covered calls for income. Higher risk — adding capital."
             )
             for _, row in sub_contract_df.sort_values("$ Total G/L").iterrows():
                 ticker     = str(row.get("Underlying_Ticker", "?"))
@@ -8656,22 +10482,57 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
                 drift_str  = f"{drift:+.1%}" if basis_ps else "—"
                 gl_icon    = "🔴" if total_gl_p < 0 else "🟢"
 
-                st.markdown(
-                    f"{gl_icon} **{ticker}** — {quantity:.0f} shares · {drift_str} · ${total_gl_p:+,.0f}"
+                # Look up doctrine for BW upgrade assessment
+                _sub_acct = str(row.get("Account", "") or "").strip()
+                _sub_doc = (
+                    _doctrine_by_ticker_acct.get((ticker, _sub_acct))
+                    or doctrine_by_ticker.get(ticker)
                 )
+                _bw_feasible = _sub_doc.get("BW_Upgrade_Feasible") if _sub_doc else None
+                _bw_needed = _sub_doc.get("BW_Upgrade_Shares_Needed", 0) if _sub_doc else 0
+                _bw_cost = _sub_doc.get("BW_Upgrade_Cost", 0) if _sub_doc else 0
+                _bw_monthly = _sub_doc.get("BW_Upgrade_Expected_Monthly", 0) if _sub_doc else 0
+                _bw_payback = _sub_doc.get("BW_Upgrade_Payback_Months", 0) if _sub_doc else 0
+                _bw_reason = _sub_doc.get("BW_Upgrade_Reason", "") if _sub_doc else ""
+
+                if _bw_feasible:
+                    st.markdown(
+                        f"🟢 **{ticker}** — {quantity:.0f} shares · {drift_str} · ${total_gl_p:+,.0f}"
+                        f"  **BW CANDIDATE**"
+                    )
+                else:
+                    st.markdown(
+                        f"{gl_icon} **{ticker}** — {quantity:.0f} shares · {drift_str} · ${total_gl_p:+,.0f}"
+                    )
+
                 sc1, sc2, sc3, sc4 = st.columns(4)
                 sc1.metric("Last", f"${last:.2f}")
                 sc2.metric("Basis/Share", f"${basis_ps:.2f}" if basis_ps else "—")
                 sc3.metric("Shares", f"{quantity:.0f}")
                 sc4.metric("Unrealized P&L", f"${total_gl_p:+,.0f}")
 
+                # BW upgrade analysis
+                if _bw_feasible:
+                    bc1, bc2, bc3, bc4 = st.columns(4)
+                    bc1.metric("Buy", f"{_bw_needed} shares")
+                    bc2.metric("Cost", f"${_bw_cost:,.0f}")
+                    bc3.metric("Est. Monthly", f"${_bw_monthly:,.0f}")
+                    bc4.metric("Payback", f"~{_bw_payback:.0f} mo")
+                    st.success(
+                        f"BW upgrade feasible: buy {_bw_needed} more shares "
+                        f"(${_bw_cost:,.0f}) → sell covered calls for "
+                        f"~${_bw_monthly:,.0f}/mo. Payback ~{_bw_payback:.0f} months."
+                    )
+                elif _bw_feasible is False and _bw_reason:
+                    st.warning(f"BW not feasible: {_bw_reason}")
+
                 thesis = str(
                     row.get("Thesis_State")
-                    or doctrine_by_ticker.get(ticker, {}).get("Thesis_State", "UNKNOWN")
+                    or _thesis_by_ticker_stock_only.get(ticker, "UNKNOWN")
                     or "UNKNOWN"
                 ).upper()
                 if thesis in ("DEGRADED", "BROKEN"):
-                    st.error(f"⚠️ Thesis: {thesis} — strong case for exiting this fractional position.")
+                    st.error(f"Thesis: {thesis} — strong case for exiting this position.")
                 st.divider()
 
     if cc_eligible_df.empty:
@@ -8689,7 +10550,7 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
             if basis is None or (isinstance(basis, float) and _np.isnan(basis)) or basis == 0:
                 return "UNKNOWN", 0.0
             drift = (last - basis) / basis
-            thesis = str(doctrine_by_ticker.get(str(row.get("Underlying_Ticker", "")), {}).get("Thesis_State", "INTACT") or "INTACT").upper()
+            thesis = str(row.get("Thesis_State") or _thesis_by_ticker_stock_only.get(str(row.get("Underlying_Ticker", "")), "INTACT") or "INTACT").upper()
             if drift < -0.35 or thesis in ("DEGRADED", "BROKEN"):
                 return "CRITICAL", drift
             elif drift < -0.10:
@@ -8715,6 +10576,7 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
 
     for _, row in cc_eligible_df.iterrows():
         ticker      = str(row.get("Underlying_Ticker", "?"))
+        _account_str = str(row.get("Account") or "").strip()
         last        = float(row.get("Last") or 0)
         basis_ps    = row.get("_basis_per_share")
         quantity    = float(row.get("_quantity_f") or row.get("Quantity") or 0)
@@ -8726,13 +10588,12 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
         iv_30d      = float(row.get("IV_30D") or 0) if str(row.get("IV_30D","")) not in ("nan","None","") else 0.0
         iv_surface  = str(row.get("iv_surface_shape") or "")
         hv_pct      = float(row.get("hv_20d_percentile") or 0) if str(row.get("hv_20d_percentile","")) not in ("nan","None","") else 0.0
-        thesis      = str(row.get("Thesis_State") or doctrine_by_ticker.get(ticker, {}).get("Thesis_State", "UNKNOWN") or "UNKNOWN").upper()
-        doc_row     = doctrine_by_ticker.get(ticker, {})
+        thesis      = str(row.get("Thesis_State") or _thesis_by_ticker_stock_only.get(ticker, "UNKNOWN") or "UNKNOWN").upper()
+        doc_row     = _doctrine_by_ticker_acct.get((ticker, _account_str)) or doctrine_by_ticker.get(ticker, {})
 
         _triage_icon = {"CRITICAL": "🔴", "RECOVERY": "🟠", "HEALTHY": "🟢", "UNKNOWN": "⚪"}.get(triage, "⚪")
         import math as _math
         _drift_str   = f"{drift:+.1%}" if drift != 0 and not _math.isnan(drift) else "—"
-        _account_str = str(row.get("Account") or "").strip()
         _acct_label  = f" · {_account_str}" if _account_str else ""
 
         # CC Recovery badge from engine
@@ -8800,23 +10661,35 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
             # If this stock has active option legs (CSP, long options, etc.),
             # surface their doctrine action — the stock decision is subordinate to
             # resolving the option-side first.
-            _paired_legs = _option_legs_by_ticker.get(ticker, [])
-            if _paired_legs:
-                for _leg in _paired_legs:
+            # Distinguish truly paired options (same TradeID) from independent positions
+            _stock_tid = str(row.get("TradeID") or "")
+            _related_legs = _option_legs_by_ticker.get(ticker, [])
+            if _related_legs:
+                for _leg in _related_legs:
                     _leg_sym    = str(_leg.get("Symbol") or _leg.get("Ticker") or "")
                     _leg_strat  = str(_leg.get("Strategy") or "")
                     _leg_action = str(_leg.get("Action") or "")
                     _leg_urg    = str(_leg.get("Urgency") or "")
                     _leg_rat    = str(_leg.get("Rationale") or "")[:120]
+                    _leg_tid    = str(_leg.get("TradeID") or "")
+                    _is_paired  = _stock_tid and _leg_tid and _stock_tid == _leg_tid
+
                     if _leg_action in ("EXIT", "ROLL"):
                         _urg_icon = "🔴" if _leg_urg == "HIGH" else "🟠"
-                        st.error(
-                            f"{_urg_icon} **Active option leg requires action first:** "
-                            f"{_leg_sym} ({_leg_strat}) → **{_leg_action} {_leg_urg}**  \n"
-                            f"{_leg_rat}  \n"
-                            "Resolve the option position before making stock-level decisions."
-                        )
-                    elif _leg_action == "HOLD":
+                        if _is_paired:
+                            st.error(
+                                f"{_urg_icon} **Paired option leg requires action first:** "
+                                f"{_leg_sym} ({_leg_strat}) → **{_leg_action} {_leg_urg}**  \n"
+                                f"{_leg_rat}  \n"
+                                "Resolve the option position before making stock-level decisions."
+                            )
+                        else:
+                            st.warning(
+                                f"{_urg_icon} **Related position on same underlying:** "
+                                f"{_leg_sym} ({_leg_strat}) → **{_leg_action} {_leg_urg}**  \n"
+                                f"Independent trade — not paired with this stock position."
+                            )
+                    elif _leg_action == "HOLD" and _is_paired:
                         st.info(
                             f"ℹ️ **Paired option leg:** {_leg_sym} ({_leg_strat}) → HOLD.  \n"
                             "Stock shares are paired with an active option position."
@@ -8835,7 +10708,8 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
                            help=f"{'70%' if triage == 'CRITICAL' else '80%'} of cost basis — McMillan structural stop")
                 rp2.metric("Stop Cushion", f"${_cushion:.2f}" if _cushion > 0 else "❌ BREACHED",
                            delta_color="normal" if _cushion > 0 else "inverse")
-                rp3.metric("Gap to Breakeven", f"${_gap:.2f}/sh" if _gap > 0 else "✅ Above basis")
+                rp3.metric("Gross Gap (pre-premium)", f"${_gap:.2f}/sh" if _gap > 0 else "✅ Above basis",
+                           help="Raw cost basis − spot, before crediting collected premium")
                 rp4.metric("Total Gap", f"${_gap * quantity:,.0f}" if _gap > 0 else "—")
 
                 # Pre-resolve CC status for recovery suppression
@@ -8948,6 +10822,124 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
                     elif _months:
                         st.caption(f"Feasible: ~{_months} months of rolling at \\${_monthly_est:.2f}/sh/month can close the \\${_gap:.2f} gap — if stock stabilizes.")
 
+            # ── Unified Recovery Plan (cross-position) ──────────────────
+            # Surfaces the coordinated recovery across BUY_WRITE + idle
+            # shares. Shows existing coverage, proposed ladder, and combined
+            # timeline so the user sees ONE plan, not two independent views.
+            _iu_idle_tab = doc_row.get("Recovery_Idle_Shares")
+            _iu_base_tab = doc_row.get("Recovery_Months_Baseline")
+            _iu_idle_v = float(_iu_idle_tab) if (_iu_idle_tab is not None and str(_iu_idle_tab) not in ("nan", "None", "")) else 0
+            _iu_base_v = float(_iu_base_tab) if (_iu_base_tab is not None and str(_iu_base_tab) not in ("nan", "None", "")) else 0
+            if _iu_idle_v >= 100 and _iu_base_v > 0:
+                _iu_full_v = float(doc_row.get("Recovery_Months_Full") or 0) if str(doc_row.get("Recovery_Months_Full", "")) not in ("nan", "None", "") else 0
+                _iu_inc_b = float(doc_row.get("Recovery_Income_Baseline_Mo") or 0) if str(doc_row.get("Recovery_Income_Baseline_Mo", "")) not in ("nan", "None", "") else 0
+                _iu_inc_f = float(doc_row.get("Recovery_Income_Full_Mo") or 0) if str(doc_row.get("Recovery_Income_Full_Mo", "")) not in ("nan", "None", "") else 0
+                _iu_rec_v = doc_row.get("Recovery_Cover_Idle_Recommended")
+                _iu_rec_bool = bool(_iu_rec_v) if (_iu_rec_v is not None and str(_iu_rec_v) not in ("nan", "None", "False", "0")) else False
+                _iu_mc_v = str(doc_row.get("MC_Recovery_Verdict") or "")
+                _iu_mc_d = float(doc_row.get("MC_Recovery_EV_Delta") or 0) if str(doc_row.get("MC_Recovery_EV_Delta", "")) not in ("nan", "None", "") else 0
+                _iu_mc_pc = float(doc_row.get("MC_Recovery_P_Recover_Current") or 0) if str(doc_row.get("MC_Recovery_P_Recover_Current", "")) not in ("nan", "None", "") else 0
+                _iu_mc_pf = float(doc_row.get("MC_Recovery_P_Recover_Full") or 0) if str(doc_row.get("MC_Recovery_P_Recover_Full", "")) not in ("nan", "None", "") else 0
+                _iu_total_v = float(doc_row.get("Recovery_Total_Shares") or 0) if str(doc_row.get("Recovery_Total_Shares", "")) not in ("nan", "None", "") else 0
+                _iu_cov_v = float(doc_row.get("Recovery_Covered_Shares") or 0) if str(doc_row.get("Recovery_Covered_Shares", "")) not in ("nan", "None", "") else 0
+                _iu_dm = int(_iu_base_v - _iu_full_v) if _iu_base_v < 999 and _iu_full_v > 0 else 0
+
+                # Find existing short call coverage for this ticker
+                _existing_calls = []
+                for _leg in _related_legs:
+                    _lcp = str(_leg.get("Call/Put") or "").upper()
+                    _lqty = float(_leg.get("Quantity") or 0)
+                    _lstrat = str(_leg.get("Strategy") or "").upper()
+                    if (_lstrat in ("BUY_WRITE", "COVERED_CALL") or (_lcp in ("C", "CALL") and _lqty < 0)):
+                        _lstr = float(_leg.get("Strike") or 0)
+                        _lexp = str(_leg.get("Expiration") or "")
+                        _lcts = int(abs(_lqty))
+                        _existing_calls.append({"contracts": _lcts, "strike": _lstr, "exp": _lexp, "strategy": _lstrat})
+                _existing_contracts = sum(c["contracts"] for c in _existing_calls)
+                _existing_shares = _existing_contracts * 100
+
+                # Ladder proposed contracts
+                _ldr_cov = int(float(doc_row.get("CC_Ladder_Covered_Lots") or 0)) if str(doc_row.get("CC_Ladder_Covered_Lots", "")) not in ("nan", "None", "") else 0
+                _total_lots = int(_iu_total_v // 100)
+                _post_contracts = _existing_contracts + _ldr_cov
+                _post_shares = _post_contracts * 100
+                _uncov_lots = _total_lots - _post_contracts
+
+                st.divider()
+                st.markdown(f"**📦 Unified Recovery Plan** — {ticker}")
+
+                # Existing coverage context
+                if _existing_calls:
+                    _ex_parts = []
+                    for _ec in _existing_calls:
+                        _ex_parts.append(f"{_ec['contracts']}x ${_ec['strike']:.0f} {_ec['exp'][:10]} ({_ec['strategy']})")
+                    st.caption(
+                        f"**Existing coverage:** {_existing_contracts} contracts on "
+                        f"{_existing_shares:,} shares — " + ", ".join(_ex_parts)
+                    )
+                    if _ldr_cov > 0:
+                        st.caption(
+                            f"**After ladder:** {_post_contracts}/{_total_lots} lots covered "
+                            f"({_post_shares:,}/{int(_iu_total_v):,} shares, "
+                            f"{_post_contracts/_total_lots*100:.0f}%) · "
+                            f"{_uncov_lots} lots uncovered (rally participation)"
+                        )
+                elif _ldr_cov > 0:
+                    st.caption(
+                        f"**No existing coverage.** Ladder proposes {_ldr_cov} contracts on "
+                        f"{_ldr_cov*100:,} of {int(_iu_idle_v):,} idle shares."
+                    )
+
+                # Unified timeline metrics
+                iu1, iu2, iu3 = st.columns(3)
+                iu1.metric(
+                    "Current (covered only)",
+                    f"~{int(_iu_base_v)} mo" if _iu_base_v < 999 else "inf",
+                    delta=f"${_iu_inc_b:,.0f}/mo · {int(_iu_cov_v):,} shares",
+                    delta_color="off",
+                )
+                iu2.metric(
+                    "Full Coverage",
+                    f"~{int(_iu_full_v)} mo" if _iu_full_v < 999 else "inf",
+                    delta=f"${_iu_inc_f:,.0f}/mo · {int(_iu_total_v):,} shares",
+                    delta_color="off",
+                )
+                iu3.metric(
+                    "Acceleration",
+                    f"-{abs(_iu_dm)} mo" if _iu_dm > 0 else "—",
+                    delta=f"{abs((_iu_dm/_iu_base_v)*100):.0f}% faster" if _iu_dm > 0 and _iu_base_v > 0 else None,
+                    delta_color="normal" if _iu_dm > 0 else "off",
+                )
+
+                # Verdict
+                if _iu_rec_bool:
+                    st.success(
+                        f"**COVER {int(_iu_idle_v):,} idle shares** — "
+                        f"saves ~{abs(_iu_dm)} months"
+                        + (f" · MC: {_iu_mc_v} (EV +${_iu_mc_d:,.0f})" if _iu_mc_v == "COVER_IDLE" else "")
+                    )
+                elif _iu_mc_v == "KEEP_IDLE":
+                    st.info(
+                        f"**KEEP {int(_iu_idle_v):,} shares idle** — "
+                        f"upside optionality beats premium (MC EV delta ${_iu_mc_d:+,.0f})"
+                    )
+                else:
+                    _iu_blk = []
+                    if str(doc_row.get("Recovery_IV_HV_OK", "")) in ("False", "0", "", "nan", "None"):
+                        _iu_blk.append("IV < 90% HV")
+                    if str(doc_row.get("Recovery_CC_Favorable", "")) in ("False", "0", "", "nan", "None"):
+                        _iu_blk.append("CC not FAVORABLE")
+                    st.warning(
+                        f"**{int(_iu_idle_v):,} idle shares — guardrails block**: "
+                        + (", ".join(_iu_blk) if _iu_blk else "conditions not met")
+                    )
+
+                if _iu_mc_v and _iu_mc_v not in ("", "SKIP"):
+                    st.caption(
+                        f"MC: P(recover) {_iu_mc_pc:.0%} current → {_iu_mc_pf:.0%} full · "
+                        f"EV delta ${_iu_mc_d:+,.0f}"
+                    )
+
             # ── CC Viability gate ──────────────────────────────────────────
             # Read doctrine engine verdict first — it has already run the 4-gate arbitration
             # (structural, vol-edge, directional, opportunity-cost). Use it to gate the
@@ -8988,14 +10980,31 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
                     "Uncovered lots preserve rally participation. See ladder plan below."
                 )
             elif triage == "RECOVERY" and last and _basis_ps_valid:
-                _min_cc_price = last * 1.10   # strike must be ≥10% OTM
-                _cc_verdict_str = (
-                    f"Conditional: write calls only at strike ≥ **\\${_min_cc_price:.2f}** "
-                    f"(10% OTM from \\${last:.2f}). "
-                    "At this level you collect premium without capping the recovery path. "
-                    "If no viable strike exists at 10% OTM in the near-term chain, wait."
-                )
-                st.warning(f"🟡 {_cc_verdict_str}")
+                _cc_verdict_raw = str(_cc_verdict or "")
+                if "WRITE_CALL_CONSTRAINED" in _cc_verdict_raw:
+                    _cstr_floor = last * 1.15
+                    st.warning(
+                        f"🟡 **HIGH-HV RECOVERY CC** — Constrained mode active. "
+                        f"HV is extreme but recovery needs income. "
+                        f"Write calls ONLY at strike ≥ **\\${_cstr_floor:.2f}** (15% OTM), "
+                        f"delta ≤ 0.20, weekly DTE only. "
+                        f"If assigned, you lock in a loss but collect meaningful premium. "
+                        f"Monitor daily — close at 50% profit or if HV drops below 60%."
+                    )
+                elif "CONSTRAINED_BLOCKED" in _cc_verdict_raw:
+                    st.info(
+                        "🟡 **Recovery rally active** — momentum is positive, don't cap upside now. "
+                        "Wait for consolidation, then re-evaluate CC entry. See watch signal below."
+                    )
+                else:
+                    _min_cc_price = last * 1.10   # strike must be ≥10% OTM
+                    _cc_verdict_str = (
+                        f"Conditional: write calls only at strike ≥ **\\${_min_cc_price:.2f}** "
+                        f"(10% OTM from \\${last:.2f}). "
+                        "At this level you collect premium without capping the recovery path. "
+                        "If no viable strike exists at 10% OTM in the near-term chain, wait."
+                    )
+                    st.warning(f"🟡 {_cc_verdict_str}")
             elif _cc_status == "UNFAVORABLE" or _arb_tag in ("HOLD_STOCK", "MONITOR"):
                 # Doctrine engine already determined CC is inadvisable — don't emit green checkmark.
                 # The full reason will display below in the CC engine block.
@@ -9123,6 +11132,10 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
                 _pc_note = doc_row.get("CC_Partial_Coverage_Note")
                 if _pc_note and str(_pc_note) not in ("nan", "None", ""):
                     st.info(f"ℹ️ {_pc_note}")
+                # DTE split advisory
+                _split_note = doc_row.get("CC_Split_Note")
+                if _split_note and str(_split_note) not in ("nan", "None", ""):
+                    st.info(f"📊 {_split_note}")
                 # ── CC Ladder display ──────────────────────────────────────
                 _ladder_eligible = doc_row.get("CC_Ladder_Eligible")
                 _ladder_json_raw = doc_row.get("CC_Ladder_JSON")
@@ -9221,10 +11234,62 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
                             _stale = " *(scan est.)*" if _src_v == "SCAN_DATA" else ""
                             st.caption("  \n".join(_exec_parts) + _stale)
 
+                        # Collect existing short calls for overlap detection
+                        _ex_calls_ldr = []
+                        for _leg in _related_legs:
+                            _lcp2 = str(_leg.get("Call/Put") or "").upper()
+                            _lqty2 = float(_leg.get("Quantity") or 0)
+                            _lstrat2 = str(_leg.get("Strategy") or "").upper()
+                            if (_lstrat2 in ("BUY_WRITE", "COVERED_CALL") or (_lcp2 in ("C", "CALL") and _lqty2 < 0)):
+                                _ex_calls_ldr.append({
+                                    "strike": float(_leg.get("Strike") or 0),
+                                    "exp": str(_leg.get("Expiration") or "")[:10],
+                                    "contracts": int(abs(_lqty2)),
+                                    "strategy": _lstrat2,
+                                })
+                        _ex_total_cts = sum(c["contracts"] for c in _ex_calls_ldr)
+
+                        # Show existing coverage before tiers
+                        if _ex_calls_ldr:
+                            _ex_desc = []
+                            for _ec in _ex_calls_ldr:
+                                _ec_exp_fmt = _fmt_expiry(_ec["exp"])
+                                _ex_desc.append(
+                                    f"{_ec['contracts']}x ${_ec['strike']:.0f} {_ec_exp_fmt} ({_ec['strategy']})"
+                                )
+                            _post_total = _ex_total_cts + _l_cov
+                            _all_lots = _l_tot + _ex_total_cts
+                            st.caption(
+                                f"**Existing:** {_ex_total_cts} contracts on {_ex_total_cts*100:,} shares — "
+                                + ", ".join(_ex_desc)
+                                + f"  \n**After ladder:** {_post_total}/{_all_lots} lots covered "
+                                f"({_post_total*100:,}/{_all_lots*100:,} shares) · "
+                                f"{_l_unc} lots uncovered (rally)"
+                            )
+
                         # Tier A
                         _render_tier("Tier A", _l_ta, _l_ta_best)
                         # Tier B
                         _render_tier("Tier B", _l_tb, _l_tb_best)
+
+                        # Overlap warning: flag when a tier's strike+exp matches existing position
+                        for _tier_label, _tier_best in [("Tier A", _l_ta_best), ("Tier B", _l_tb_best)]:
+                            if not _tier_best:
+                                continue
+                            _t_strike = float(_tier_best.get("strike", 0))
+                            _t_exp = str(_tier_best.get("expiry", ""))[:10]
+                            for _ec in _ex_calls_ldr:
+                                if abs(_ec["strike"] - _t_strike) < 0.01 and _ec["exp"] == _t_exp:
+                                    st.warning(
+                                        f"**{_tier_label} overlaps existing position** — "
+                                        f"you already have {_ec['contracts']}x ${_ec['strike']:.0f} "
+                                        f"{_fmt_expiry(_ec['exp'])} ({_ec['strategy']}). "
+                                        f"Adding {_l_tb if _tier_label == 'Tier B' else _l_ta}x "
+                                        f"concentrates {_ec['contracts'] + (_l_tb if _tier_label == 'Tier B' else _l_ta)} "
+                                        f"contracts at same strike/exp. "
+                                        f"Consider a different strike or expiry for diversification."
+                                    )
+                                    break
 
                         st.caption(
                             f"**Tier C:** {_l_unc} lots uncovered (upside participation). "
@@ -9385,6 +11450,35 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
                     )
                 _cc_copy_lines.append("")
 
+            # Unified recovery plan (if idle shares present)
+            _rec_total_c = float(doc_row.get("Recovery_Total_Shares", 0) or 0)
+            _rec_covered_c = float(doc_row.get("Recovery_Covered_Shares", 0) or 0)
+            _rec_idle_c = float(doc_row.get("Recovery_Idle_Shares", 0) or 0)
+            _rec_mo_base_c = float(doc_row.get("Recovery_Months_Baseline", 0) or 0)
+            _rec_mo_full_c = float(doc_row.get("Recovery_Months_Full", 0) or 0)
+            _rec_inc_base_c = float(doc_row.get("Recovery_Income_Baseline_Mo", 0) or 0)
+            _rec_inc_full_c = float(doc_row.get("Recovery_Income_Full_Mo", 0) or 0)
+            _rec_accel_c = float(doc_row.get("Recovery_Acceleration_Pct", 0) or 0)
+            _rec_recommend_c = bool(doc_row.get("Recovery_Cover_Idle_Recommended", False))
+            if _rec_idle_c > 0 and _rec_mo_base_c > 0:
+                _cc_copy_lines.append(
+                    f"Unified Recovery — {int(_rec_total_c):,} shares "
+                    f"({int(_rec_covered_c):,} covered, {int(_rec_idle_c):,} idle)"
+                )
+                _base_t = f"~{int(_rec_mo_base_c)} months" if _rec_mo_base_c < 999 else "∞"
+                _full_t = f"~{int(_rec_mo_full_c)} months" if _rec_mo_full_c < 999 else "∞"
+                _cc_copy_lines.append(
+                    f"Baseline: ${_rec_inc_base_c:,.2f}/mo → {_base_t} | "
+                    f"Full: ${_rec_inc_full_c:,.2f}/mo → {_full_t}"
+                )
+                if _rec_recommend_c:
+                    _delta_mo_c = int(_rec_mo_base_c - _rec_mo_full_c)
+                    _cc_copy_lines.append(
+                        f"⚡ Cover {int(_rec_idle_c):,} idle shares → "
+                        f"saves ~{abs(_delta_mo_c)} months ({abs(_rec_accel_c):.0f}% faster)"
+                    )
+                _cc_copy_lines.append("")
+
             # CC viability
             _cc_copy_lines.append(f"CC Status: {_cc_status}")
             if _cc_verdict:
@@ -9439,10 +11533,57 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
                         ]
                         return lines
 
+                    # Existing coverage context (cross-position)
+                    _ex_calls_cp = []
+                    for _leg_cp in _option_legs_by_ticker.get(ticker, []):
+                        _lcp_cp = str(_leg_cp.get("Call/Put") or "").upper()
+                        _lqty_cp = float(_leg_cp.get("Quantity") or 0)
+                        _lstrat_cp = str(_leg_cp.get("Strategy") or "").upper()
+                        if (_lstrat_cp in ("BUY_WRITE", "COVERED_CALL") or (_lcp_cp in ("C", "CALL") and _lqty_cp < 0)):
+                            _ex_calls_cp.append({
+                                "strike": float(_leg_cp.get("Strike") or 0),
+                                "exp": str(_leg_cp.get("Expiration") or "")[:10],
+                                "contracts": int(abs(_lqty_cp)),
+                                "strategy": _lstrat_cp,
+                            })
+                    if _ex_calls_cp:
+                        _ex_cts_cp = sum(c["contracts"] for c in _ex_calls_cp)
+                        _ex_desc_cp = ", ".join(
+                            f"{c['contracts']}x ${c['strike']:.0f} {c['exp']} ({c['strategy']})"
+                            for c in _ex_calls_cp
+                        )
+                        _post_cp = _ex_cts_cp + _lp.get("covered_lots", 0)
+                        _all_cp = _lp.get("total_lots", 0) + _ex_cts_cp
+                        _cc_copy_lines.append(
+                            f"Existing: {_ex_cts_cp} contracts on {_ex_cts_cp*100:,} shares — {_ex_desc_cp}"
+                        )
+                        _cc_copy_lines.append(
+                            f"After ladder: {_post_cp}/{_all_cp} lots covered "
+                            f"({_post_cp*100:,}/{_all_cp*100:,} shares) · "
+                            f"{_lp.get('uncovered_lots', 0)} lots uncovered (rally)"
+                        )
+
                     _ta_c = _lp.get("tier_a_best")
                     _tb_c = _lp.get("tier_b_best")
                     _cc_copy_lines.extend(_copy_tier("Tier A", _lp.get("tier_a_lots", 0), _ta_c))
                     _cc_copy_lines.extend(_copy_tier("Tier B", _lp.get("tier_b_lots", 0), _tb_c))
+
+                    # Overlap warning in copy text
+                    for _tl_cp, _tb_cp in [("Tier A", _ta_c), ("Tier B", _tb_c)]:
+                        if not _tb_cp:
+                            continue
+                        _ts_cp = float(_tb_cp.get("strike", 0))
+                        _te_cp = str(_tb_cp.get("expiry", ""))[:10]
+                        for _ec_cp in _ex_calls_cp:
+                            if abs(_ec_cp["strike"] - _ts_cp) < 0.01 and _ec_cp["exp"] == _te_cp:
+                                _tl_lots = _lp.get("tier_b_lots", 0) if _tl_cp == "Tier B" else _lp.get("tier_a_lots", 0)
+                                _cc_copy_lines.append(
+                                    f"⚠️ {_tl_cp} overlaps existing {_ec_cp['contracts']}x "
+                                    f"${_ec_cp['strike']:.0f} {_ec_cp['exp']} ({_ec_cp['strategy']}). "
+                                    f"Combined: {_ec_cp['contracts'] + _tl_lots} contracts at same strike/exp."
+                                )
+                                break
+
                     _cc_copy_lines.append(
                         f"Tier C: {_lp.get('uncovered_lots', 0)} lots uncovered (rally) | "
                         f"Strike floor: ${_lp.get('strike_floor', 0):.2f}"
@@ -9502,9 +11643,79 @@ def _render_idle_positions_tab(df: pd.DataFrame, doctrine_df: pd.DataFrame | Non
                 _pc_note_c = doc_row.get("CC_Partial_Coverage_Note")
                 if _pc_note_c and str(_pc_note_c) not in ("nan", "None", ""):
                     _cc_copy_lines.append(str(_pc_note_c))
+                _split_note_c = doc_row.get("CC_Split_Note")
+                if _split_note_c and str(_split_note_c) not in ("nan", "None", ""):
+                    _cc_copy_lines.append(str(_split_note_c))
                 _cc_copy_lines.append("")
 
             _cc_copy_lines.append(f"Thesis: {thesis}")
+
+            # ── Earnings Track Record (collapsed expander) ──────────────
+            _etq = doc_row.get("Earnings_Track_Quarters")
+            if _etq and pd.notna(_etq) and int(_etq) > 0:
+                _etq = int(_etq)
+                _ebeat = doc_row.get("Earnings_Beat_Rate")
+                _ecrush = doc_row.get("Earnings_Avg_IV_Crush_Pct")
+                _eramp = doc_row.get("Earnings_Avg_IV_Ramp_Pct")
+                _egap = doc_row.get("Earnings_Avg_Gap_Pct")
+                _eexp = doc_row.get("Earnings_Avg_Expected_Move_Pct")
+                _eact = doc_row.get("Earnings_Avg_Actual_Move_Pct")
+                _emr = doc_row.get("Earnings_Avg_Move_Ratio")
+                _esurp = doc_row.get("Earnings_Last_Surprise_Pct")
+
+                _eh_lines = []
+                if pd.notna(_ebeat):
+                    _eh_lines.append(f"**Beat Rate**: {_ebeat*100:.0f}% ({_etq} quarters)")
+                if pd.notna(_ecrush):
+                    _eh_lines.append(f"**Avg IV Crush**: {_ecrush*100:.1f}%")
+                if pd.notna(_eramp):
+                    _eh_lines.append(f"**Avg IV Ramp (pre-earnings)**: {_eramp*100:.1f}%")
+                if pd.notna(_egap):
+                    _eh_lines.append(f"**Avg |Gap|**: {_egap*100:.1f}%")
+                if pd.notna(_eexp) and pd.notna(_eact):
+                    _eh_lines.append(
+                        f"**Expected Move**: {_eexp*100:.1f}% (straddle) vs "
+                        f"**Actual**: {_eact*100:.1f}%"
+                    )
+                if pd.notna(_emr):
+                    _mr_label = "market overprices" if _emr < 1.0 else "market underprices"
+                    _eh_lines.append(f"**Move Ratio**: {_emr:.2f} ({_mr_label} earnings)")
+                if pd.notna(_esurp):
+                    _eh_lines.append(f"**Last Surprise**: {_esurp:.1f}%")
+
+                # Formation data (Phase 1→2→3)
+                _ef_phase2 = doc_row.get("Earnings_Phase2_Start_Day")
+                _ef_drift = doc_row.get("Earnings_Drift_Predicted_Gap_Rate")
+                _ef_quality = doc_row.get("Earnings_Formation_Quality")
+                _ef_current = doc_row.get("Earnings_Current_Phase")
+
+                _form_lines = []
+                if pd.notna(_ef_phase2) and _ef_phase2:
+                    _form_lines.append(f"**Avg Positioning Starts**: D{int(_ef_phase2)}")
+                if pd.notna(_ef_drift) and _ef_drift:
+                    _form_lines.append(f"**Drift Predicted Gap**: {float(_ef_drift)*100:.0f}%")
+                if _ef_quality and str(_ef_quality) not in ("", "N/A", "nan"):
+                    _form_lines.append(f"**Formation Quality**: {_ef_quality}")
+
+                if _eh_lines:
+                    # Phase badge
+                    _phase_badge = ""
+                    if _ef_current and str(_ef_current) not in ("", "QUIET", "NO_UPCOMING", "N/A", "nan"):
+                        _phase_colors = {
+                            "EARLY_POSITIONING": "🟡",
+                            "LATE_POSITIONING": "🟠",
+                            "IMMINENT": "🔴",
+                        }
+                        _phase_icon = _phase_colors.get(str(_ef_current), "")
+                        _phase_badge = f" {_phase_icon} {str(_ef_current).replace('_', ' ')}"
+
+                    with st.expander(f"📊 Earnings Track Record — {ticker} ({_etq}Q){_phase_badge}", expanded=False):
+                        st.markdown(" | ".join(_eh_lines[:3]))
+                        if len(_eh_lines) > 3:
+                            st.markdown(" | ".join(_eh_lines[3:]))
+                        if _form_lines:
+                            st.markdown("---")
+                            st.markdown(" | ".join(_form_lines))
 
             with st.expander("📋 Copy Card", expanded=False):
                 st.code("\n".join(_cc_copy_lines), language=None)
@@ -9677,6 +11888,39 @@ def render_manage_view(core_project_root, sanitize_func, set_view_func):
 
     st.title("📋 Position Monitor")
 
+    # ── Market Context Strip ────────────────────────────────────────────────
+    try:
+        from core.shared.data_layer.market_context import get_latest_market_context
+        from core.shared.data_layer.market_regime_classifier import classify_market_regime
+        _mkt_ctx = get_latest_market_context()
+        if _mkt_ctx is not None:
+            _mkt_r = classify_market_regime(_mkt_ctx)
+            _regime_colors = {
+                "RISK_ON": "green", "NORMAL": "blue", "CAUTIOUS": "orange",
+                "RISK_OFF": "red", "CRISIS": "red",
+            }
+            _rc = _regime_colors.get(_mkt_r.regime, "gray")
+            _vix = _mkt_ctx.get("vix")
+            _vix_pctl = _mkt_ctx.get("vix_percentile_252d")
+            _vvix = _mkt_ctx.get("vvix")
+            _breadth = _mkt_ctx.get("universe_breadth_pct_sma50")
+            _skew = _mkt_ctx.get("skew")
+            _parts = []
+            if _vix is not None:
+                _pctl_str = f" ({_vix_pctl:.0f}th %ile)" if _vix_pctl is not None else ""
+                _parts.append(f"VIX: {_vix:.1f}{_pctl_str}")
+            if _vvix is not None:
+                _parts.append(f"VVIX: {_vvix:.0f}")
+            _parts.append(f"Term: {_mkt_r.term_structure}")
+            if _skew is not None:
+                _parts.append(f"SKEW: {_skew:.0f}")
+            if _breadth is not None:
+                _parts.append(f"Breadth: {_breadth:.0f}%")
+            _parts.append(f"Regime: :{_rc}[**{_mkt_r.regime}**] (score: {_mkt_r.score:.0f})")
+            st.caption(" | ".join(_parts))
+    except Exception:
+        pass  # Graceful — strip simply doesn't show if data unavailable
+
     # ── Load data ───────────────────────────────────────────────────────────
     from core.shared.data_contracts.config import PIPELINE_DB_PATH
 
@@ -9730,11 +11974,18 @@ def render_manage_view(core_project_root, sanitize_func, set_view_func):
     df_positions = df[df["AssetType"].isin(["OPTION", "STOCK"])].copy() if "AssetType" in df.columns else df.copy()
 
     # ── Compute idle position count for tab badge ────────────────────────────
+    # Trade-level: a STOCK row is idle when its TradeID has no OPTION legs
+    # (not ticker-level, which misses partial coverage like EOSE 900 covered + 1100 idle).
     _idle_count = 0
     _critical_count = 0
-    if "AssetType" in df_positions.columns:
-        _opt_t = set(df_positions.loc[df_positions["AssetType"] == "OPTION", "Underlying_Ticker"].dropna())
-        _idle_rows = df_positions[(df_positions["AssetType"] == "STOCK") & ~df_positions["Underlying_Ticker"].isin(_opt_t)]
+    if "AssetType" in df_positions.columns and "TradeID" in df_positions.columns:
+        _trades_with_options = set(
+            df_positions.loc[df_positions["AssetType"] == "OPTION", "TradeID"].dropna()
+        )
+        _idle_rows = df_positions[
+            (df_positions["AssetType"] == "STOCK")
+            & ~df_positions["TradeID"].isin(_trades_with_options)
+        ]
         _idle_count = len(_idle_rows)
         # Count CRITICAL: loss > 35%
         for _, _ir in _idle_rows.iterrows():
@@ -9756,12 +12007,12 @@ def render_manage_view(core_project_root, sanitize_func, set_view_func):
 
     # ── Tabs ────────────────────────────────────────────────────────────────
     if has_doctrine:
-        tabs = st.tabs(["🧠 Doctrine", "📊 Positions", _idle_tab_label, "🎯 Optimize", "📅 Calendar", "🔢 Greeks", "▶ Run Engine", "🗄️ Raw Data"])
-        tab_doctrine, tab_pos, tab_idle, tab_opt, tab_cal, tab_greek, tab_run, tab_raw = tabs
+        tabs = st.tabs(["🧠 Doctrine", "📊 Positions", _idle_tab_label, "🎯 Optimize", "📅 Calendar", "🔢 Greeks", "▶ Run Engine", "🔁 Replay", "🗄️ Raw Data"])
+        tab_doctrine, tab_pos, tab_idle, tab_opt, tab_cal, tab_greek, tab_run, tab_replay, tab_raw = tabs
     else:
-        tabs = st.tabs(["📊 Positions", _idle_tab_label, "🎯 Optimize", "📅 Calendar", "🔢 Greeks", "▶ Run Engine", "🗄️ Raw Data"])
+        tabs = st.tabs(["📊 Positions", _idle_tab_label, "🎯 Optimize", "📅 Calendar", "🔢 Greeks", "▶ Run Engine", "🔁 Replay", "🗄️ Raw Data"])
         tab_doctrine = None
-        tab_pos, tab_idle, tab_opt, tab_cal, tab_greek, tab_run, tab_raw = tabs
+        tab_pos, tab_idle, tab_opt, tab_cal, tab_greek, tab_run, tab_replay, tab_raw = tabs
 
     if tab_doctrine is not None:
         with tab_doctrine:
@@ -9819,6 +12070,10 @@ def render_manage_view(core_project_root, sanitize_func, set_view_func):
         else:
             st.warning("No Positions CSV found in `data/brokerage_inputs/`. Upload one in the Perception tab first.")
         _render_run_engine_control(latest_csv)
+
+    with tab_replay:
+        from streamlit_app.replay_view import render_replay_view
+        render_replay_view(db_path=str(PIPELINE_DB_PATH))
 
     with tab_raw:
         st.caption("Verbatim output. All columns shown.")
